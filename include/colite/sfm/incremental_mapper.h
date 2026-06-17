@@ -22,8 +22,10 @@ struct IncrementalMapperOptions {
   ImageRegistrarOptions registration;
   IncrementalTriangulatorOptions triangulation;
   LocalBundleAdjustmentOptions local_bundle_adjustment;
+  ObservationFilterOptions local_retriangulation_filter;
   ObservationFilterOptions observation_filter;
   bool run_local_bundle_adjustment = true;
+  bool run_local_retriangulation_filter = true;
   bool run_observation_filter = true;
 };
 
@@ -78,6 +80,7 @@ IncrementalTriangulatorSummary RetriangulateLocalNeighborhood(
     const MatchGraph& graph,
     ImageId image_id,
     const IncrementalTriangulatorOptions& options,
+    const ObservationFilterOptions* local_filter_options,
     Reconstruction* reconstruction);
 
 // 从所有未注册图像中选择下一张最适合注册的图像。

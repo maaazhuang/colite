@@ -660,6 +660,12 @@ int RunPipeline(const ReconSfmCliOptions& options,
   RematchWeakImagePairs(cameras_by_image, weak_pair_options, &graph);
 
   IncrementalMappingOptions mapping_options;
+  // 局部 re-triangulation 比首次建点更积极，因此给它单独加一层角度分层：
+  // 低 median angle 的两视图边先不参与局部重三角化，新建点也要通过 1 度角度门。
+  mapping_options.mapper.triangulation.min_pair_median_triangulation_angle_deg =
+      1.0;
+  mapping_options.mapper.local_retriangulation_filter
+      .min_triangulation_angle_deg = 1.0;
   IncrementalMappingSummary summary =
       RunIncrementalMapping(graph, mapping_options, &reconstruction);
   std::filesystem::create_directories(output_dir);

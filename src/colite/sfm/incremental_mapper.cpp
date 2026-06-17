@@ -6,6 +6,8 @@
 #include <utility>
 #include <vector>
 
+#include "colite/core/geometry.h"
+
 namespace colite {
 namespace {
 
@@ -126,6 +128,123 @@ std::vector<ImageCandidate> CollectImageCandidates(
   return candidates;
 }
 
+std::set<Point3DId> CollectPoint3DIds(const Reconstruction& reconstruction) {
+  std::set<Point3DId> point3d_ids;
+  for (const auto& [point3d_id, point3d] : reconstruction.Points3D()) {
+    (void)point3d;
+    point3d_ids.insert(point3d_id);
+  }
+  return point3d_ids;
+}
+
+bool HasLargeReprojectionError(const Reconstruction& reconstruction,
+                               const Point3D& point3d,
+                               const TrackElement& element,
+                               double max_error_px) {
+  if (!reconstruction.ExistsImage(element.image_id)) {
+    return true;
+  }
+  const Image& image = reconstruction.GetImage(element.image_id);
+  if (!image.HasPose() || !reconstruction.ExistsCamera(image.camera_id) ||
+      element.point2d_idx >= image.points2d.size()) {
+    return true;
+  }
+  const Camera& camera = reconstruction.GetCamera(image.camera_id);
+  const auto error =
+      ReprojectionError(camera, *image.cam_from_world, point3d.xyz,
+                        image.points2d[element.point2d_idx].xy);
+  return !error.has_value() || *error > max_error_px;
+}
+
+double MaxTriangulationAngleDegrees(const Reconstruction& reconstruction,
+                                    const Point3D& point3d) {
+  double max_angle = 0.0;
+  for (std::size_t i = 0; i < point3d.track.elements.size(); ++i) {
+    const TrackElement& element1 = point3d.track.elements[i];
+    if (!reconstruction.ExistsImage(element1.image_id)) {
+      continue;
+    }
+    const Image& image1 = reconstruction.GetImage(element1.image_id);
+    if (!image1.HasPose() || !reconstruction.ExistsCamera(image1.camera_id) ||
+        element1.point2d_idx >= image1.points2d.size()) {
+      continue;
+    }
+    const Camera& camera1 = reconstruction.GetCamera(image1.camera_id);
+    const Eigen::Vector3d bearing1 =
+        PixelToBearing(camera1, image1.points2d[element1.point2d_idx].xy);
+
+    for (std::size_t j = i + 1; j < point3d.track.elements.size(); ++j) {
+      const TrackElement& element2 = point3d.track.elements[j];
+      if (!reconstruction.ExistsImage(element2.image_id)) {
+        continue;
+      }
+      const Image& image2 = reconstruction.GetImage(element2.image_id);
+      if (!image2.HasPose() ||
+          !reconstruction.ExistsCamera(image2.camera_id) ||
+          element2.point2d_idx >= image2.points2d.size()) {
+        continue;
+      }
+      const Camera& camera2 = reconstruction.GetCamera(image2.camera_id);
+      const Eigen::Vector3d bearing2 =
+          PixelToBearing(camera2, image2.points2d[element2.point2d_idx].xy);
+      max_angle = std::max(max_angle,
+                           TriangulationAngleDegrees(*image1.cam_from_world,
+                                                     bearing1,
+                                                     *image2.cam_from_world,
+                                                     bearing2));
+    }
+  }
+  return max_angle;
+}
+
+ObservationFilterSummary FilterNewlyCreatedPoints(
+    const std::set<Point3DId>& point_ids_before,
+    const ObservationFilterOptions& options,
+    Reconstruction* reconstruction) {
+  ObservationFilterSummary summary;
+  if (reconstruction == nullptr) {
+    summary.message = "Reconstruction is null";
+    return summary;
+  }
+
+  std::vector<Point3DId> points_to_delete;
+  for (const auto& [point3d_id, point3d] : reconstruction->Points3D()) {
+    if (point_ids_before.find(point3d_id) != point_ids_before.end()) {
+      continue;
+    }
+    bool has_bad_observation = false;
+    for (const TrackElement& element : point3d.track.elements) {
+      if (HasLargeReprojectionError(*reconstruction, point3d, element,
+                                    options.max_reprojection_error_px)) {
+        has_bad_observation = true;
+        break;
+      }
+    }
+    if (has_bad_observation ||
+        point3d.track.Length() < options.min_track_length ||
+        MaxTriangulationAngleDegrees(*reconstruction, point3d) <
+            options.min_triangulation_angle_deg) {
+      points_to_delete.push_back(point3d_id);
+    }
+  }
+
+  for (const Point3DId point3d_id : points_to_delete) {
+    if (!reconstruction->ExistsPoint3D(point3d_id)) {
+      continue;
+    }
+    const std::size_t track_length =
+        reconstruction->GetPoint3D(point3d_id).track.Length();
+    if (reconstruction->DeletePoint3D(point3d_id)) {
+      ++summary.num_removed_points;
+      summary.num_removed_observations += track_length;
+    }
+  }
+
+  summary.success = true;
+  summary.message = "Local retriangulation filtering finished";
+  return summary;
+}
+
 }  // namespace
 
 IncrementalMapperSummary RegisterNextImage(
@@ -155,8 +274,13 @@ IncrementalMapperSummary RegisterNextImage(
       graph, image_id, options.triangulation, reconstruction);
   summary.triangulation = TriangulateRegisteredImage(
       graph, image_id, options.triangulation, reconstruction);
+  const ObservationFilterOptions* local_retriangulation_filter =
+      options.run_local_retriangulation_filter
+          ? &options.local_retriangulation_filter
+          : nullptr;
   summary.local_retriangulation = RetriangulateLocalNeighborhood(
-      graph, image_id, options.triangulation, reconstruction);
+      graph, image_id, options.triangulation, local_retriangulation_filter,
+      reconstruction);
 
   // 3. 对新图像及其共视邻域做局部 BA，消化 PnP 和三角化带来的误差。
   if (options.run_local_bundle_adjustment) {
@@ -187,6 +311,7 @@ IncrementalTriangulatorSummary RetriangulateLocalNeighborhood(
     const MatchGraph& graph,
     ImageId image_id,
     const IncrementalTriangulatorOptions& options,
+    const ObservationFilterOptions* local_filter_options,
     Reconstruction* reconstruction) {
   IncrementalTriangulatorSummary summary;
   summary.image_id = image_id;
@@ -196,6 +321,8 @@ IncrementalTriangulatorSummary RetriangulateLocalNeighborhood(
     return summary;
   }
 
+  const std::set<Point3DId> point_ids_before =
+      CollectPoint3DIds(*reconstruction);
   std::set<ImageId> local_image_ids;
   local_image_ids.insert(image_id);
   for (const MatchGraphEdge& edge : FindVerifiedNeighbors(graph, image_id)) {
@@ -219,6 +346,14 @@ IncrementalTriangulatorSummary RetriangulateLocalNeighborhood(
     summary.num_created_points += triangulation.num_created_points;
     summary.num_created_observations +=
         triangulation.num_created_observations;
+  }
+
+  if (local_filter_options != nullptr) {
+    const ObservationFilterSummary filter_summary = FilterNewlyCreatedPoints(
+        point_ids_before, *local_filter_options, reconstruction);
+    summary.num_filtered_points = filter_summary.num_removed_points;
+    summary.num_filtered_observations =
+        filter_summary.num_removed_observations;
   }
 
   summary.message = "Local retriangulation finished";

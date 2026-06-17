@@ -12,6 +12,7 @@ namespace colite {
 // 当前版本实现其中 Create 新点的子集，Complete/Merge 后续单独补齐。
 struct IncrementalTriangulatorOptions {
   double min_triangulation_angle_deg = 0.5;
+  double min_pair_median_triangulation_angle_deg = 0.0;
   double create_max_reprojection_error_px = 4.0;
   bool ignore_two_view_tracks = false;
 };
@@ -21,6 +22,8 @@ struct IncrementalTriangulatorSummary {
   std::size_t num_created_points = 0;
   std::size_t num_created_observations = 0;
   std::size_t num_completed_observations = 0;
+  std::size_t num_filtered_observations = 0;
+  std::size_t num_filtered_points = 0;
   std::string message;
 };
 

@@ -23,6 +23,16 @@ bool IsUsableGeometry(const TwoViewGeometry& geometry) {
          !geometry.inlier_matches.empty();
 }
 
+bool PassesPairAngleLayer(const TwoViewGeometry& geometry,
+                          const IncrementalTriangulatorOptions& options) {
+  if (options.min_pair_median_triangulation_angle_deg <= 0.0 ||
+      geometry.median_triangulation_angle < 0.0) {
+    return true;
+  }
+  return geometry.median_triangulation_angle >=
+         options.min_pair_median_triangulation_angle_deg;
+}
+
 bool HasPoseAndCamera(const Reconstruction& reconstruction, ImageId image_id) {
   if (!reconstruction.ExistsImage(image_id)) {
     return false;
@@ -318,7 +328,8 @@ IncrementalTriangulatorSummary TriangulateRegisteredImage(
 
   std::set<std::pair<ImageId, Point2DIdx>> tried_observations;
   for (const auto& [pair, geometry] : graph.verified_geometries) {
-    if (!PairContainsImage(pair, image_id) || !IsUsableGeometry(geometry)) {
+    if (!PairContainsImage(pair, image_id) || !IsUsableGeometry(geometry) ||
+        !PassesPairAngleLayer(geometry, options)) {
       continue;
     }
 
@@ -365,7 +376,8 @@ IncrementalTriangulatorSummary CompleteTracksForRegisteredImage(
 
   std::set<std::pair<ImageId, Point2DIdx>> tried_observations;
   for (const auto& [pair, geometry] : graph.verified_geometries) {
-    if (!PairContainsImage(pair, image_id) || !IsUsableGeometry(geometry)) {
+    if (!PairContainsImage(pair, image_id) || !IsUsableGeometry(geometry) ||
+        !PassesPairAngleLayer(geometry, options)) {
       continue;
     }
 

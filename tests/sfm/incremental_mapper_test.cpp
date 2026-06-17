@@ -369,10 +369,96 @@ TEST(IncrementalMapperTest, RetriangulatesRegisteredNeighborhoodPairs) {
   options.create_max_reprojection_error_px = 1.0;
 
   const IncrementalTriangulatorSummary summary =
-      RetriangulateLocalNeighborhood(graph, 3, options, &reconstruction);
+      RetriangulateLocalNeighborhood(graph, 3, options, nullptr,
+                                     &reconstruction);
 
   EXPECT_GE(summary.num_created_points, 10U);
   EXPECT_EQ(reconstruction.Points3D().size(), 10U);
+}
+
+TEST(IncrementalMapperTest, RetriangulationSkipsLowAnglePairLayer) {
+  const Camera camera = MakeCamera(1);
+  const Pose3 cam1_from_world = CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0));
+  const Pose3 cam2_from_world = CameraAt(Eigen::Vector3d(1.0, 0.0, 0.0));
+  const Eigen::Vector3d point_world(0.0, 0.0, 5.0);
+  const auto pixel1 = ProjectWorldPoint(camera, cam1_from_world, point_world);
+  const auto pixel2 = ProjectWorldPoint(camera, cam2_from_world, point_world);
+  ASSERT_TRUE(pixel1.has_value());
+  ASSERT_TRUE(pixel2.has_value());
+
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  Image image1 = MakeImage(1, 1);
+  image1.registered = true;
+  image1.cam_from_world = cam1_from_world;
+  image1.points2d.push_back({*pixel1, 0, kInvalidPoint3DId});
+  reconstruction.AddImage(image1);
+  Image image2 = MakeImage(2, 1);
+  image2.registered = true;
+  image2.cam_from_world = cam2_from_world;
+  image2.points2d.push_back({*pixel2, 0, kInvalidPoint3DId});
+  reconstruction.AddImage(image2);
+
+  MatchGraph graph;
+  TwoViewGeometry geometry = MakeVerifiedGeometry({{0, 0}});
+  geometry.median_triangulation_angle = 0.2;
+  SetVerifiedGeometry(&graph, 1, 2, geometry);
+
+  IncrementalTriangulatorOptions options;
+  options.min_triangulation_angle_deg = 0.0;
+  options.min_pair_median_triangulation_angle_deg = 1.0;
+  options.create_max_reprojection_error_px = 1.0;
+
+  const IncrementalTriangulatorSummary summary =
+      RetriangulateLocalNeighborhood(graph, 1, options, nullptr,
+                                     &reconstruction);
+
+  EXPECT_EQ(summary.num_created_points, 0U);
+  EXPECT_TRUE(reconstruction.Points3D().empty());
+}
+
+TEST(IncrementalMapperTest, RetriangulationFiltersNewLowAnglePoints) {
+  const Camera camera = MakeCamera(1);
+  const Pose3 cam1_from_world = CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0));
+  const Pose3 cam2_from_world = CameraAt(Eigen::Vector3d(0.01, 0.0, 0.0));
+  const Eigen::Vector3d point_world(0.0, 0.0, 10.0);
+  const auto pixel1 = ProjectWorldPoint(camera, cam1_from_world, point_world);
+  const auto pixel2 = ProjectWorldPoint(camera, cam2_from_world, point_world);
+  ASSERT_TRUE(pixel1.has_value());
+  ASSERT_TRUE(pixel2.has_value());
+
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  Image image1 = MakeImage(1, 1);
+  image1.registered = true;
+  image1.cam_from_world = cam1_from_world;
+  image1.points2d.push_back({*pixel1, 0, kInvalidPoint3DId});
+  reconstruction.AddImage(image1);
+  Image image2 = MakeImage(2, 1);
+  image2.registered = true;
+  image2.cam_from_world = cam2_from_world;
+  image2.points2d.push_back({*pixel2, 0, kInvalidPoint3DId});
+  reconstruction.AddImage(image2);
+
+  MatchGraph graph;
+  SetVerifiedGeometry(&graph, 1, 2, MakeVerifiedGeometry({{0, 0}}));
+
+  IncrementalTriangulatorOptions triangulation_options;
+  triangulation_options.min_triangulation_angle_deg = 0.0;
+  triangulation_options.create_max_reprojection_error_px = 1.0;
+
+  ObservationFilterOptions filter_options;
+  filter_options.max_reprojection_error_px = 1.0;
+  filter_options.min_triangulation_angle_deg = 1.0;
+  filter_options.min_track_length = 2;
+
+  const IncrementalTriangulatorSummary summary =
+      RetriangulateLocalNeighborhood(graph, 1, triangulation_options,
+                                     &filter_options, &reconstruction);
+
+  EXPECT_EQ(summary.num_created_points, 1U);
+  EXPECT_EQ(summary.num_filtered_points, 1U);
+  EXPECT_TRUE(reconstruction.Points3D().empty());
 }
 
 TEST(IncrementalMapperTest, CompletesTracksAcrossAllRegisteredImagesAtEnd) {
