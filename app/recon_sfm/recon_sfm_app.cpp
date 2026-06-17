@@ -28,6 +28,7 @@
 #include "colite/features/sift_extractor.h"
 #include "colite/matching/descriptor_matcher.h"
 #include "colite/matching/two_view_geometry_batch.h"
+#include "colite/matching/weak_pair_rematcher.h"
 #include "colite/sfm/incremental_mapper.h"
 
 namespace colite::app {
@@ -645,6 +646,18 @@ int RunPipeline(const ReconSfmCliOptions& options,
   TwoViewGeometryBatchOptions geometry_options;
   geometry_options.keep_degenerate = true;
   VerifyMatchGraphGeometries(cameras_by_image, &graph, geometry_options);
+
+  WeakPairRematchingOptions weak_pair_options;
+  weak_pair_options.nearby_image_window = options.nearby_match_window;
+  weak_pair_options.min_inlier_gain = 10;
+  weak_pair_options.relaxed_matching = matching_options;
+  weak_pair_options.relaxed_matching.max_ratio =
+      std::max(options.nearby_match_ratio, 0.95);
+  weak_pair_options.relaxed_matching.mutual_check = true;
+  weak_pair_options.guided_matching.max_sampson_error_px =
+      geometry_options.geometry_options.max_error_px;
+  weak_pair_options.verification = geometry_options.geometry_options;
+  RematchWeakImagePairs(cameras_by_image, weak_pair_options, &graph);
 
   IncrementalMappingOptions mapping_options;
   IncrementalMappingSummary summary =

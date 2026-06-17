@@ -33,6 +33,7 @@ struct IncrementalMapperSummary {
   ImageRegistrationSummary registration;
   IncrementalTriangulatorSummary track_completion;
   IncrementalTriangulatorSummary triangulation;
+  IncrementalTriangulatorSummary local_retriangulation;
   LocalBundleAdjustmentSummary local_bundle_adjustment;
   ObservationFilterSummary observation_filter;
   std::string message;
@@ -69,6 +70,14 @@ IncrementalMapperSummary RegisterNextImage(
     const MatchGraph& graph,
     ImageId image_id,
     const IncrementalMapperOptions& options,
+    Reconstruction* reconstruction);
+
+// 对新注册图像及其已注册强邻居执行局部重三角化，补上新图像引入后可见的
+// 邻居-邻居 track，作为局部 BA 前的几何增密步骤。
+IncrementalTriangulatorSummary RetriangulateLocalNeighborhood(
+    const MatchGraph& graph,
+    ImageId image_id,
+    const IncrementalTriangulatorOptions& options,
     Reconstruction* reconstruction);
 
 // 从所有未注册图像中选择下一张最适合注册的图像。

@@ -6,8 +6,10 @@ add_executable(colite_core_tests
   features/sift_extractor_test.cpp
   integration/recon_sfm_app_test.cpp
   matching/descriptor_matcher_test.cpp
+  matching/guided_matching_test.cpp
   matching/two_view_geometry_batch_test.cpp
   matching/two_view_geometry_verifier_test.cpp
+  matching/weak_pair_rematcher_test.cpp
   sfm/global_bundle_adjuster_test.cpp
   sfm/image_registrar_test.cpp
   sfm/incremental_initializer_test.cpp

@@ -6,8 +6,10 @@ add_library(colite_core
   core/version.cpp
   features/sift_extractor.cpp
   matching/descriptor_matcher.cpp
+  matching/guided_matching.cpp
   matching/two_view_geometry_batch.cpp
   matching/two_view_geometry_verifier.cpp
+  matching/weak_pair_rematcher.cpp
   sfm/global_bundle_adjuster.cpp
   sfm/image_registrar.cpp
   sfm/incremental_initializer.cpp

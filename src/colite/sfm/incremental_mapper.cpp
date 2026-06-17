@@ -12,6 +12,8 @@ namespace {
 struct ImageCandidate {
   ImageId image_id = kInvalidImageId;
   std::size_t num_visible_points = 0;
+  std::size_t num_registered_neighbors = 0;
+  std::size_t num_verified_inliers_to_registered_images = 0;
 };
 
 bool PairContainsImage(const ImagePair& pair, ImageId image_id) {
@@ -33,19 +35,22 @@ bool HasValidFeatureIndex(const FeatureSet* features, Point2DIdx idx) {
          idx < features->keypoints.size();
 }
 
-std::size_t CountVisibleExistingPoints(const MatchGraph& graph,
-                                       ImageId image_id,
-                                       const Reconstruction& reconstruction) {
+ImageCandidate AnalyzeImageCandidate(const MatchGraph& graph,
+                                     ImageId image_id,
+                                     const Reconstruction& reconstruction) {
+  ImageCandidate candidate;
+  candidate.image_id = image_id;
   if (!reconstruction.ExistsImage(image_id) ||
       reconstruction.IsImageRegistered(image_id)) {
-    return 0;
+    return candidate;
   }
 
   const FeatureSet* target_features = FindFeatures(graph, image_id);
   if (target_features == nullptr) {
-    return 0;
+    return candidate;
   }
 
+  std::set<ImageId> registered_neighbors;
   std::set<Point2DIdx> visible_target_points;
   for (const auto& [pair, geometry] : graph.verified_geometries) {
     if (!PairContainsImage(pair, image_id) || !IsUsableGeometry(geometry)) {
@@ -57,6 +62,10 @@ std::size_t CountVisibleExistingPoints(const MatchGraph& graph,
         !reconstruction.IsImageRegistered(neighbor_id)) {
       continue;
     }
+
+    registered_neighbors.insert(neighbor_id);
+    candidate.num_verified_inliers_to_registered_images +=
+        geometry.inlier_matches.size();
 
     const Image& neighbor_image = reconstruction.GetImage(neighbor_id);
     const bool target_is_first = pair.image_id1 == image_id;
@@ -77,7 +86,9 @@ std::size_t CountVisibleExistingPoints(const MatchGraph& graph,
     }
   }
 
-  return visible_target_points.size();
+  candidate.num_visible_points = visible_target_points.size();
+  candidate.num_registered_neighbors = registered_neighbors.size();
+  return candidate;
 }
 
 std::vector<ImageCandidate> CollectImageCandidates(
@@ -87,10 +98,11 @@ std::vector<ImageCandidate> CollectImageCandidates(
   std::vector<ImageCandidate> candidates;
   for (const auto& [image_id, image] : reconstruction.Images()) {
     (void)image;
-    const std::size_t num_visible_points =
-        CountVisibleExistingPoints(graph, image_id, reconstruction);
-    if (num_visible_points >= options.registration.min_num_correspondences) {
-      candidates.push_back({image_id, num_visible_points});
+    const ImageCandidate candidate =
+        AnalyzeImageCandidate(graph, image_id, reconstruction);
+    if (candidate.num_visible_points >=
+        options.registration.min_num_correspondences) {
+      candidates.push_back(candidate);
     }
   }
 
@@ -98,6 +110,16 @@ std::vector<ImageCandidate> CollectImageCandidates(
             [](const ImageCandidate& lhs, const ImageCandidate& rhs) {
               if (lhs.num_visible_points != rhs.num_visible_points) {
                 return lhs.num_visible_points > rhs.num_visible_points;
+              }
+              if (lhs.num_registered_neighbors !=
+                  rhs.num_registered_neighbors) {
+                return lhs.num_registered_neighbors >
+                       rhs.num_registered_neighbors;
+              }
+              if (lhs.num_verified_inliers_to_registered_images !=
+                  rhs.num_verified_inliers_to_registered_images) {
+                return lhs.num_verified_inliers_to_registered_images >
+                       rhs.num_verified_inliers_to_registered_images;
               }
               return lhs.image_id < rhs.image_id;
             });
@@ -133,6 +155,8 @@ IncrementalMapperSummary RegisterNextImage(
       graph, image_id, options.triangulation, reconstruction);
   summary.triangulation = TriangulateRegisteredImage(
       graph, image_id, options.triangulation, reconstruction);
+  summary.local_retriangulation = RetriangulateLocalNeighborhood(
+      graph, image_id, options.triangulation, reconstruction);
 
   // 3. 对新图像及其共视邻域做局部 BA，消化 PnP 和三角化带来的误差。
   if (options.run_local_bundle_adjustment) {
@@ -156,6 +180,48 @@ IncrementalMapperSummary RegisterNextImage(
 
   summary.success = true;
   summary.message = "Image registered and locally refined";
+  return summary;
+}
+
+IncrementalTriangulatorSummary RetriangulateLocalNeighborhood(
+    const MatchGraph& graph,
+    ImageId image_id,
+    const IncrementalTriangulatorOptions& options,
+    Reconstruction* reconstruction) {
+  IncrementalTriangulatorSummary summary;
+  summary.image_id = image_id;
+  if (reconstruction == nullptr ||
+      !reconstruction->IsImageRegistered(image_id)) {
+    summary.message = "Image is not registered";
+    return summary;
+  }
+
+  std::set<ImageId> local_image_ids;
+  local_image_ids.insert(image_id);
+  for (const MatchGraphEdge& edge : FindVerifiedNeighbors(graph, image_id)) {
+    const ImageId neighbor_id = edge.OtherImageId(image_id);
+    if (reconstruction->IsImageRegistered(neighbor_id)) {
+      local_image_ids.insert(neighbor_id);
+    }
+  }
+
+  // COLMAP 的增量三角化会围绕新注册图像反复 complete/merge/create。这里先做
+  // 保守的局部版本：新图像和强邻居都重跑一轮，使邻居-邻居遗漏 track 进入局部 BA。
+  for (const ImageId local_image_id : local_image_ids) {
+    const IncrementalTriangulatorSummary completion =
+        CompleteTracksForRegisteredImage(graph, local_image_id, options,
+                                         reconstruction);
+    summary.num_completed_observations += completion.num_completed_observations;
+
+    const IncrementalTriangulatorSummary triangulation =
+        TriangulateRegisteredImage(graph, local_image_id, options,
+                                   reconstruction);
+    summary.num_created_points += triangulation.num_created_points;
+    summary.num_created_observations +=
+        triangulation.num_created_observations;
+  }
+
+  summary.message = "Local retriangulation finished";
   return summary;
 }
 

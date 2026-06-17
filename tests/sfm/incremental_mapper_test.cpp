@@ -263,6 +263,118 @@ TEST(IncrementalMapperTest, RunsCompleteIncrementalMappingLoop) {
   }
 }
 
+TEST(IncrementalMapperTest, SelectsCandidateWithStrongerRegisteredConnectivity) {
+  const Camera camera = MakeCamera(1);
+
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  for (const ImageId image_id : {1U, 2U, 3U, 4U}) {
+    Image image = MakeImage(image_id, 1);
+    if (image_id == 1U || image_id == 4U) {
+      image.registered = true;
+      image.cam_from_world = CameraAt(Eigen::Vector3d::Zero());
+      for (int i = 0; i < 10; ++i) {
+        image.points2d.push_back(
+            {{100.0 + i, 120.0 + i}, 0, kInvalidPoint3DId});
+      }
+    } else {
+      for (int i = 0; i < 10; ++i) {
+        image.points2d.push_back(
+            {{200.0 + i, 220.0 + i}, 0, kInvalidPoint3DId});
+      }
+    }
+    reconstruction.AddImage(image);
+  }
+
+  for (int i = 0; i < 10; ++i) {
+    Track track1;
+    track1.AddElement(1, static_cast<Point2DIdx>(i));
+    reconstruction.AddPoint3D(Eigen::Vector3d(i, 0.0, 5.0), track1);
+
+    Track track4;
+    track4.AddElement(4, static_cast<Point2DIdx>(i));
+    reconstruction.AddPoint3D(Eigen::Vector3d(i, 1.0, 5.0), track4);
+  }
+
+  MatchGraph graph;
+  FeatureSet dummy_features;
+  for (int i = 0; i < 10; ++i) {
+    dummy_features.keypoints.push_back(
+        {static_cast<float>(i), static_cast<float>(i), 1.0F, 0.0F});
+  }
+  SetFeatures(&graph, 2, dummy_features);
+  SetFeatures(&graph, 3, dummy_features);
+
+  const std::vector<FeatureMatch> all_matches = IdentityMatches(0, 10);
+  SetVerifiedGeometry(&graph, 1, 2, MakeVerifiedGeometry(all_matches));
+  SetVerifiedGeometry(&graph, 1, 3, MakeVerifiedGeometry(IdentityMatches(0, 5)));
+  SetVerifiedGeometry(&graph, 4, 3, MakeVerifiedGeometry(IdentityMatches(5, 10)));
+
+  IncrementalMapperOptions options;
+  options.registration.min_num_correspondences = 8;
+
+  const std::optional<ImageId> next_image =
+      SelectNextImage(graph, options, reconstruction);
+
+  ASSERT_TRUE(next_image.has_value());
+  EXPECT_EQ(*next_image, 3U);
+}
+
+TEST(IncrementalMapperTest, RetriangulatesRegisteredNeighborhoodPairs) {
+  const Camera camera = MakeCamera(1);
+  const std::vector<Eigen::Vector3d> points = MakeScenePoints();
+  const Pose3 cam1_from_world = CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0));
+  const Pose3 cam2_from_world = CameraAt(Eigen::Vector3d(1.0, 0.0, 0.0));
+  const Pose3 cam3_from_world = CameraAt(Eigen::Vector3d(0.5, 0.1, 0.0));
+
+  const FeatureSet features1 = ProjectFeatures(camera, cam1_from_world, points);
+  const FeatureSet features2 = ProjectFeatures(camera, cam2_from_world, points);
+  const FeatureSet features3 = ProjectFeatures(camera, cam3_from_world, points);
+  const std::vector<FeatureMatch> matches_all = IdentityMatches(0, 10);
+  const std::vector<FeatureMatch> seed_matches = IdentityMatches(0, 8);
+
+  MatchGraph graph;
+  SetFeatures(&graph, 1, features1);
+  SetFeatures(&graph, 2, features2);
+  SetFeatures(&graph, 3, features3);
+  SetVerifiedGeometry(&graph, 1, 2, MakeVerifiedGeometry(matches_all));
+  SetVerifiedGeometry(&graph, 1, 3, MakeVerifiedGeometry(seed_matches));
+  SetVerifiedGeometry(&graph, 2, 3, MakeVerifiedGeometry(seed_matches));
+
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  Image image1 = MakeImage(1, 1);
+  image1.registered = true;
+  image1.cam_from_world = cam1_from_world;
+  Image image2 = MakeImage(2, 1);
+  image2.registered = true;
+  image2.cam_from_world = cam2_from_world;
+  Image image3 = MakeImage(3, 1);
+  image3.registered = true;
+  image3.cam_from_world = cam3_from_world;
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    image1.points2d.push_back({{features1.keypoints[i].x, features1.keypoints[i].y},
+                               static_cast<Point2DIdx>(i), kInvalidPoint3DId});
+    image2.points2d.push_back({{features2.keypoints[i].x, features2.keypoints[i].y},
+                               static_cast<Point2DIdx>(i), kInvalidPoint3DId});
+    image3.points2d.push_back({{features3.keypoints[i].x, features3.keypoints[i].y},
+                               static_cast<Point2DIdx>(i), kInvalidPoint3DId});
+  }
+  reconstruction.AddImage(image1);
+  reconstruction.AddImage(image2);
+  reconstruction.AddImage(image3);
+
+  IncrementalTriangulatorOptions options;
+  options.min_triangulation_angle_deg = 0.1;
+  options.create_max_reprojection_error_px = 1.0;
+
+  const IncrementalTriangulatorSummary summary =
+      RetriangulateLocalNeighborhood(graph, 3, options, &reconstruction);
+
+  EXPECT_GE(summary.num_created_points, 10U);
+  EXPECT_EQ(reconstruction.Points3D().size(), 10U);
+}
+
 TEST(IncrementalMapperTest, CompletesTracksAcrossAllRegisteredImagesAtEnd) {
   const Camera camera = MakeCamera(1);
   const Eigen::Vector3d point_world(0.0, 0.0, 5.0);
