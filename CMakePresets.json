@@ -1,0 +1,44 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "wsl-debug",
+      "displayName": "WSL Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-wsl",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "COLITE_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "wsl-release",
+      "displayName": "WSL Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-wsl-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "COLITE_BUILD_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "wsl-debug",
+      "configurePreset": "wsl-debug"
+    },
+    {
+      "name": "wsl-release",
+      "configurePreset": "wsl-release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "wsl-debug",
+      "configurePreset": "wsl-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

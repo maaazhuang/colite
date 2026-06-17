@@ -1,0 +1,8 @@
+/build*/
+out/
+.cache/
+.vs/
+.vscode/
+CMakeUserPresets.json
+/references/
+output/

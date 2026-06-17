@@ -1,0 +1,26 @@
+# Initial SfM configuration placeholder.
+image_path: data/images
+output_path: output/sparse
+
+camera:
+  model: pinhole
+  width: 0
+  height: 0
+  fx: 0.0
+  fy: 0.0
+  cx: 0.0
+  cy: 0.0
+
+features:
+  type: sift
+  max_num_features: 8192
+
+matching:
+  type: exhaustive
+  ratio_test: 0.8
+  mutual_check: true
+
+sfm:
+  min_num_inliers: 30
+  min_track_length: 2
+
