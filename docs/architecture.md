@@ -3,7 +3,10 @@
 Colite is a compact C++ reconstruction system organized around a minimal
 SfM-first pipeline and a later CPU MVS baseline.
 
-## Initial Module Layout
+For the current implementation status, COLMAP comparison baseline, and
+handoff notes, see `docs/current_status.md`.
+
+## Module Layout
 
 - `core`: shared math-facing types, camera models, versioning, logging hooks.
 - `image`: image loading, metadata, undistortion, and camera initialization.
@@ -15,7 +18,6 @@ SfM-first pipeline and a later CPU MVS baseline.
 - `app`: command-line tools.
 - `tests`: focused unit and integration tests.
 
-The first milestone intentionally contains only `core`, `app`, and `tests`.
-New modules should be added as independent CMake targets or source groups when
-their interfaces become concrete.
-
+The first implementation milestone has grown into an end-to-end incremental SfM
+baseline. The active modules are `core`, `features`, `matching`, `sfm`, `app`,
+and `tests`; MVS remains future work.

@@ -209,6 +209,8 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
          "JPEG EXIF 35mm focal prior when available, otherwise "
          "1.2 * max(width, height).\n"
       << "  --max_num_features <n>   SIFT feature limit, default 4096.\n"
+      << "  --feature_extractor <opencv|vlsift|cvsift>\n"
+         "                            SIFT extraction backend, default opencv.\n"
       << "  --matcher <bf|flann>     Descriptor matcher backend, default bf.\n"
       << "  --nearby_match_window <n>\n"
          "                            Re-match neighboring image pairs within "
@@ -248,6 +250,9 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
       options.focal_length = std::stod(RequireValue(args, &i, arg));
     } else if (arg == "--max_num_features") {
       options.max_num_features = std::stoi(RequireValue(args, &i, arg));
+    } else if (arg == "--feature_extractor") {
+      options.feature_backend =
+          SiftBackendFromName(RequireValue(args, &i, arg));
     } else if (arg == "--nearby_match_window") {
       options.nearby_match_window =
           static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
@@ -615,6 +620,7 @@ int RunPipeline(const ReconSfmCliOptions& options,
 
   SiftExtractionOptions sift_options;
   sift_options.max_num_features = options.max_num_features;
+  sift_options.backend = options.feature_backend;
 
   MatchGraph graph;
   Reconstruction reconstruction;

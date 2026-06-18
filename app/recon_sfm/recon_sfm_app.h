@@ -8,6 +8,7 @@
 
 #include "colite/core/match_graph.h"
 #include "colite/core/reconstruction.h"
+#include "colite/features/sift_extractor.h"
 #include "colite/matching/descriptor_matcher.h"
 #include "colite/sfm/incremental_mapper.h"
 
@@ -20,6 +21,7 @@ struct ReconSfmCliOptions {
   std::string output_path;
   double focal_length = 0.0;
   int max_num_features = 4096;
+  SiftBackend feature_backend = SiftBackend::kOpenCV;
   bool use_flann = false;
   std::size_t nearby_match_window = 2;
   double nearby_match_ratio = 0.9;

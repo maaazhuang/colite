@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -11,13 +12,30 @@
 
 namespace colite {
 
+// SIFT 特征提取后端。OpenCV 保留原有直接调用路径；VlSift/CvSift 是从
+// references/sift 复制到项目内后接入的改造实现。
+enum class SiftBackend {
+  kOpenCV,
+  kVlSift,
+  kCvSift,
+};
+
+const char* SiftBackendName(SiftBackend backend);
+SiftBackend SiftBackendFromName(std::string_view name);
+
 // SIFT 特征提取配置。第一版只保留 OpenCV SIFT 常用参数，后续再扩展仿射形状等能力。
 struct SiftExtractionOptions {
+  SiftBackend backend = SiftBackend::kOpenCV;
   int max_num_features = 8192;
   int num_octave_layers = 3;
   double contrast_threshold = 0.04;
   double edge_threshold = 10.0;
   double sigma = 1.6;
+
+  // VLFeat/COLMAP CPU SIFT 专用参数。COLMAP 普通 CPU SIFT 默认固定 4 个
+  // octave，并且每个 keypoint 最多保留 2 个方向。
+  int vl_num_octaves = 4;
+  int max_num_orientations = 2;
 
   // COLMAP 默认使用 first_octave=-1。OpenCV 不直接暴露该参数，因此这里通过
   // 先 2 倍上采样再把 keypoint 坐标缩回原图来近似，提升相邻图像弱纹理区域稳定性。

@@ -30,6 +30,46 @@ TEST(SiftExtractorTest, ExtractsFeaturesFromSyntheticImage) {
   EXPECT_EQ(features.descriptors.cols(), 128);
 }
 
+TEST(SiftExtractorTest, ParsesBackendNames) {
+  EXPECT_EQ(SiftBackendFromName("opencv"), SiftBackend::kOpenCV);
+  EXPECT_EQ(SiftBackendFromName("vlsift"), SiftBackend::kVlSift);
+  EXPECT_EQ(SiftBackendFromName("cvsift"), SiftBackend::kCvSift);
+  EXPECT_THROW(SiftBackendFromName("unknown"), std::invalid_argument);
+}
+
+TEST(SiftExtractorTest, ExtractsFeaturesWithAllBackends) {
+  SiftExtractionOptions options;
+  options.max_num_features = 256;
+  options.contrast_threshold = 0.0;
+
+  for (const SiftBackend backend :
+       {SiftBackend::kOpenCV, SiftBackend::kVlSift, SiftBackend::kCvSift}) {
+    options.backend = backend;
+    const FeatureSet features =
+        ExtractSiftFeatures(MakeSyntheticImage(), options);
+
+    EXPECT_FALSE(features.keypoints.empty()) << SiftBackendName(backend);
+    EXPECT_GT(features.descriptors.size(), 0) << SiftBackendName(backend);
+    EXPECT_EQ(features.descriptors.rows(),
+              static_cast<Eigen::Index>(features.keypoints.size()))
+        << SiftBackendName(backend);
+    EXPECT_EQ(features.descriptors.cols(), 128) << SiftBackendName(backend);
+  }
+}
+
+TEST(SiftExtractorTest, VlSiftKeepsCompleteScaleLevelsLikeColmap) {
+  SiftExtractionOptions options;
+  options.backend = SiftBackend::kVlSift;
+  options.max_num_features = 10;
+  options.contrast_threshold = 0.0;
+
+  const FeatureSet features = ExtractSiftFeatures(MakeSyntheticImage(), options);
+
+  EXPECT_GT(features.keypoints.size(), static_cast<std::size_t>(10));
+  EXPECT_EQ(features.descriptors.rows(),
+            static_cast<Eigen::Index>(features.keypoints.size()));
+}
+
 TEST(SiftExtractorTest, AppliesRootSiftNormalizationByDefault) {
   SiftExtractionOptions options;
   options.max_num_features = 256;

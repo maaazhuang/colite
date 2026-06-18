@@ -49,6 +49,7 @@ TEST(ReconSfmAppTest, PrintsHelp) {
 
   EXPECT_EQ(exit_code, 0);
   EXPECT_NE(out.str().find("Usage:"), std::string::npos);
+  EXPECT_NE(out.str().find("--feature_extractor"), std::string::npos);
   EXPECT_TRUE(err.str().empty());
 }
 

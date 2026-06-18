@@ -4,7 +4,7 @@ project(
   colite
   VERSION 0.1.0
   DESCRIPTION "A compact C++ SfM and MVS reconstruction system"
-  LANGUAGES CXX
+  LANGUAGES C CXX
 )
 
 option(COLITE_BUILD_TESTS "Build unit tests" ON)

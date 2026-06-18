@@ -4,6 +4,9 @@ add_library(colite_core
   core/match_graph.cpp
   core/reconstruction.cpp
   core/version.cpp
+  features/backends/sift_opencv_v2.cpp
+  features/backends/sift_vlfeat_v2.c
+  features/backends/vl_imconv.c
   features/sift_extractor.cpp
   matching/descriptor_matcher.cpp
   matching/guided_matching.cpp
@@ -23,6 +26,8 @@ target_include_directories(colite_core
   PUBLIC
     ${PROJECT_SOURCE_DIR}/include
     ${OpenCV_INCLUDE_DIRS}
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/features
 )
 
 target_compile_definitions(colite_core
@@ -45,3 +50,11 @@ if(MSVC)
 else()
   target_compile_options(colite_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+set_source_files_properties(
+  features/backends/sift_opencv_v2.cpp
+  features/backends/sift_vlfeat_v2.c
+  features/backends/vl_imconv.c
+  PROPERTIES
+    COMPILE_OPTIONS "-Wno-pedantic;-Wno-unused-function"
+)
