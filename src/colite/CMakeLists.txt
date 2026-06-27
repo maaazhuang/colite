@@ -13,6 +13,11 @@ add_library(colite_core
   matching/two_view_geometry_batch.cpp
   matching/two_view_geometry_verifier.cpp
   matching/weak_pair_rematcher.cpp
+  mvs/dense_cloud.cpp
+  mvs/dense_map.cpp
+  mvs/image_workspace.cpp
+  mvs/mvs_pipeline.cpp
+  mvs/patch_match.cpp
   sfm/global_bundle_adjuster.cpp
   sfm/image_registrar.cpp
   sfm/incremental_initializer.cpp

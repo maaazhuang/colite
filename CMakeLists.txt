@@ -21,6 +21,7 @@ find_library(FLANN_CPP_LIBRARY NAMES flann_cpp REQUIRED)
 find_library(LZ4_LIBRARY NAMES lz4 REQUIRED)
 
 add_subdirectory(src/colite)
+add_subdirectory(app/recon_mvs)
 add_subdirectory(app/recon_sfm)
 
 if(COLITE_BUILD_TESTS)

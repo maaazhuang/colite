@@ -5,12 +5,18 @@ add_executable(colite_core_tests
   core/reconstruction_test.cpp
   features/sift_extractor_test.cpp
   features/sift_reference_consistency_test.cpp
+  integration/recon_mvs_app_test.cpp
   integration/recon_sfm_app_test.cpp
   matching/descriptor_matcher_test.cpp
   matching/guided_matching_test.cpp
   matching/two_view_geometry_batch_test.cpp
   matching/two_view_geometry_verifier_test.cpp
   matching/weak_pair_rematcher_test.cpp
+  mvs/dense_cloud_test.cpp
+  mvs/dense_map_test.cpp
+  mvs/image_workspace_test.cpp
+  mvs/mvs_pipeline_test.cpp
+  mvs/patch_match_test.cpp
   sfm/global_bundle_adjuster_test.cpp
   sfm/image_registrar_test.cpp
   sfm/incremental_initializer_test.cpp
@@ -61,6 +67,7 @@ target_compile_options(vlfeat_original_reference
 target_link_libraries(colite_core_tests
   PRIVATE
     colite_core
+    recon_mvs_app
     recon_sfm_app
     GTest::gtest_main
     vlfeat_original_reference
@@ -79,3 +86,16 @@ target_compile_definitions(colite_core_tests
 
 include(GoogleTest)
 gtest_discover_tests(colite_core_tests)
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+add_test(
+  NAME MvsSweepScriptTest
+  COMMAND ${Python3_EXECUTABLE}
+          ${PROJECT_SOURCE_DIR}/tests/scripts/mvs_sweep_test.py
+)
+set_tests_properties(
+  MvsSweepScriptTest
+  PROPERTIES
+    ENVIRONMENT "COLITE_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
+)

@@ -3,6 +3,9 @@ out/
 .cache/
 .vs/
 .vscode/
+.VSCodeCounter/
+__pycache__/
+*.pyc
 CMakeUserPresets.json
 /references/
 output/
