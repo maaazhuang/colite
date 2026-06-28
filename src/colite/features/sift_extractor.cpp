@@ -8,14 +8,15 @@
 #include <string>
 #include <vector>
 
-#include <opencv2/features2d.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
-#include "backends/sift_opencv_v2.hpp"
+#include "backends/cuda_sift_extractor.h"
+#include "backends/sift_opencv.hpp"
+#include "sift_descriptor_conversion.h"
 
 extern "C" {
-#include "backends/sift_vlfeat_v2.h"
+#include "backends/sift_vlfeat.h"
 }
 
 namespace colite {
@@ -23,16 +24,6 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kDefaultOpenCvContrastThreshold = 0.04;
-
-FeatureKeypoint ConvertKeypoint(const cv::KeyPoint& keypoint,
-                                const double coordinate_scale) {
-  FeatureKeypoint result;
-  result.x = keypoint.pt.x * coordinate_scale;
-  result.y = keypoint.pt.y * coordinate_scale;
-  result.scale = keypoint.size * coordinate_scale;
-  result.orientation = keypoint.angle;
-  return result;
-}
 
 std::string LowerExtension(const std::filesystem::path& path) {
   std::string ext = path.extension().string();
@@ -62,74 +53,6 @@ cv::Mat ToGrayImage(const cv::Mat& image) {
   return gray;
 }
 
-DescriptorMatrix ConvertDescriptors(const cv::Mat& descriptors,
-                                    const bool use_root_sift) {
-  if (descriptors.empty()) {
-    return {};
-  }
-
-  cv::Mat float_descriptors;
-  if (descriptors.type() == CV_32F) {
-    float_descriptors =
-        descriptors.isContinuous() ? descriptors : descriptors.clone();
-  } else {
-    descriptors.convertTo(float_descriptors, CV_32F);
-  }
-
-  DescriptorMatrix result(float_descriptors.rows, float_descriptors.cols);
-  for (int row = 0; row < float_descriptors.rows; ++row) {
-    const float* src = float_descriptors.ptr<float>(row);
-    double l1_norm = 0.0;
-    for (int col = 0; col < float_descriptors.cols; ++col) {
-      const double value = std::max(0.0, static_cast<double>(src[col]));
-      result(row, col) = value;
-      l1_norm += value;
-    }
-
-    if (use_root_sift && l1_norm > 0.0) {
-      // RootSIFT：先做 L1 归一化，再逐维开方。这样可弱化大梯度 bin 对
-      // 距离排序的支配作用，与 COLMAP 的 l1_root 描述子归一化保持一致。
-      const double inv_l1_norm = 1.0 / l1_norm;
-      for (int col = 0; col < float_descriptors.cols; ++col) {
-        result(row, col) = std::sqrt(result(row, col) * inv_l1_norm);
-      }
-    }
-  }
-  return result;
-}
-
-DescriptorMatrix ConvertDescriptors(const std::vector<float>& descriptors,
-                                    const std::size_t num_descriptors,
-                                    const bool use_root_sift) {
-  if (num_descriptors == 0) {
-    return {};
-  }
-  if (descriptors.size() != num_descriptors * 128) {
-    throw std::runtime_error("SIFT descriptor buffer has unexpected size.");
-  }
-
-  DescriptorMatrix result(static_cast<Eigen::Index>(num_descriptors), 128);
-  for (std::size_t row = 0; row < num_descriptors; ++row) {
-    double l1_norm = 0.0;
-    for (int col = 0; col < 128; ++col) {
-      const double value =
-          std::max(0.0, static_cast<double>(descriptors[row * 128 + col]));
-      result(static_cast<Eigen::Index>(row), col) = value;
-      l1_norm += value;
-    }
-
-    if (use_root_sift && l1_norm > 0.0) {
-      const double inv_l1_norm = 1.0 / l1_norm;
-      for (int col = 0; col < 128; ++col) {
-        result(static_cast<Eigen::Index>(row), col) =
-            std::sqrt(result(static_cast<Eigen::Index>(row), col) *
-                      inv_l1_norm);
-      }
-    }
-  }
-  return result;
-}
-
 std::vector<float> GrayToFloatVector(const cv::Mat& gray,
                                      const double scale = 1.0) {
   cv::Mat gray_float;
@@ -146,8 +69,6 @@ std::vector<float> GrayToFloatVector(const cv::Mat& gray,
 
 double EffectiveVlSiftPeakThreshold(const SiftExtractionOptions& options) {
   // COLMAP CPU SIFT 的 peak_threshold 默认是 0.02 / octave_resolution。
-  // 为了不破坏调用方显式传入的阈值，仅在仍保持 OpenCV 默认 contrast=0.04
-  // 时切换到 COLMAP 默认值；显式设为 0 等自定义值会原样传给 VLFeat。
   if (std::abs(options.contrast_threshold -
                kDefaultOpenCvContrastThreshold) < 1e-12) {
     return 0.02 / static_cast<double>(options.num_octave_layers);
@@ -178,66 +99,36 @@ struct VlSiftLevelFeatures {
   std::vector<float> descriptors;
 };
 
-FeatureSet ExtractOpenCvSiftFeatures(const cv::Mat& gray,
-                                     const SiftExtractionOptions& options) {
-  cv::Mat extraction_image;
-  double coordinate_scale = 1.0;
-  if (options.upsample_first_octave) {
-    // OpenCV SIFT 不暴露 COLMAP 的 first_octave=-1 参数，这里用 2 倍上采样
-    // 近似低 octave 检测，再把坐标和尺度还原到原始图像坐标系。
-    cv::resize(gray, extraction_image, cv::Size(), 2.0, 2.0,
-               cv::INTER_LINEAR);
-    coordinate_scale = 0.5;
-  } else {
-    extraction_image = gray;
-  }
-
-  auto sift = cv::SIFT::create(options.max_num_features,
-                               options.num_octave_layers,
-                               options.contrast_threshold,
-                               options.edge_threshold,
-                               options.sigma);
-
-  std::vector<cv::KeyPoint> keypoints;
-  cv::Mat descriptors;
-  sift->detectAndCompute(extraction_image, cv::noArray(), keypoints,
-                         descriptors);
-
-  FeatureSet result;
-  result.keypoints.reserve(keypoints.size());
-  for (const cv::KeyPoint& keypoint : keypoints) {
-    result.keypoints.push_back(ConvertKeypoint(keypoint, coordinate_scale));
-  }
-
-  result.descriptors = ConvertDescriptors(descriptors, options.use_root_sift);
-  return result;
-}
-
 FeatureSet ExtractCvSiftFeatures(const cv::Mat& gray,
                                  const SiftExtractionOptions& options) {
   const std::vector<float> image = GrayToFloatVector(gray);
-  cv::SIFTV2 sift = cv::SIFTV2::create(options.max_num_features,
+  features::backends::Sift sift =
+      features::backends::Sift::create(options.max_num_features,
                                        options.num_octave_layers,
                                        options.contrast_threshold,
                                        options.edge_threshold,
                                        options.sigma);
-  std::vector<cv::KeyPointV2> keypoints;
+  std::vector<features::backends::KeyPoint> keypoints;
   std::vector<float> descriptors;
   sift.detectAndCompute(image.data(), gray.cols, gray.rows, keypoints,
                         descriptors);
 
   FeatureSet result;
   result.keypoints.reserve(keypoints.size());
-  for (const cv::KeyPointV2& keypoint : keypoints) {
+  for (const features::backends::KeyPoint& keypoint : keypoints) {
     FeatureKeypoint converted;
     converted.x = keypoint.x;
     converted.y = keypoint.y;
     converted.scale = keypoint.size;
     converted.orientation = keypoint.angle;
+    converted.response = keypoint.response;
     result.keypoints.push_back(converted);
   }
-  result.descriptors =
-      ConvertDescriptors(descriptors, keypoints.size(), options.use_root_sift);
+  if (descriptors.size() != keypoints.size() * 128) {
+    throw std::runtime_error("SIFT descriptor buffer has unexpected size.");
+  }
+  result.descriptors = features::ConvertSiftDescriptors(
+      descriptors.data(), keypoints.size(), options.use_root_sift);
   return result;
 }
 
@@ -247,8 +138,7 @@ FeatureSet ExtractVlSiftFeatures(const cv::Mat& gray,
   const int first_octave = options.upsample_first_octave ? -1 : 0;
   VlSiftFilt* filter =
       vl_sift_new(gray.cols, gray.rows, options.vl_num_octaves,
-                  options.num_octave_layers,
-                  first_octave);
+                  options.num_octave_layers, first_octave);
   if (filter == nullptr) {
     throw std::runtime_error("Failed to create VL SIFT filter.");
   }
@@ -256,7 +146,6 @@ FeatureSet ExtractVlSiftFeatures(const cv::Mat& gray,
   vl_sift_set_edge_thresh(filter, options.edge_threshold);
 
   std::vector<VlSiftLevelFeatures> levels;
-
   int err = vl_sift_process_first_octave(filter, image.data());
   while (err == VL_ERR_OK) {
     vl_sift_detect(filter);
@@ -284,10 +173,10 @@ FeatureSet ExtractVlSiftFeatures(const cv::Mat& gray,
       for (int orientation_idx = 0; orientation_idx < num_used_orientations;
            ++orientation_idx) {
         FeatureKeypoint converted;
-        // COLMAP 的 FeatureKeypoint 以像素中心 (0.5, 0.5) 为左上角原点。
         converted.x = keypoints[i].x + 0.5F;
         converted.y = keypoints[i].y + 0.5F;
         converted.scale = keypoints[i].sigma;
+        converted.response = 0.0F;
         converted.orientation =
             static_cast<float>(angles[orientation_idx] * 180.0 / kPi);
         if (converted.orientation < 0.0F) {
@@ -332,9 +221,11 @@ FeatureSet ExtractVlSiftFeatures(const cv::Mat& gray,
     descriptors.insert(descriptors.end(), levels[level_idx].descriptors.begin(),
                        levels[level_idx].descriptors.end());
   }
-  result.descriptors =
-      ConvertDescriptors(descriptors, result.keypoints.size(),
-                         options.use_root_sift);
+  if (descriptors.size() != result.keypoints.size() * 128) {
+    throw std::runtime_error("SIFT descriptor buffer has unexpected size.");
+  }
+  result.descriptors = features::ConvertSiftDescriptors(
+      descriptors.data(), result.keypoints.size(), options.use_root_sift);
   return result;
 }
 
@@ -342,12 +233,12 @@ FeatureSet ExtractVlSiftFeatures(const cv::Mat& gray,
 
 const char* SiftBackendName(const SiftBackend backend) {
   switch (backend) {
-    case SiftBackend::kOpenCV:
-      return "opencv";
     case SiftBackend::kVlSift:
       return "vlsift";
     case SiftBackend::kCvSift:
       return "cvsift";
+    case SiftBackend::kCudaSift:
+      return "cudasift";
   }
   return "unknown";
 }
@@ -359,15 +250,16 @@ SiftBackend SiftBackendFromName(std::string_view name) {
                    return static_cast<char>(std::tolower(ch));
                  });
 
-  if (normalized == "opencv" || normalized == "opencv_sift") {
-    return SiftBackend::kOpenCV;
-  }
   if (normalized == "vlsift" || normalized == "vl_sift" ||
       normalized == "vlfeat") {
     return SiftBackend::kVlSift;
   }
   if (normalized == "cvsift" || normalized == "cv_sift") {
     return SiftBackend::kCvSift;
+  }
+  if (normalized == "cudasift" || normalized == "cuda_sift" ||
+      normalized == "cuda") {
+    return SiftBackend::kCudaSift;
   }
   throw std::invalid_argument("Unsupported SIFT backend: " + normalized);
 }
@@ -376,12 +268,12 @@ FeatureSet ExtractSiftFeatures(const cv::Mat& image,
                                const SiftExtractionOptions& options) {
   const cv::Mat gray = ToGrayImage(image);
   switch (options.backend) {
-    case SiftBackend::kOpenCV:
-      return ExtractOpenCvSiftFeatures(gray, options);
     case SiftBackend::kVlSift:
       return ExtractVlSiftFeatures(gray, options);
     case SiftBackend::kCvSift:
       return ExtractCvSiftFeatures(gray, options);
+    case SiftBackend::kCudaSift:
+      return ExtractCudaSiftFeatures(gray, options);
   }
   throw std::invalid_argument("Unsupported SIFT backend.");
 }

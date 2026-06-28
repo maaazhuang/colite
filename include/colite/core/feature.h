@@ -18,6 +18,8 @@ struct FeatureKeypoint {
   float y = 0.0F;
   float scale = 1.0F;
   float orientation = 0.0F;
+  // 特征响应强度，用于特征筛选、诊断和不同后端之间的排序对齐。
+  float response = 0.0F;
 };
 
 // 两张图像之间的一条特征匹配，idx1/idx2 分别索引两张图像的特征点。

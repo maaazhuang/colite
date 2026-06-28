@@ -5,8 +5,10 @@ add_executable(colite_core_tests
   core/reconstruction_test.cpp
   features/sift_extractor_test.cpp
   features/sift_reference_consistency_test.cpp
-  integration/recon_mvs_app_test.cpp
-  integration/recon_sfm_app_test.cpp
+  integration/recon_mvs_exe_test.cpp
+  integration/recon_sfm_exe_test.cpp
+  integration/sfm_workspace_and_commands_test.cpp
+  integration/sfm_dependency_boundary_test.cpp
   matching/descriptor_matcher_test.cpp
   matching/guided_matching_test.cpp
   matching/two_view_geometry_batch_test.cpp
@@ -67,8 +69,9 @@ target_compile_options(vlfeat_original_reference
 target_link_libraries(colite_core_tests
   PRIVATE
     colite_core
-    recon_mvs_app
-    recon_sfm_app
+    colite_sfm_command_exe
+    colite_recon_mvs_exe
+    colite_recon_sfm_exe
     GTest::gtest_main
     vlfeat_original_reference
 )

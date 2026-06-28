@@ -46,16 +46,31 @@ void AppendProjectedPoint(const Camera& camera,
 
 void FillDescriptorsForRelaxedRecovery(FeatureSet* features1,
                                        FeatureSet* features2) {
-  features1->descriptors.resize(10, 1);
-  features2->descriptors.resize(12, 1);
+  constexpr int kBlockSize = 8;
+  constexpr float kDescriptorValue = 181.0F;
+  features1->descriptors.resize(10, 128);
+  features2->descriptors.resize(12, 128);
+  features1->descriptors.setZero();
+  features2->descriptors.setZero();
+
   for (int i = 0; i < 10; ++i) {
-    features1->descriptors(i, 0) = static_cast<float>(10 * i);
-    features2->descriptors(i, 0) = static_cast<float>(10 * i + 1);
+    for (int offset = 0; offset < kBlockSize; ++offset) {
+      const int col = i * kBlockSize + offset;
+      features1->descriptors(i, col) = kDescriptorValue;
+      features2->descriptors(i, col) = kDescriptorValue;
+    }
   }
 
   // 第 8/9 个点的第二近邻较近：ratio=0.8 会拒绝，ratio=0.95 会接受。
-  features2->descriptors(10, 0) = 81.1F;
-  features2->descriptors(11, 0) = 91.1F;
+  for (int offset = 0; offset < kBlockSize; ++offset) {
+    features2->descriptors(10, 8 * kBlockSize + offset) = kDescriptorValue;
+    features2->descriptors(11, 9 * kBlockSize + offset) = kDescriptorValue;
+  }
+  features2->descriptors(8, 8 * kBlockSize + kBlockSize - 1) = 170.0F;
+  features2->descriptors(9, 9 * kBlockSize + kBlockSize - 1) = 170.0F;
+  features2->descriptors(10, 8 * kBlockSize + kBlockSize - 1) = 166.0F;
+  features2->descriptors(11, 9 * kBlockSize + kBlockSize - 1) = 166.0F;
+
   features2->keypoints.push_back(features2->keypoints[8]);
   features2->keypoints.push_back(features2->keypoints[9]);
 }

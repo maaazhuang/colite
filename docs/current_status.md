@@ -104,12 +104,23 @@ colmap mapper \
 
 - SIFT 特征提取模块。
 - 支持三种可切换 SIFT 后端：
-  - `opencv`：保留原 OpenCV `cv::SIFT` 直接调用路径。
   - `vlsift`：接入从 `references/sift/sift_vlfeat` 复制到项目内的改造 VLFeat SIFT，并已按 COLMAP CPU SIFT 封装方式改进。
-  - `cvsift`：接入从 `references/sift/sift_opencv` 复制到项目内的改造 OpenCV-like SIFT。
+  - `cvsift`：接入从 `references/sift/sift_opencv` 复制到项目内的改造 OpenCV-like SIFT，也是当前默认后端。
+- 现已新增可选 `cudasift` 后端：源码从 `references/CudaSift-AdaLovelace` 复制到项目内，需用 `-DCOLITE_ENABLE_CUDA_SIFT=ON` 和 CUDA 编译器启用；默认 CPU 构建中保留后端名和明确的不可用错误。
+- 项目内后端源码统一放在 `src/colite/features/backends`：`sift_vlfeat.*` 已内联原 `vl_imconv` 列卷积逻辑，`sift_opencv.*` 已移除 `V2` 命名和 `cv` 命名空间，改为 colite 自有命名空间。
+- OpenCV `cv::SIFT` 直接调用路径已移除；OpenCV 目前只保留在图像读写、灰度转换、resize 和 `cv::Mat` 容器层。
 - 支持最大特征数量配置。
 - 已做 RootSIFT/归一化相关处理。
 - 当前与 COLMAP 差距主要仍集中在特征提取策略细节，例如尺度、方向、多方向 keypoint、特征数量语义等。
+- `FeatureKeypoint` 已补充 `response` 字段，用于跨后端特征强度排序、诊断和后续 COLMAP 风格筛选。
+
+三种 SIFT 后端的主要差异与当前适配口径：
+
+- `vlsift` 输入灰度按 `[0, 1]`，坐标使用 COLMAP 像素中心约定，descriptor 已从 VLFeat bin 顺序转换到 UBC/SiftGPU 顺序，特征数量限制按尺度层保留。
+- `cvsift` 输入灰度按 `[0, 255]`，descriptor 和 keypoint 行为贴近 OpenCV SIFT，`response` 来自 OpenCV-like 检测响应。
+- `cudasift` 输入灰度按 `[0, 255]`，descriptor 在 CUDA kernel 内先执行 Lowe 风格 L2 归一化和 0.2 截断，再由 colite 公共转换入口执行 RootSIFT；`response` 当前使用 DoG `abs(sharpness)`。
+- `cudasift` 的 `max_num_features` 现已适配为最终输出上限：内部使用更大的候选池提取，再按 `response` 降序和坐标稳定 tie-break 裁剪，避免低特征数时被 GPU 原子写入顺序截断。
+- 三个后端最终都输出 `FeatureSet` + `DescriptorMatrix`，并通过同一套 RootSIFT 转换逻辑进入匹配模块。
 
 `vlsift` 当前已对齐 COLMAP CPU SIFT 的关键封装逻辑：
 
@@ -124,10 +135,10 @@ colmap mapper \
 ### matching
 
 - 描述子匹配：
-  - OpenCV 分支。
-  - FLANN 分支。
-  - 自研/独立 FLANN 路线按 COLMAP 思路推进，尽量降低对 OpenCV matcher 的依赖。
-- 二视图几何验证。
+  - `bf`：自实现 CPU brute-force matcher，不依赖 OpenCV BFMatcher；SIFT float 描述子会先转为 COLMAP 风格的 uint8/512 空间，再按 COLMAP CPU brute-force 的 dot-product、`max_distance`、ratio、cross-check 逻辑筛选。
+  - `flann`：独立 libflann 后端，使用 `flann::L2<uint8_t>`、4 棵 KDTree、128 leaves，参数和距离空间对齐 COLMAP CPU FLANN matcher。
+  - 命令行仍通过 `--matcher <bf|flann>` 切换。
+- 二视图几何验证：已移除 OpenCV calib3d 依赖，改为内部 RANSAC + 八点法估计 E/F，DLT 估计 H，并通过 essential 分解和正深度检查恢复相对位姿。
 - exhaustive pair 处理。
 - guided matching。
 - 二阶段 weak pair rematching。
@@ -137,7 +148,7 @@ colmap mapper \
 
 - 增量 SfM 初始化。
 - 新图像注册。
-- PnP/注册候选调度。
+- PnP/注册候选调度：已移除 OpenCV `solvePnPRansac` 依赖，改为内部 DLT PnP + RANSAC + 内点重估；图像读写仍可继续使用 OpenCV。
 - 增量三角化。
 - re-triangulation。
 - 局部 BA。
@@ -166,7 +177,7 @@ colmap mapper \
   --output_path build-wsl/compare-building-18/controlled-colite-4000-pinhole \
   --focal_length 2457.6 \
   --max_num_features 4000 \
-  --feature_extractor opencv \
+  --feature_extractor cvsift \
   --matcher flann
 ```
 
@@ -178,7 +189,7 @@ colmap mapper \
   --output_path build-wsl/compare-building-18/controlled-colite-8000-pinhole \
   --focal_length 2457.6 \
   --max_num_features 8000 \
-  --feature_extractor opencv \
+  --feature_extractor cvsift \
   --matcher flann
 ```
 

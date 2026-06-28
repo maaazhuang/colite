@@ -7,18 +7,22 @@
 namespace colite {
 
 // 描述子匹配后端。
-// kOpenCVBruteForce：直接调用 OpenCV BFMatcher。
-// kFlann：直接使用独立 FLANN 库做 KNN 搜索，流程参考 COLMAP 的 FLANN 索引思路。
+// kBruteForce：自实现 CPU 暴力匹配，流程参考 COLMAP CPU brute-force matcher。
+// kFlann：直接使用独立 FLANN 库做 KNN 搜索，参数对齐 COLMAP CPU FLANN matcher。
 enum class DescriptorMatcherBackend {
-  kOpenCVBruteForce,
+  kBruteForce,
+  kOpenCVBruteForce = kBruteForce,  // 兼容旧命名，内部已不再依赖 OpenCV matcher。
   kFlann,
 };
 
 struct DescriptorMatchingOptions {
-  DescriptorMatcherBackend backend = DescriptorMatcherBackend::kOpenCVBruteForce;
+  DescriptorMatcherBackend backend = DescriptorMatcherBackend::kBruteForce;
 
-  // Lowe ratio test 阈值。0.8 是 SIFT 常用默认值。
+  // Lowe ratio test 阈值。COLMAP SIFT 默认值为 0.8。
   double max_ratio = 0.8;
+
+  // 最佳匹配距离上限。该阈值定义在 COLMAP 的长度 512 SIFT 描述子距离空间中。
+  double max_distance = 0.7;
 
   // 是否启用互检。启用后要求 A->B 的最佳匹配和 B->A 的最佳匹配互相一致。
   bool mutual_check = true;

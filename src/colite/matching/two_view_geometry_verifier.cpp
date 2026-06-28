@@ -2,11 +2,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <numeric>
+#include <optional>
+#include <random>
 #include <stdexcept>
+#include <vector>
 
 #include <Eigen/Geometry>
-#include <opencv2/calib3d.hpp>
-#include <opencv2/core.hpp>
+#include <Eigen/SVD>
 
 #include "colite/core/geometry.h"
 
@@ -14,13 +18,24 @@ namespace colite {
 namespace {
 
 constexpr std::size_t kMinPointsForRobustTwoViewGeometry = 8;
+constexpr double kMinHomogeneousScale = 1e-12;
 
 struct MatchedPoints {
-  std::vector<cv::Point2f> pixels1;
-  std::vector<cv::Point2f> pixels2;
-  std::vector<cv::Point2f> normalized1;
-  std::vector<cv::Point2f> normalized2;
+  std::vector<Eigen::Vector2d> pixels1;
+  std::vector<Eigen::Vector2d> pixels2;
+  std::vector<Eigen::Vector2d> normalized1;
+  std::vector<Eigen::Vector2d> normalized2;
   std::vector<FeatureMatch> matches;
+};
+
+struct NormalizedPoints2D {
+  std::vector<Eigen::Vector2d> points;
+  Eigen::Matrix3d transform = Eigen::Matrix3d::Identity();
+};
+
+struct MatrixRansacResult {
+  Eigen::Matrix3d model = Eigen::Matrix3d::Zero();
+  std::vector<std::size_t> inlier_indices;
 };
 
 bool IsValidFeatureIndex(Point2DIdx idx, const FeatureSet& features) {
@@ -28,12 +43,11 @@ bool IsValidFeatureIndex(Point2DIdx idx, const FeatureSet& features) {
          idx < static_cast<Point2DIdx>(features.keypoints.size());
 }
 
-cv::Point2f NormalizedPointFromPixel(const Camera& camera,
-                                     const FeatureKeypoint& keypoint) {
+Eigen::Vector2d NormalizedPointFromPixel(const Camera& camera,
+                                         const FeatureKeypoint& keypoint) {
   const Eigen::Vector3d ray =
       UnprojectPixel(camera, Eigen::Vector2d(keypoint.x, keypoint.y), 1.0);
-  return {static_cast<float>(ray.x() / ray.z()),
-          static_cast<float>(ray.y() / ray.z())};
+  return {ray.x() / ray.z(), ray.y() / ray.z()};
 }
 
 MatchedPoints ExtractMatchedPoints(const Camera& camera1,
@@ -66,39 +80,242 @@ MatchedPoints ExtractMatchedPoints(const Camera& camera1,
   return points;
 }
 
-Eigen::Matrix3d CvMatToEigen3d(const cv::Mat& input) {
-  cv::Mat matrix;
-  input.convertTo(matrix, CV_64F);
+NormalizedPoints2D NormalizePoints(const std::vector<Eigen::Vector2d>& points,
+                                   const std::vector<std::size_t>& indices) {
+  NormalizedPoints2D result;
+  result.points.reserve(indices.size());
+  if (indices.empty()) {
+    return result;
+  }
 
-  Eigen::Matrix3d result = Eigen::Matrix3d::Zero();
-  for (int row = 0; row < 3; ++row) {
-    for (int col = 0; col < 3; ++col) {
-      result(row, col) = matrix.at<double>(row, col);
-    }
+  Eigen::Vector2d centroid = Eigen::Vector2d::Zero();
+  for (const std::size_t idx : indices) {
+    centroid += points[idx];
+  }
+  centroid /= static_cast<double>(indices.size());
+
+  double mean_distance = 0.0;
+  for (const std::size_t idx : indices) {
+    mean_distance += (points[idx] - centroid).norm();
+  }
+  mean_distance /= static_cast<double>(indices.size());
+  const double scale =
+      mean_distance > 0.0 ? std::sqrt(2.0) / mean_distance : 1.0;
+
+  result.transform << scale, 0.0, -scale * centroid.x(), 0.0, scale,
+      -scale * centroid.y(), 0.0, 0.0, 1.0;
+  for (const std::size_t idx : indices) {
+    result.points.push_back((result.transform *
+                             points[idx].homogeneous())
+                                .hnormalized());
   }
   return result;
 }
 
-cv::Mat FirstThreeByThreeBlock(const cv::Mat& input) {
-  if (input.rows < 3 || input.cols != 3) {
-    return {};
-  }
-  return input.rowRange(0, 3).clone();
+std::vector<std::size_t> AllIndices(const std::size_t count) {
+  std::vector<std::size_t> indices(count);
+  std::iota(indices.begin(), indices.end(), 0);
+  return indices;
 }
 
-std::vector<FeatureMatch> InlierMatchesFromMask(
-    const std::vector<FeatureMatch>& matches,
-    const cv::Mat& mask) {
-  std::vector<FeatureMatch> inliers;
-  if (mask.empty()) {
-    return inliers;
+std::vector<std::size_t> SampleUniqueIndices(std::mt19937* rng,
+                                             const std::size_t count,
+                                             const std::size_t sample_size) {
+  std::vector<std::size_t> indices = AllIndices(count);
+  std::shuffle(indices.begin(), indices.end(), *rng);
+  indices.resize(sample_size);
+  return indices;
+}
+
+std::optional<Eigen::Matrix3d> EstimateFundamentalMatrix(
+    const std::vector<Eigen::Vector2d>& points1,
+    const std::vector<Eigen::Vector2d>& points2,
+    const std::vector<std::size_t>& indices) {
+  if (indices.size() < 8) {
+    return std::nullopt;
   }
 
-  inliers.reserve(matches.size());
-  for (int i = 0; i < mask.rows; ++i) {
-    if (mask.at<uchar>(i, 0) != 0) {
-      inliers.push_back(matches[static_cast<std::size_t>(i)]);
+  const NormalizedPoints2D norm1 = NormalizePoints(points1, indices);
+  const NormalizedPoints2D norm2 = NormalizePoints(points2, indices);
+
+  Eigen::MatrixXd a(indices.size(), 9);
+  for (std::size_t i = 0; i < indices.size(); ++i) {
+    const double x1 = norm1.points[i].x();
+    const double y1 = norm1.points[i].y();
+    const double x2 = norm2.points[i].x();
+    const double y2 = norm2.points[i].y();
+    a.row(static_cast<Eigen::Index>(i)) << x2 * x1, x2 * y1, x2, y2 * x1,
+        y2 * y1, y2, x1, y1, 1.0;
+  }
+
+  const Eigen::JacobiSVD<Eigen::MatrixXd> svd(a, Eigen::ComputeFullV);
+  Eigen::Matrix3d f =
+      Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::RowMajor>>(
+          svd.matrixV().col(8).data());
+
+  const Eigen::JacobiSVD<Eigen::Matrix3d> f_svd(
+      f, Eigen::ComputeFullU | Eigen::ComputeFullV);
+  Eigen::Vector3d singular_values = f_svd.singularValues();
+  singular_values.z() = 0.0;
+  f = f_svd.matrixU() * singular_values.asDiagonal() *
+      f_svd.matrixV().transpose();
+
+  Eigen::Matrix3d denormalized =
+      norm2.transform.transpose() * f * norm1.transform;
+  const double norm = denormalized.norm();
+  if (norm <= 0.0 || !std::isfinite(norm)) {
+    return std::nullopt;
+  }
+  return denormalized / norm;
+}
+
+std::optional<Eigen::Matrix3d> EstimateEssentialMatrix(
+    const std::vector<Eigen::Vector2d>& points1,
+    const std::vector<Eigen::Vector2d>& points2,
+    const std::vector<std::size_t>& indices) {
+  auto essential = EstimateFundamentalMatrix(points1, points2, indices);
+  if (!essential) {
+    return std::nullopt;
+  }
+
+  const Eigen::JacobiSVD<Eigen::Matrix3d> svd(
+      *essential, Eigen::ComputeFullU | Eigen::ComputeFullV);
+  const double sigma =
+      0.5 * (svd.singularValues().x() + svd.singularValues().y());
+  Eigen::Matrix3d corrected = svd.matrixU() *
+                              Eigen::Vector3d(sigma, sigma, 0.0).asDiagonal() *
+                              svd.matrixV().transpose();
+  const double norm = corrected.norm();
+  if (norm <= 0.0 || !std::isfinite(norm)) {
+    return std::nullopt;
+  }
+  return corrected / norm;
+}
+
+std::optional<Eigen::Matrix3d> EstimateHomographyMatrix(
+    const std::vector<Eigen::Vector2d>& points1,
+    const std::vector<Eigen::Vector2d>& points2,
+    const std::vector<std::size_t>& indices) {
+  if (indices.size() < 4) {
+    return std::nullopt;
+  }
+
+  const NormalizedPoints2D norm1 = NormalizePoints(points1, indices);
+  const NormalizedPoints2D norm2 = NormalizePoints(points2, indices);
+
+  Eigen::MatrixXd a(static_cast<Eigen::Index>(2 * indices.size()), 9);
+  for (std::size_t i = 0; i < indices.size(); ++i) {
+    const double x = norm1.points[i].x();
+    const double y = norm1.points[i].y();
+    const double xp = norm2.points[i].x();
+    const double yp = norm2.points[i].y();
+    a.row(static_cast<Eigen::Index>(2 * i))
+        << -x, -y, -1.0, 0.0, 0.0, 0.0, xp * x, xp * y, xp;
+    a.row(static_cast<Eigen::Index>(2 * i + 1))
+        << 0.0, 0.0, 0.0, -x, -y, -1.0, yp * x, yp * y, yp;
+  }
+
+  const Eigen::JacobiSVD<Eigen::MatrixXd> svd(a, Eigen::ComputeFullV);
+  Eigen::Matrix3d h =
+      Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::RowMajor>>(
+          svd.matrixV().col(8).data());
+  h = norm2.transform.inverse() * h * norm1.transform;
+
+  const double scale =
+      std::abs(h(2, 2)) > kMinHomogeneousScale ? h(2, 2) : h.norm();
+  if (std::abs(scale) <= kMinHomogeneousScale || !std::isfinite(scale)) {
+    return std::nullopt;
+  }
+  return h / scale;
+}
+
+double SampsonError(const Eigen::Matrix3d& matrix,
+                    const Eigen::Vector2d& point1,
+                    const Eigen::Vector2d& point2) {
+  const Eigen::Vector3d x1 = point1.homogeneous();
+  const Eigen::Vector3d x2 = point2.homogeneous();
+  const Eigen::Vector3d mx1 = matrix * x1;
+  const Eigen::Vector3d mtx2 = matrix.transpose() * x2;
+  const double x2tmx1 = x2.dot(mx1);
+  const double denom =
+      mx1.x() * mx1.x() + mx1.y() * mx1.y() + mtx2.x() * mtx2.x() +
+      mtx2.y() * mtx2.y();
+  if (denom <= 0.0) {
+    return std::numeric_limits<double>::infinity();
+  }
+  return std::abs(x2tmx1) / std::sqrt(denom);
+}
+
+double HomographyTransferError(const Eigen::Matrix3d& homography,
+                               const Eigen::Vector2d& point1,
+                               const Eigen::Vector2d& point2) {
+  const Eigen::Vector3d transferred = homography * point1.homogeneous();
+  if (std::abs(transferred.z()) <= kMinHomogeneousScale) {
+    return std::numeric_limits<double>::infinity();
+  }
+  return (transferred.hnormalized() - point2).norm();
+}
+
+template <typename Estimator, typename Residual>
+MatrixRansacResult RunMatrixRansac(const std::size_t num_points,
+                                   const std::size_t sample_size,
+                                   const int max_num_iterations,
+                                   const double max_error,
+                                   Estimator estimator,
+                                   Residual residual) {
+  MatrixRansacResult best;
+  if (num_points < sample_size) {
+    return best;
+  }
+
+  std::mt19937 rng(0);
+  const int iterations = std::max(1, max_num_iterations);
+  for (int iteration = 0; iteration < iterations; ++iteration) {
+    const std::vector<std::size_t> sample =
+        num_points == sample_size ? AllIndices(num_points)
+                                  : SampleUniqueIndices(&rng, num_points,
+                                                        sample_size);
+    const std::optional<Eigen::Matrix3d> model = estimator(sample);
+    if (!model) {
+      continue;
     }
+
+    std::vector<std::size_t> inliers;
+    inliers.reserve(num_points);
+    for (std::size_t idx = 0; idx < num_points; ++idx) {
+      const double error = residual(*model, idx);
+      if (std::isfinite(error) && error <= max_error) {
+        inliers.push_back(idx);
+      }
+    }
+
+    if (inliers.size() > best.inlier_indices.size()) {
+      best.model = *model;
+      best.inlier_indices = std::move(inliers);
+      if (best.inlier_indices.size() == num_points) {
+        break;
+      }
+    }
+  }
+
+  if (best.inlier_indices.size() >= sample_size) {
+    const std::optional<Eigen::Matrix3d> refined =
+        estimator(best.inlier_indices);
+    if (refined) {
+      best.model = *refined;
+    }
+  }
+
+  return best;
+}
+
+std::vector<FeatureMatch> MatchesFromInlierIndices(
+    const std::vector<FeatureMatch>& matches,
+    const std::vector<std::size_t>& inlier_indices) {
+  std::vector<FeatureMatch> inliers;
+  inliers.reserve(inlier_indices.size());
+  for (const std::size_t idx : inlier_indices) {
+    inliers.push_back(matches[idx]);
   }
   return inliers;
 }
@@ -114,14 +331,88 @@ double NormalizedRansacThreshold(const Camera& camera1,
   return max_error_px / focal;
 }
 
-Pose3 RelativePoseFromCv(const cv::Mat& rotation, const cv::Mat& translation) {
-  Pose3 cam2_from_cam1;
-  const Eigen::Matrix3d r = CvMatToEigen3d(rotation);
-  cam2_from_cam1.q_cw = Eigen::Quaterniond(r).normalized();
-  cam2_from_cam1.t_cw =
-      Eigen::Vector3d(translation.at<double>(0), translation.at<double>(1),
-                      translation.at<double>(2));
-  return cam2_from_cam1;
+std::optional<Eigen::Vector3d> TriangulateNormalizedPoint(
+    const Eigen::Vector2d& point1,
+    const Eigen::Vector2d& point2,
+    const Eigen::Matrix3d& rotation,
+    const Eigen::Vector3d& translation) {
+  Eigen::Matrix<double, 3, 4> p1;
+  p1 << Eigen::Matrix3d::Identity(), Eigen::Vector3d::Zero();
+  Eigen::Matrix<double, 3, 4> p2;
+  p2 << rotation, translation;
+
+  Eigen::Matrix4d a;
+  a.row(0) = point1.x() * p1.row(2) - p1.row(0);
+  a.row(1) = point1.y() * p1.row(2) - p1.row(1);
+  a.row(2) = point2.x() * p2.row(2) - p2.row(0);
+  a.row(3) = point2.y() * p2.row(2) - p2.row(1);
+
+  const Eigen::JacobiSVD<Eigen::Matrix4d> svd(a, Eigen::ComputeFullV);
+  const Eigen::Vector4d homogeneous = svd.matrixV().col(3);
+  if (std::abs(homogeneous.w()) <= kMinHomogeneousScale) {
+    return std::nullopt;
+  }
+  return homogeneous.hnormalized();
+}
+
+bool HasPositiveDepthInBothViews(const Eigen::Vector3d& point_cam1,
+                                 const Eigen::Matrix3d& rotation,
+                                 const Eigen::Vector3d& translation) {
+  const Eigen::Vector3d point_cam2 = rotation * point_cam1 + translation;
+  return point_cam1.z() > 0.0 && point_cam2.z() > 0.0;
+}
+
+Pose3 ChoosePoseFromEssentialMatrix(
+    const Eigen::Matrix3d& essential,
+    const std::vector<Eigen::Vector2d>& points1,
+    const std::vector<Eigen::Vector2d>& points2,
+    const std::vector<std::size_t>& inlier_indices) {
+  Eigen::JacobiSVD<Eigen::Matrix3d> svd(
+      essential, Eigen::ComputeFullU | Eigen::ComputeFullV);
+  Eigen::Matrix3d u = svd.matrixU();
+  Eigen::Matrix3d vt = svd.matrixV().transpose();
+  if (u.determinant() < 0.0) {
+    u.col(2) *= -1.0;
+  }
+  if (vt.determinant() < 0.0) {
+    vt.row(2) *= -1.0;
+  }
+
+  Eigen::Matrix3d w;
+  w << 0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0;
+
+  std::vector<std::pair<Eigen::Matrix3d, Eigen::Vector3d>> candidates;
+  candidates.emplace_back(u * w * vt, u.col(2));
+  candidates.emplace_back(u * w * vt, -u.col(2));
+  candidates.emplace_back(u * w.transpose() * vt, u.col(2));
+  candidates.emplace_back(u * w.transpose() * vt, -u.col(2));
+
+  std::size_t best_positive_depths = 0;
+  Pose3 best_pose;
+  for (auto& [rotation, translation] : candidates) {
+    if (rotation.determinant() < 0.0) {
+      rotation = -rotation;
+      translation = -translation;
+    }
+
+    std::size_t positive_depths = 0;
+    for (const std::size_t idx : inlier_indices) {
+      const auto point_cam1 =
+          TriangulateNormalizedPoint(points1[idx], points2[idx], rotation,
+                                     translation);
+      if (point_cam1 &&
+          HasPositiveDepthInBothViews(*point_cam1, rotation, translation)) {
+        ++positive_depths;
+      }
+    }
+
+    if (positive_depths > best_positive_depths) {
+      best_positive_depths = positive_depths;
+      best_pose.q_cw = Eigen::Quaterniond(rotation).normalized();
+      best_pose.t_cw = translation.normalized();
+    }
+  }
+  return best_pose;
 }
 
 double ComputeMedianTriangulationAngle(
@@ -177,60 +468,71 @@ TwoViewGeometry EstimateTwoViewGeometry(
     return geometry;
   }
 
-  cv::Mat fundamental_mask;
-  const cv::Mat fundamental = cv::findFundamentalMat(
-      points.pixels1, points.pixels2, cv::FM_RANSAC, options.max_error_px,
-      options.confidence, fundamental_mask);
-  std::vector<FeatureMatch> fundamental_inliers;
-  if (!fundamental.empty() && fundamental.rows == 3 && fundamental.cols == 3) {
-    geometry.F = CvMatToEigen3d(fundamental);
-    fundamental_inliers =
-        InlierMatchesFromMask(points.matches, fundamental_mask);
+  const MatrixRansacResult fundamental = RunMatrixRansac(
+      points.matches.size(), 8, options.max_num_iterations,
+      options.max_error_px,
+      [&](const std::vector<std::size_t>& sample) {
+        return EstimateFundamentalMatrix(points.pixels1, points.pixels2,
+                                         sample);
+      },
+      [&](const Eigen::Matrix3d& model, const std::size_t idx) {
+        return SampsonError(model, points.pixels1[idx], points.pixels2[idx]);
+      });
+  if (!fundamental.inlier_indices.empty()) {
+    geometry.F = fundamental.model;
   }
 
   if (options.estimate_homography) {
-    cv::Mat homography_mask;
-    const cv::Mat homography = cv::findHomography(
-        points.pixels1, points.pixels2, cv::RANSAC, options.max_error_px,
-        homography_mask);
-    if (!homography.empty() && homography.rows == 3 && homography.cols == 3) {
-      geometry.H = CvMatToEigen3d(homography);
+    const MatrixRansacResult homography = RunMatrixRansac(
+        points.matches.size(), 4, options.max_num_iterations,
+        options.max_error_px,
+        [&](const std::vector<std::size_t>& sample) {
+          return EstimateHomographyMatrix(points.pixels1, points.pixels2,
+                                          sample);
+        },
+        [&](const Eigen::Matrix3d& model, const std::size_t idx) {
+          return HomographyTransferError(model, points.pixels1[idx],
+                                         points.pixels2[idx]);
+        });
+    if (!homography.inlier_indices.empty()) {
+      geometry.H = homography.model;
     }
   }
 
-  cv::Mat essential_mask;
-  cv::Mat essential = cv::findEssentialMat(
-      points.normalized1, points.normalized2, 1.0, cv::Point2d(0.0, 0.0),
-      cv::RANSAC, options.confidence,
-      NormalizedRansacThreshold(camera1, camera2, options.max_error_px),
-      essential_mask);
-  essential = FirstThreeByThreeBlock(essential);
+  const double normalized_threshold =
+      NormalizedRansacThreshold(camera1, camera2, options.max_error_px);
+  const MatrixRansacResult essential = RunMatrixRansac(
+      points.matches.size(), 8, options.max_num_iterations,
+      normalized_threshold,
+      [&](const std::vector<std::size_t>& sample) {
+        return EstimateEssentialMatrix(points.normalized1, points.normalized2,
+                                       sample);
+      },
+      [&](const Eigen::Matrix3d& model, const std::size_t idx) {
+        return SampsonError(model, points.normalized1[idx],
+                            points.normalized2[idx]);
+      });
 
-  if (!essential.empty()) {
-    cv::Mat rotation;
-    cv::Mat translation;
-    cv::Mat recover_mask = essential_mask.clone();
-    cv::recoverPose(essential, points.normalized1, points.normalized2, rotation,
-                    translation, 1.0, cv::Point2d(0.0, 0.0), recover_mask);
-
-    geometry.E = CvMatToEigen3d(essential);
-    geometry.cam2_from_cam1 = RelativePoseFromCv(rotation, translation);
-    geometry.inlier_matches = InlierMatchesFromMask(points.matches, recover_mask);
+  if (essential.inlier_indices.size() >=
+      static_cast<std::size_t>(options.min_num_inliers)) {
+    geometry.E = essential.model;
+    geometry.cam2_from_cam1 = ChoosePoseFromEssentialMatrix(
+        geometry.E, points.normalized1, points.normalized2,
+        essential.inlier_indices);
+    geometry.inlier_matches =
+        MatchesFromInlierIndices(points.matches, essential.inlier_indices);
     geometry.median_triangulation_angle = ComputeMedianTriangulationAngle(
         camera1, features1, camera2, features2, geometry.cam2_from_cam1,
         geometry.inlier_matches);
-
-    if (geometry.inlier_matches.size() >=
-        static_cast<std::size_t>(options.min_num_inliers)) {
-      geometry.type = TwoViewGeometry::Type::kCalibratedEssential;
-      return geometry;
-    }
+    geometry.type = TwoViewGeometry::Type::kCalibratedEssential;
+    return geometry;
   }
 
-  if (fundamental_inliers.size() >=
+  if (fundamental.inlier_indices.size() >=
       static_cast<std::size_t>(options.min_num_inliers)) {
     geometry.type = TwoViewGeometry::Type::kUncalibratedFundamental;
-    geometry.inlier_matches = fundamental_inliers;
+    geometry.inlier_matches =
+        MatchesFromInlierIndices(points.matches, fundamental.inlier_indices);
     return geometry;
   }
 

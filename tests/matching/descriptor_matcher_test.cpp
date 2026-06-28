@@ -1,7 +1,6 @@
 #include "colite/matching/descriptor_matcher.h"
 
 #include <algorithm>
-#include <array>
 #include <initializer_list>
 #include <vector>
 
@@ -10,12 +9,28 @@
 namespace colite {
 namespace {
 
-DescriptorMatrix MakeDescriptors(std::initializer_list<std::array<float, 4>> rows) {
-  DescriptorMatrix descriptors(static_cast<Eigen::Index>(rows.size()), 4);
+DescriptorMatrix MakeBlockDescriptors(std::initializer_list<int> blocks) {
+  DescriptorMatrix descriptors(static_cast<Eigen::Index>(blocks.size()), 128);
+  descriptors.setZero();
   Eigen::Index row_idx = 0;
-  for (const auto& row : rows) {
-    for (Eigen::Index col = 0; col < 4; ++col) {
-      descriptors(row_idx, col) = row[static_cast<std::size_t>(col)];
+  for (const int block : blocks) {
+    for (Eigen::Index offset = 0; offset < 16; ++offset) {
+      descriptors(row_idx, static_cast<Eigen::Index>(block * 16) + offset) =
+          0.25F;
+    }
+    ++row_idx;
+  }
+  return descriptors;
+}
+
+DescriptorMatrix MakeUnitSiftDescriptors(std::initializer_list<int> blocks) {
+  DescriptorMatrix descriptors(static_cast<Eigen::Index>(blocks.size()), 128);
+  descriptors.setZero();
+  Eigen::Index row_idx = 0;
+  for (const int block : blocks) {
+    for (Eigen::Index offset = 0; offset < 16; ++offset) {
+      descriptors(row_idx, static_cast<Eigen::Index>(block * 16) + offset) =
+          0.25F;
     }
     ++row_idx;
   }
@@ -32,21 +47,12 @@ std::vector<std::pair<Point2DIdx, Point2DIdx>> ToPairs(
   return pairs;
 }
 
-TEST(DescriptorMatcherTest, OpenCVBruteForceMatchesWithRatioAndMutualCheck) {
-  const DescriptorMatrix descriptors1 = MakeDescriptors({
-      {0.0F, 0.0F, 0.0F, 0.0F},
-      {10.0F, 0.0F, 0.0F, 0.0F},
-      {0.0F, 10.0F, 0.0F, 0.0F},
-  });
-  const DescriptorMatrix descriptors2 = MakeDescriptors({
-      {0.1F, 0.0F, 0.0F, 0.0F},
-      {10.1F, 0.0F, 0.0F, 0.0F},
-      {0.0F, 10.1F, 0.0F, 0.0F},
-      {30.0F, 30.0F, 0.0F, 0.0F},
-  });
+TEST(DescriptorMatcherTest, BruteForceMatchesWithRatioAndMutualCheck) {
+  const DescriptorMatrix descriptors1 = MakeBlockDescriptors({0, 1, 2});
+  const DescriptorMatrix descriptors2 = MakeBlockDescriptors({0, 1, 2, 3});
 
   DescriptorMatchingOptions options;
-  options.backend = DescriptorMatcherBackend::kOpenCVBruteForce;
+  options.backend = DescriptorMatcherBackend::kBruteForce;
   options.max_ratio = 0.8;
   options.mutual_check = true;
 
@@ -58,21 +64,12 @@ TEST(DescriptorMatcherTest, OpenCVBruteForceMatchesWithRatioAndMutualCheck) {
                 {0, 0}, {1, 1}, {2, 2}}));
 }
 
-TEST(DescriptorMatcherTest, FlannMatchesSamePairsAsOpenCVBranch) {
-  const DescriptorMatrix descriptors1 = MakeDescriptors({
-      {0.0F, 0.0F, 0.0F, 0.0F},
-      {10.0F, 0.0F, 0.0F, 0.0F},
-      {0.0F, 10.0F, 0.0F, 0.0F},
-  });
-  const DescriptorMatrix descriptors2 = MakeDescriptors({
-      {0.1F, 0.0F, 0.0F, 0.0F},
-      {10.1F, 0.0F, 0.0F, 0.0F},
-      {0.0F, 10.1F, 0.0F, 0.0F},
-      {30.0F, 30.0F, 0.0F, 0.0F},
-  });
+TEST(DescriptorMatcherTest, FlannMatchesSamePairsAsBruteForceBranch) {
+  const DescriptorMatrix descriptors1 = MakeBlockDescriptors({0, 1, 2});
+  const DescriptorMatrix descriptors2 = MakeBlockDescriptors({0, 1, 2, 3});
 
   DescriptorMatchingOptions bf_options;
-  bf_options.backend = DescriptorMatcherBackend::kOpenCVBruteForce;
+  bf_options.backend = DescriptorMatcherBackend::kBruteForce;
   bf_options.max_ratio = 0.8;
   bf_options.mutual_check = true;
 
@@ -88,17 +85,38 @@ TEST(DescriptorMatcherTest, FlannMatchesSamePairsAsOpenCVBranch) {
 }
 
 TEST(DescriptorMatcherTest, RejectsAmbiguousMatchByRatio) {
-  const DescriptorMatrix descriptors1 = MakeDescriptors({
-      {0.0F, 0.0F, 0.0F, 0.0F},
-  });
-  const DescriptorMatrix descriptors2 = MakeDescriptors({
-      {0.1F, 0.0F, 0.0F, 0.0F},
-      {0.2F, 0.0F, 0.0F, 0.0F},
-  });
+  const DescriptorMatrix descriptors1 = MakeBlockDescriptors({0});
+  const DescriptorMatrix descriptors2 = MakeBlockDescriptors({0, 0});
 
   DescriptorMatchingOptions options;
-  options.backend = DescriptorMatcherBackend::kOpenCVBruteForce;
+  options.backend = DescriptorMatcherBackend::kBruteForce;
   options.max_ratio = 0.4;
+  options.mutual_check = false;
+
+  EXPECT_TRUE(MatchDescriptors(descriptors1, descriptors2, options).empty());
+}
+
+TEST(DescriptorMatcherTest, RejectsMatchBeyondColmapMaxDistance) {
+  const DescriptorMatrix descriptors1 = MakeUnitSiftDescriptors({0});
+  const DescriptorMatrix descriptors2 = MakeUnitSiftDescriptors({1, 2});
+
+  DescriptorMatchingOptions options;
+  options.backend = DescriptorMatcherBackend::kBruteForce;
+  options.max_ratio = 1.0;
+  options.max_distance = 0.7;
+  options.mutual_check = false;
+
+  EXPECT_TRUE(MatchDescriptors(descriptors1, descriptors2, options).empty());
+}
+
+TEST(DescriptorMatcherTest, RejectsEqualBestAndSecondBestByRatio) {
+  const DescriptorMatrix descriptors1 = MakeUnitSiftDescriptors({0});
+  const DescriptorMatrix descriptors2 = MakeUnitSiftDescriptors({0, 0});
+
+  DescriptorMatchingOptions options;
+  options.backend = DescriptorMatcherBackend::kBruteForce;
+  options.max_ratio = 1.0;
+  options.max_distance = 1.0;
   options.mutual_check = false;
 
   EXPECT_TRUE(MatchDescriptors(descriptors1, descriptors2, options).empty());

@@ -8,12 +8,8 @@
 
 #include <gtest/gtest.h>
 #include <opencv2/core.hpp>
-#include <opencv2/core/version.hpp>
-#include <opencv2/features2d.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
-
-#include "sift_opencv_v2.hpp"
 
 #define VlSiftFilt OrigVlSiftFilt
 #define VlSiftKeypoint OrigVlSiftKeypoint
@@ -79,7 +75,7 @@
 #undef VlSiftFilt
 
 extern "C" {
-#include "sift_vlfeat_v2.h"
+#include "sift_vlfeat.h"
 }
 
 namespace colite {
@@ -127,39 +123,6 @@ std::vector<float> MatToFloatVector(const cv::Mat& gray) {
     }
   }
   return result;
-}
-
-double AngleDifferenceDegrees(const float a, const float b) {
-  double diff = std::abs(static_cast<double>(a) - static_cast<double>(b));
-  while (diff >= 360.0) {
-    diff -= 360.0;
-  }
-  return std::min(diff, 360.0 - diff);
-}
-
-double DescriptorCosine(const float* a, const float* b, const int length) {
-  double dot = 0.0;
-  double norm_a = 0.0;
-  double norm_b = 0.0;
-  for (int i = 0; i < length; ++i) {
-    dot += static_cast<double>(a[i]) * static_cast<double>(b[i]);
-    norm_a += static_cast<double>(a[i]) * static_cast<double>(a[i]);
-    norm_b += static_cast<double>(b[i]) * static_cast<double>(b[i]);
-  }
-  if (norm_a == 0.0 || norm_b == 0.0) {
-    return 0.0;
-  }
-  return dot / std::sqrt(norm_a * norm_b);
-}
-
-cv::Ptr<cv::SIFT> CreateReferenceSift(const int max_features) {
-#if CV_VERSION_MAJOR > 4 || \
-    (CV_VERSION_MAJOR == 4 && CV_VERSION_MINOR > 12) || \
-    (CV_VERSION_MAJOR == 4 && CV_VERSION_MINOR == 12)
-  return cv::SIFT::create(max_features, 3, 0.04, 10.0, 1.6, CV_32F, true);
-#else
-  return cv::SIFT::create(max_features, 3, 0.04, 10.0, 1.6);
-#endif
 }
 
 std::vector<VlFeature> ExtractOriginalVlSift(const cv::Mat& gray) {
@@ -325,92 +288,6 @@ TEST(SiftReferenceConsistencyTest, VlFeatVariantMatchesOriginal) {
     }
   }
   EXPECT_LE(max_descriptor_linf, kVlFeatDescriptorTolerance);
-}
-
-TEST(SiftReferenceConsistencyTest, OpenCvVariantIsNearOpenCvSift) {
-  const cv::Mat image = LoadReferenceGrayImage();
-  ASSERT_FALSE(image.empty());
-
-  constexpr int kMaxFeatures = 300;
-  auto sift = CreateReferenceSift(kMaxFeatures);
-  std::vector<cv::KeyPoint> original_keypoints;
-  cv::Mat original_descriptors;
-  sift->detectAndCompute(image, cv::noArray(), original_keypoints,
-                         original_descriptors);
-
-  const std::vector<float> image_float = MatToFloatVector(image);
-  cv::SIFTV2 sift_v2 = cv::SIFTV2::create(kMaxFeatures, 3, 0.04, 10.0, 1.6);
-  std::vector<cv::KeyPointV2> modified_keypoints;
-  std::vector<float> modified_descriptors;
-  sift_v2.detectAndCompute(image_float.data(), image.cols, image.rows,
-                           modified_keypoints, modified_descriptors);
-
-  ASSERT_GT(original_keypoints.size(), 200u);
-  ASSERT_EQ(original_descriptors.cols, 128);
-  ASSERT_EQ(modified_descriptors.size(), modified_keypoints.size() * 128);
-
-  const double count_ratio =
-      static_cast<double>(modified_keypoints.size()) /
-      static_cast<double>(original_keypoints.size());
-  EXPECT_NEAR(count_ratio, 1.0, 0.12);
-
-  std::vector<int> used(original_keypoints.size(), 0);
-  int matched = 0;
-  double cosine_sum = 0.0;
-  const size_t candidates = std::min<size_t>(modified_keypoints.size(), 120);
-
-  for (size_t i = 0; i < candidates; ++i) {
-    const auto& candidate = modified_keypoints[i];
-    double best_score = std::numeric_limits<double>::max();
-    int best_index = -1;
-    for (size_t j = 0; j < original_keypoints.size(); ++j) {
-      if (used[j]) {
-        continue;
-      }
-      const cv::KeyPoint& ref = original_keypoints[j];
-      const double dx = static_cast<double>(candidate.x) - ref.pt.x;
-      const double dy = static_cast<double>(candidate.y) - ref.pt.y;
-      const double dist2 = dx * dx + dy * dy;
-      const double size_diff =
-          std::abs(static_cast<double>(candidate.size) -
-                   static_cast<double>(ref.size));
-      const double angle_diff =
-          AngleDifferenceDegrees(candidate.angle, ref.angle);
-      const double score = dist2 + size_diff * size_diff + angle_diff * 0.01;
-      if (score < best_score) {
-        best_score = score;
-        best_index = static_cast<int>(j);
-      }
-    }
-
-    if (best_index < 0) {
-      continue;
-    }
-
-    const cv::KeyPoint& ref = original_keypoints[best_index];
-    const double dx = static_cast<double>(candidate.x) - ref.pt.x;
-    const double dy = static_cast<double>(candidate.y) - ref.pt.y;
-    const double position_error = std::sqrt(dx * dx + dy * dy);
-    const double relative_size_error =
-        std::abs(static_cast<double>(candidate.size) -
-                 static_cast<double>(ref.size)) /
-        std::max(1.0, static_cast<double>(ref.size));
-    const double angle_error =
-        AngleDifferenceDegrees(candidate.angle, ref.angle);
-    if (position_error <= 1.25 && relative_size_error <= 0.20 &&
-        angle_error <= 12.0) {
-      used[best_index] = 1;
-      ++matched;
-      cosine_sum += DescriptorCosine(
-          modified_descriptors.data() + i * 128,
-          original_descriptors.ptr<float>(best_index), 128);
-    }
-  }
-
-  ASSERT_GT(matched, 0);
-  EXPECT_GE(static_cast<double>(matched) / static_cast<double>(candidates),
-            0.65);
-  EXPECT_GE(cosine_sum / static_cast<double>(matched), 0.85);
 }
 
 }  // namespace

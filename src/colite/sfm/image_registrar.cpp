@@ -1,14 +1,23 @@
 #include "colite/sfm/image_registrar.h"
 
+#include <algorithm>
+#include <cmath>
 #include <map>
+#include <numeric>
+#include <optional>
+#include <random>
 #include <vector>
 
 #include <Eigen/Geometry>
-#include <opencv2/calib3d.hpp>
-#include <opencv2/core.hpp>
+#include <Eigen/SVD>
+
+#include "colite/core/geometry.h"
 
 namespace colite {
 namespace {
+
+constexpr std::size_t kMinDltPnPPoints = 6;
+constexpr double kMinProjectionScale = 1e-12;
 
 struct PnPCorrespondence {
   Point3DId point3d_id = kInvalidPoint3DId;
@@ -46,7 +55,6 @@ bool IsUsableGeometry(const TwoViewGeometry& geometry) {
 
 void AddCorrespondenceIfValid(const FeatureMatch& match,
                               bool target_is_first,
-                              ImageId neighbor_image_id,
                               Image& target_image,
                               const Image& neighbor_image,
                               const Reconstruction& reconstruction,
@@ -74,7 +82,6 @@ void AddCorrespondenceIfValid(const FeatureMatch& match,
 
   const Point3D& point3d =
       reconstruction.GetPoint3D(neighbor_point2d.point3d_id);
-  (void)neighbor_image_id;
   correspondences_by_target_idx->emplace(
       target_idx,
       PnPCorrespondence{point3d.id, target_idx, point3d.xyz,
@@ -113,8 +120,8 @@ std::vector<PnPCorrespondence> CollectPnPCorrespondences(
     const Image& neighbor_image = reconstruction->GetImage(neighbor_id);
     const bool target_is_first = pair.image_id1 == image_id;
     for (const FeatureMatch& match : geometry.inlier_matches) {
-      AddCorrespondenceIfValid(match, target_is_first, neighbor_id,
-                               target_image, neighbor_image, *reconstruction,
+      AddCorrespondenceIfValid(match, target_is_first, target_image,
+                               neighbor_image, *reconstruction,
                                &unique_correspondences);
     }
   }
@@ -127,53 +134,186 @@ std::vector<PnPCorrespondence> CollectPnPCorrespondences(
   return correspondences;
 }
 
-cv::Mat CameraMatrixToCv(const Camera& camera) {
-  const Eigen::Matrix3d k = camera.CalibrationMatrix();
-  cv::Mat matrix(3, 3, CV_64F);
-  for (int row = 0; row < 3; ++row) {
-    for (int col = 0; col < 3; ++col) {
-      matrix.at<double>(row, col) = k(row, col);
+std::vector<std::size_t> AllIndices(const std::size_t count) {
+  std::vector<std::size_t> indices(count);
+  std::iota(indices.begin(), indices.end(), 0);
+  return indices;
+}
+
+std::vector<std::size_t> SampleUniqueIndices(std::mt19937* rng,
+                                             const std::size_t count,
+                                             const std::size_t sample_size) {
+  std::vector<std::size_t> indices = AllIndices(count);
+  std::shuffle(indices.begin(), indices.end(), *rng);
+  indices.resize(sample_size);
+  return indices;
+}
+
+Eigen::Vector2d NormalizedImagePoint(const Camera& camera,
+                                     const Eigen::Vector2d& pixel) {
+  const Eigen::Vector3d ray = UnprojectPixel(camera, pixel, 1.0);
+  return {ray.x() / ray.z(), ray.y() / ray.z()};
+}
+
+std::optional<Pose3> PoseFromProjectionMatrix(
+    Eigen::Matrix<double, 3, 4> projection,
+    const std::vector<PnPCorrespondence>& correspondences,
+    const std::vector<std::size_t>& indices) {
+  Pose3 best_pose;
+  std::size_t best_positive_depths = 0;
+
+  for (const double sign : {1.0, -1.0}) {
+    const Eigen::Matrix<double, 3, 4> signed_projection = sign * projection;
+    const Eigen::Matrix3d m = signed_projection.leftCols<3>();
+    const Eigen::JacobiSVD<Eigen::Matrix3d> svd(
+        m, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Matrix3d rotation = svd.matrixU() * svd.matrixV().transpose();
+    if (rotation.determinant() < 0.0) {
+      continue;
+    }
+
+    const double scale = svd.singularValues().mean();
+    if (scale <= 0.0 || !std::isfinite(scale)) {
+      continue;
+    }
+
+    Pose3 pose;
+    pose.q_cw = Eigen::Quaterniond(rotation).normalized();
+    pose.t_cw = signed_projection.col(3) / scale;
+
+    std::size_t positive_depths = 0;
+    for (const std::size_t idx : indices) {
+      if (pose.TransformPoint(correspondences[idx].xyz).z() > 0.0) {
+        ++positive_depths;
+      }
+    }
+
+    if (positive_depths > best_positive_depths) {
+      best_positive_depths = positive_depths;
+      best_pose = pose;
     }
   }
-  return matrix;
-}
 
-cv::Mat DistortionCoefficientsToCv(const Camera& camera) {
-  cv::Mat distortion = cv::Mat::zeros(1, 5, CV_64F);
-  if (camera.model_id == CameraModelId::kSimpleRadial &&
-      camera.params.size() >= 4) {
-    distortion.at<double>(0, 0) = camera.params[3];
+  if (best_positive_depths == 0) {
+    return std::nullopt;
   }
-  return distortion;
+  return best_pose;
 }
 
-Pose3 PoseFromPnP(const cv::Mat& rvec, const cv::Mat& tvec) {
-  cv::Mat rotation_cv;
-  cv::Rodrigues(rvec, rotation_cv);
+std::optional<Pose3> EstimatePoseDlt(
+    const Camera& camera,
+    const std::vector<PnPCorrespondence>& correspondences,
+    const std::vector<std::size_t>& indices) {
+  if (indices.size() < kMinDltPnPPoints) {
+    return std::nullopt;
+  }
 
+  Eigen::MatrixXd a(static_cast<Eigen::Index>(2 * indices.size()), 12);
+  for (std::size_t row = 0; row < indices.size(); ++row) {
+    const PnPCorrespondence& correspondence = correspondences[indices[row]];
+    const Eigen::Vector2d xy =
+        NormalizedImagePoint(camera, correspondence.xy);
+    const Eigen::Vector4d xyz_h = correspondence.xyz.homogeneous();
+
+    a.row(static_cast<Eigen::Index>(2 * row)).setZero();
+    a.row(static_cast<Eigen::Index>(2 * row)).segment<4>(4) = -xyz_h;
+    a.row(static_cast<Eigen::Index>(2 * row)).segment<4>(8) = xy.y() * xyz_h;
+
+    a.row(static_cast<Eigen::Index>(2 * row + 1)).setZero();
+    a.row(static_cast<Eigen::Index>(2 * row + 1)).segment<4>(0) = xyz_h;
+    a.row(static_cast<Eigen::Index>(2 * row + 1)).segment<4>(8) =
+        -xy.x() * xyz_h;
+  }
+
+  const Eigen::JacobiSVD<Eigen::MatrixXd> svd(a, Eigen::ComputeFullV);
+  Eigen::Matrix<double, 3, 4> projection =
+      Eigen::Map<const Eigen::Matrix<double, 3, 4, Eigen::RowMajor>>(
+          svd.matrixV().col(11).data());
+  if (projection.leftCols<3>().norm() <= kMinProjectionScale) {
+    return std::nullopt;
+  }
+  return PoseFromProjectionMatrix(projection, correspondences, indices);
+}
+
+std::vector<std::size_t> InliersForPose(
+    const Camera& camera,
+    const std::vector<PnPCorrespondence>& correspondences,
+    const Pose3& pose,
+    const double max_reprojection_error_px) {
+  std::vector<std::size_t> inliers;
+  inliers.reserve(correspondences.size());
+  for (std::size_t idx = 0; idx < correspondences.size(); ++idx) {
+    const std::optional<double> error =
+        ReprojectionError(camera, pose, correspondences[idx].xyz,
+                          correspondences[idx].xy);
+    if (error && *error <= max_reprojection_error_px) {
+      inliers.push_back(idx);
+    }
+  }
+  return inliers;
+}
+
+struct PnPRansacResult {
   Pose3 pose;
-  Eigen::Matrix3d rotation = Eigen::Matrix3d::Identity();
-  for (int row = 0; row < 3; ++row) {
-    for (int col = 0; col < 3; ++col) {
-      rotation(row, col) = rotation_cv.at<double>(row, col);
+  std::vector<std::size_t> inlier_indices;
+};
+
+PnPRansacResult EstimatePoseRansac(
+    const Camera& camera,
+    const std::vector<PnPCorrespondence>& correspondences,
+    const ImageRegistrarOptions& options) {
+  PnPRansacResult best;
+  if (correspondences.size() < kMinDltPnPPoints) {
+    return best;
+  }
+
+  std::mt19937 rng(0);
+  const int iterations = std::max(1, options.max_num_iterations);
+  for (int iteration = 0; iteration < iterations; ++iteration) {
+    const std::vector<std::size_t> sample =
+        correspondences.size() == kMinDltPnPPoints
+            ? AllIndices(correspondences.size())
+            : SampleUniqueIndices(&rng, correspondences.size(),
+                                  kMinDltPnPPoints);
+    const std::optional<Pose3> pose =
+        EstimatePoseDlt(camera, correspondences, sample);
+    if (!pose) {
+      continue;
+    }
+
+    std::vector<std::size_t> inliers = InliersForPose(
+        camera, correspondences, *pose, options.max_reprojection_error_px);
+    if (inliers.size() > best.inlier_indices.size()) {
+      best.pose = *pose;
+      best.inlier_indices = std::move(inliers);
+      if (best.inlier_indices.size() == correspondences.size()) {
+        break;
+      }
     }
   }
-  pose.q_cw = Eigen::Quaterniond(rotation).normalized();
-  pose.t_cw = Eigen::Vector3d(tvec.at<double>(0), tvec.at<double>(1),
-                              tvec.at<double>(2));
-  return pose;
+
+  if (best.inlier_indices.size() >= kMinDltPnPPoints) {
+    const std::optional<Pose3> refined =
+        EstimatePoseDlt(camera, correspondences, best.inlier_indices);
+    if (refined) {
+      best.pose = *refined;
+      best.inlier_indices = InliersForPose(camera, correspondences, best.pose,
+                                           options.max_reprojection_error_px);
+    }
+  }
+
+  return best;
 }
 
 void LinkInlierCorrespondencesToImage(
     ImageId image_id,
     const std::vector<PnPCorrespondence>& correspondences,
-    const cv::Mat& inlier_indices,
+    const std::vector<std::size_t>& inlier_indices,
     Reconstruction* reconstruction) {
   Image& image = reconstruction->GetImage(image_id);
-  for (int row = 0; row < inlier_indices.rows; ++row) {
-    const int correspondence_idx = inlier_indices.at<int>(row, 0);
+  for (const std::size_t correspondence_idx : inlier_indices) {
     const PnPCorrespondence& correspondence =
-        correspondences[static_cast<std::size_t>(correspondence_idx)];
+        correspondences[correspondence_idx];
     Point2D& point2d = image.points2d[correspondence.point2d_idx];
     if (point2d.HasPoint3D()) {
       continue;
@@ -224,38 +364,19 @@ ImageRegistrationSummary RegisterImageWithExistingPoints(
 
   const Image& image = reconstruction->GetImage(image_id);
   const Camera& camera = reconstruction->GetCamera(image.camera_id);
-
-  std::vector<cv::Point3f> object_points;
-  std::vector<cv::Point2f> image_points;
-  object_points.reserve(correspondences.size());
-  image_points.reserve(correspondences.size());
-  for (const PnPCorrespondence& correspondence : correspondences) {
-    object_points.emplace_back(static_cast<float>(correspondence.xyz.x()),
-                               static_cast<float>(correspondence.xyz.y()),
-                               static_cast<float>(correspondence.xyz.z()));
-    image_points.emplace_back(static_cast<float>(correspondence.xy.x()),
-                              static_cast<float>(correspondence.xy.y()));
-  }
-
-  cv::Mat rvec;
-  cv::Mat tvec;
-  cv::Mat inlier_indices;
-  const bool solved = cv::solvePnPRansac(
-      object_points, image_points, CameraMatrixToCv(camera),
-      DistortionCoefficientsToCv(camera), rvec, tvec, false,
-      options.max_num_iterations, static_cast<float>(options.max_reprojection_error_px),
-      options.confidence, inlier_indices, cv::SOLVEPNP_EPNP);
-  summary.num_inliers = static_cast<std::size_t>(inlier_indices.rows);
-  if (!solved || summary.num_inliers < options.min_num_inliers) {
+  const PnPRansacResult result =
+      EstimatePoseRansac(camera, correspondences, options);
+  summary.num_inliers = result.inlier_indices.size();
+  if (summary.num_inliers < options.min_num_inliers) {
     summary.message = "PnP RANSAC failed or found too few inliers";
     return summary;
   }
 
   Image& mutable_image = reconstruction->GetImage(image_id);
-  mutable_image.cam_from_world = PoseFromPnP(rvec, tvec);
+  mutable_image.cam_from_world = result.pose;
   reconstruction->RegisterImage(image_id);
-  LinkInlierCorrespondencesToImage(image_id, correspondences, inlier_indices,
-                                   reconstruction);
+  LinkInlierCorrespondencesToImage(image_id, correspondences,
+                                   result.inlier_indices, reconstruction);
 
   summary.success = true;
   summary.message = "Image registered";

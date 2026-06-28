@@ -8,14 +8,16 @@
 
 namespace colite {
 
-// 两视图几何验证参数。第一版使用 OpenCV 的鲁棒估计作为基线，
-// 后续可以在不改变外部接口的前提下替换为自研 RANSAC/LORANSAC。
+// 两视图几何验证参数。当前实现使用内部 RANSAC + DLT/八点法估计 F/H/E。
 struct TwoViewGeometryOptions {
   // RANSAC 内点阈值，单位为像素。用于 F/H；E 会换算到归一化平面。
   double max_error_px = 4.0;
 
-  // RANSAC 置信度。
+  // RANSAC 置信度。当前保留该参数用于接口兼容，后续 LORANSAC 会使用。
   double confidence = 0.999;
+
+  // 内部 RANSAC 最大迭代次数。
+  int max_num_iterations = 1000;
 
   // 判定几何关系有效所需的最少内点数。
   int min_num_inliers = 15;

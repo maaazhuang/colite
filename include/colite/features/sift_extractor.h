@@ -12,20 +12,21 @@
 
 namespace colite {
 
-// SIFT 特征提取后端。OpenCV 保留原有直接调用路径；VlSift/CvSift 是从
-// references/sift 复制到项目内后接入的改造实现。
+// SIFT 特征提取后端。OpenCV 官方 SIFT 直接调用路径已移除；
+// CvSift / VlSift / CudaSift 都是项目内接入的实现。
 enum class SiftBackend {
-  kOpenCV,
   kVlSift,
   kCvSift,
+  kCudaSift,
 };
 
 const char* SiftBackendName(SiftBackend backend);
 SiftBackend SiftBackendFromName(std::string_view name);
 
-// SIFT 特征提取配置。第一版只保留 OpenCV SIFT 常用参数，后续再扩展仿射形状等能力。
+// SIFT 特征提取配置。
 struct SiftExtractionOptions {
-  SiftBackend backend = SiftBackend::kOpenCV;
+  SiftBackend backend = SiftBackend::kCvSift;
+  // 最终输出的特征数量上限。CudaSift 内部会使用更大的候选池，再按响应裁剪。
   int max_num_features = 8192;
   int num_octave_layers = 3;
   double contrast_threshold = 0.04;
@@ -37,16 +38,26 @@ struct SiftExtractionOptions {
   int vl_num_octaves = 4;
   int max_num_orientations = 2;
 
-  // COLMAP 默认使用 first_octave=-1。OpenCV 不直接暴露该参数，因此这里通过
-  // 先 2 倍上采样再把 keypoint 坐标缩回原图来近似，提升相邻图像弱纹理区域稳定性。
+  // COLMAP 默认使用 first_octave=-1。该选项用于 VLFeat 后端；CvSift 后端
+  // 保留自身 OpenCV-like 行为。
   bool upsample_first_octave = true;
 
   // COLMAP 默认使用 L1-root 描述子归一化，也就是 RootSIFT。
   bool use_root_sift = true;
+
+  // CudaSift 使用自己的阈值尺度，默认值参考 CudaSift 示例。
+  int cuda_device = 0;
+  int cuda_num_octaves = 5;
+  double cuda_init_blur = 1.0;
+  float cuda_threshold = 3.0f;
+  float cuda_lowest_scale = 0.0f;
+  bool cuda_scale_up = false;
 };
 
-// 从灰度或彩色图像中提取 SIFT 特征。
-// 返回的描述子为 CV_32F，每一行对应一个 keypoint。
+// 返回 CudaSift 后端在当前构建和运行时环境下是否可用。
+bool IsCudaSiftAvailable();
+
+// 从灰度或彩色图像中提取 SIFT 特征。图像容器仍使用 cv::Mat。
 FeatureSet ExtractSiftFeatures(const cv::Mat& image,
                                const SiftExtractionOptions& options = {});
 
@@ -55,12 +66,12 @@ FeatureSet ExtractSiftFeaturesFromFile(
     const std::filesystem::path& image_path,
     const SiftExtractionOptions& options = {});
 
-// 批量提取目录下的常见图像文件，结果按文件名路径排序，便于测试和复现。
+// 批量提取目录下的常见图像文件，结果按文件名路径排序。
 std::map<std::filesystem::path, FeatureSet> ExtractSiftFeaturesFromDirectory(
     const std::filesystem::path& image_dir,
     const SiftExtractionOptions& options = {});
 
-// 列出目录下的常见图像文件。该函数不递归，第一版保持简单。
+// 列出目录下的常见图像文件。该函数不递归。
 std::vector<std::filesystem::path> ListImageFiles(
     const std::filesystem::path& image_dir);
 

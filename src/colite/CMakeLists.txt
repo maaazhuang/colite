@@ -1,13 +1,46 @@
+set(COLITE_CUDA_SIFT_SOURCES
+  features/backends/cuda_sift_extractor_stub.cpp
+)
+
+if(COLITE_ENABLE_CUDA_SIFT)
+  set(COLITE_CUDA_SIFT_SOURCES
+    features/backends/cuda_sift_extractor.cu
+  )
+
+  add_library(colite_cudasift_backend STATIC
+    features/backends/cudasift/thirdparty/cudaImage.cu
+    features/backends/cudasift/thirdparty/cudaSiftH.cu
+  )
+  target_include_directories(colite_cudasift_backend
+    PUBLIC
+      ${CMAKE_CURRENT_SOURCE_DIR}/features/backends/cudasift/thirdparty
+  )
+  target_compile_options(colite_cudasift_backend
+    PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
+  )
+  set_target_properties(colite_cudasift_backend PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    POSITION_INDEPENDENT_CODE ON
+  )
+endif()
+
 add_library(colite_core
   core/camera.cpp
   core/geometry.cpp
   core/match_graph.cpp
   core/reconstruction.cpp
   core/version.cpp
-  features/backends/sift_opencv_v2.cpp
-  features/backends/sift_vlfeat_v2.c
-  features/backends/vl_imconv.c
+  controllers/recon_sfm_controller.cpp
+  controllers/feature_extractor.cpp
+  controllers/sequential_matcher.cpp
+  controllers/mapper.cpp
+  features/backends/sift_opencv.cpp
+  features/backends/sift_vlfeat.c
+  ${COLITE_CUDA_SIFT_SOURCES}
   features/sift_extractor.cpp
+  io/camera_prior.cpp
+  io/sfm_workspace.cpp
   matching/descriptor_matcher.cpp
   matching/guided_matching.cpp
   matching/two_view_geometry_batch.cpp
@@ -50,6 +83,11 @@ target_link_libraries(colite_core
     ${OpenCV_LIBS}
 )
 
+if(COLITE_ENABLE_CUDA_SIFT)
+  target_link_libraries(colite_core PUBLIC colite_cudasift_backend)
+  target_compile_definitions(colite_core PUBLIC COLITE_ENABLE_CUDA_SIFT)
+endif()
+
 if(MSVC)
   target_compile_options(colite_core PRIVATE /W4)
 else()
@@ -57,9 +95,9 @@ else()
 endif()
 
 set_source_files_properties(
-  features/backends/sift_opencv_v2.cpp
-  features/backends/sift_vlfeat_v2.c
-  features/backends/vl_imconv.c
+  features/backends/sift_opencv.cpp
+  features/backends/sift_vlfeat.c
+  features/backends/cuda_sift_extractor_stub.cpp
   PROPERTIES
     COMPILE_OPTIONS "-Wno-pedantic;-Wno-unused-function"
 )
