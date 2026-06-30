@@ -8,6 +8,7 @@
 
 #include "colite/core/camera.h"
 #include "colite/core/match_graph.h"
+#include "colite/exe/command.h"
 #include "colite/exe/feature_extractor.h"
 #include "colite/exe/mapper.h"
 #include "colite/exe/sequential_matcher.h"
@@ -57,6 +58,7 @@ TEST(SfmWorkspaceTest, RoundTripsManifestFeaturesAndMatches) {
   image2.camera_id = 1;
   image2.name = "image2.jpg";
   image2.file_path = "/tmp/image2.jpg";
+  image2.prior_position = Eigen::Vector3d(1.0, 2.0, 3.0);
 
   WriteWorkspaceCameras(workspace, {camera});
   WriteWorkspaceImages(workspace, {image1, image2});
@@ -85,6 +87,10 @@ TEST(SfmWorkspaceTest, RoundTripsManifestFeaturesAndMatches) {
   EXPECT_EQ(cameras[0].width, 640U);
   ASSERT_EQ(images.size(), 2U);
   EXPECT_EQ(images[1].name, "image2.jpg");
+  ASSERT_TRUE(images[1].prior_position.has_value());
+  EXPECT_NEAR(images[1].prior_position->x(), 1.0, 1e-12);
+  EXPECT_NEAR(images[1].prior_position->y(), 2.0, 1e-12);
+  EXPECT_NEAR(images[1].prior_position->z(), 3.0, 1e-12);
   ASSERT_EQ(loaded_features.keypoints.size(), 2U);
   EXPECT_FLOAT_EQ(loaded_features.keypoints[1].response, 3.0F);
   ASSERT_EQ(loaded_features.descriptors.rows(), 2);
@@ -123,11 +129,75 @@ TEST(SfmCommandExeTest, PrintsHelpForStageCommands) {
                                       err),
             0);
   EXPECT_NE(out.str().find("--overlap"), std::string::npos);
+  EXPECT_NE(out.str().find("--matching_type"), std::string::npos);
 
   out.str("");
   out.clear();
   EXPECT_EQ(exe::RunMapper({"mapper", "--help"}, out, err), 0);
   EXPECT_NE(out.str().find("--workspace_path"), std::string::npos);
+}
+
+TEST(ColiteCommandExeTest, PrintsTopLevelHelp) {
+  std::ostringstream out;
+  std::ostringstream err;
+
+  EXPECT_EQ(exe::RunColite({"colite", "--help"}, out, err), 0);
+  EXPECT_NE(out.str().find("Usage:"), std::string::npos);
+  EXPECT_NE(out.str().find("feature_extractor"), std::string::npos);
+  EXPECT_NE(out.str().find("exhaustive_matcher"), std::string::npos);
+  EXPECT_NE(out.str().find("vocab_tree_matcher"), std::string::npos);
+  EXPECT_NE(out.str().find("recon_sfm"), std::string::npos);
+  EXPECT_TRUE(err.str().empty());
+}
+
+TEST(ColiteCommandExeTest, DispatchesExhaustiveSpatialAndVocabTreeMatcherHelp) {
+  std::ostringstream out;
+  std::ostringstream err;
+
+  EXPECT_EQ(exe::RunColite({"colite", "exhaustive_matcher", "--help"}, out,
+                           err),
+            0);
+  EXPECT_NE(out.str().find("colite exhaustive_matcher"), std::string::npos);
+  EXPECT_NE(out.str().find("--workspace_path"), std::string::npos);
+  EXPECT_TRUE(err.str().empty());
+
+  out.str("");
+  out.clear();
+  EXPECT_EQ(exe::RunColite({"colite", "spatial_matcher", "--help"}, out, err),
+            0);
+  EXPECT_NE(out.str().find("colite spatial_matcher"), std::string::npos);
+  EXPECT_NE(out.str().find("--spatial_max_distance"), std::string::npos);
+  EXPECT_TRUE(err.str().empty());
+
+  out.str("");
+  out.clear();
+  EXPECT_EQ(exe::RunColite({"colite", "vocab_tree_matcher", "--help"}, out,
+                           err),
+            0);
+  EXPECT_NE(out.str().find("colite vocab_tree_matcher"), std::string::npos);
+  EXPECT_NE(out.str().find("--vocab_tree_num_images"), std::string::npos);
+  EXPECT_TRUE(err.str().empty());
+}
+
+TEST(ColiteCommandExeTest, DispatchesSubcommandHelp) {
+  std::ostringstream out;
+  std::ostringstream err;
+
+  EXPECT_EQ(exe::RunColite({"colite", "recon_sfm", "--help"}, out, err), 0);
+  EXPECT_NE(out.str().find("colite recon_sfm"), std::string::npos);
+  EXPECT_NE(out.str().find("--image_path"), std::string::npos);
+  EXPECT_TRUE(err.str().empty());
+}
+
+TEST(ColiteCommandExeTest, RejectsUnknownSubcommand) {
+  std::ostringstream out;
+  std::ostringstream err;
+
+  EXPECT_EQ(exe::RunColite({"colite", "does_not_exist"}, out, err), 1);
+  EXPECT_TRUE(out.str().empty());
+  EXPECT_NE(err.str().find("Unknown command: does_not_exist"),
+            std::string::npos);
+  EXPECT_NE(err.str().find("Available commands:"), std::string::npos);
 }
 
 TEST(SfmCommandExeTest, FeatureExtractorUsesExifFocalPriorByDefault) {

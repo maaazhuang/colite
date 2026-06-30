@@ -19,7 +19,7 @@ const std::vector<CameraModelSpec>& CameraModelSpecs() {
        Indices{1, 2},
        Indices{},
        false,
-       false},
+       true},
       {CameraModelId::kPinhole,
        "PINHOLE",
        Names{"fx", "fy", "cx", "cy"},
@@ -43,7 +43,7 @@ const std::vector<CameraModelSpec>& CameraModelSpecs() {
        Indices{1, 2},
        Indices{3, 4},
        false,
-       false},
+       true},
       {CameraModelId::kOpenCV,
        "OPENCV",
        Names{"fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2"},
@@ -51,7 +51,7 @@ const std::vector<CameraModelSpec>& CameraModelSpecs() {
        Indices{2, 3},
        Indices{4, 5, 6, 7},
        false,
-       false},
+       true},
       {CameraModelId::kOpenCVFisheye,
        "OPENCV_FISHEYE",
        Names{"fx", "fy", "cx", "cy", "k1", "k2", "k3", "k4"},
@@ -124,17 +124,40 @@ void RequirePositiveDepth(const Eigen::Vector3d& point_camera) {
   }
 }
 
-Eigen::Vector2d RemoveSimpleRadialDistortion(Eigen::Vector2d distorted,
-                                             double k1) {
+Eigen::Vector2d DistortRadial(const Eigen::Vector2d& normalized,
+                              double k1,
+                              double k2) {
+  const double radius2 = normalized.squaredNorm();
+  return normalized * (1.0 + k1 * radius2 + k2 * radius2 * radius2);
+}
+
+Eigen::Vector2d DistortOpenCV(const Eigen::Vector2d& normalized,
+                              double k1,
+                              double k2,
+                              double p1,
+                              double p2) {
+  const double x = normalized.x();
+  const double y = normalized.y();
+  const double x2 = x * x;
+  const double y2 = y * y;
+  const double xy = x * y;
+  const double radius2 = x2 + y2;
+  const double radial = 1.0 + k1 * radius2 + k2 * radius2 * radius2;
+  return {x * radial + 2.0 * p1 * xy + p2 * (radius2 + 2.0 * x2),
+          y * radial + p1 * (radius2 + 2.0 * y2) + 2.0 * p2 * xy};
+}
+
+template <typename DistortFunc>
+Eigen::Vector2d RemoveDistortion(const Eigen::Vector2d& distorted,
+                                 DistortFunc distort) {
   // 用固定次数迭代近似去畸变。第一版足够用于反投影和测试，后续可改成更稳健的求解。
   Eigen::Vector2d undistorted = distorted;
   for (int i = 0; i < 8; ++i) {
-    const double radius2 = undistorted.squaredNorm();
-    const double scale = 1.0 + k1 * radius2;
-    if (std::abs(scale) < 1e-12) {
+    const Eigen::Vector2d error = distort(undistorted) - distorted;
+    undistorted -= error;
+    if (error.norm() < 1e-14) {
       break;
     }
-    undistorted = distorted / scale;
   }
   return undistorted;
 }
@@ -294,6 +317,14 @@ Eigen::Vector2d ProjectPoint(const Camera& camera,
             fy * point_camera.y() / point_camera.z() + cy};
   }
 
+  if (camera.model_id == CameraModelId::kSimplePinhole) {
+    const double f = camera.params[0];
+    const double cx = camera.params[1];
+    const double cy = camera.params[2];
+    return {f * point_camera.x() / point_camera.z() + cx,
+            f * point_camera.y() / point_camera.z() + cy};
+  }
+
   if (camera.model_id == CameraModelId::kSimpleRadial) {
     const double f = camera.params[0];
     const double cx = camera.params[1];
@@ -304,6 +335,27 @@ Eigen::Vector2d ProjectPoint(const Camera& camera,
     const Eigen::Vector2d distorted =
         ApplySimpleRadialDistortion(normalized, k1);
     return {f * distorted.x() + cx, f * distorted.y() + cy};
+  }
+
+  if (camera.model_id == CameraModelId::kRadial) {
+    const double f = camera.params[0];
+    const double cx = camera.params[1];
+    const double cy = camera.params[2];
+    const Eigen::Vector2d normalized(point_camera.x() / point_camera.z(),
+                                     point_camera.y() / point_camera.z());
+    const Eigen::Vector2d distorted =
+        DistortRadial(normalized, camera.params[3], camera.params[4]);
+    return {f * distorted.x() + cx, f * distorted.y() + cy};
+  }
+
+  if (camera.model_id == CameraModelId::kOpenCV) {
+    const Eigen::Vector2d normalized(point_camera.x() / point_camera.z(),
+                                     point_camera.y() / point_camera.z());
+    const Eigen::Vector2d distorted =
+        DistortOpenCV(normalized, camera.params[4], camera.params[5],
+                      camera.params[6], camera.params[7]);
+    return {camera.params[0] * distorted.x() + camera.params[2],
+            camera.params[1] * distorted.y() + camera.params[3]};
   }
 
   throw std::domain_error("Projection is not implemented for this model.");
@@ -327,6 +379,15 @@ Eigen::Vector3d UnprojectPixel(const Camera& camera,
             depth};
   }
 
+  if (camera.model_id == CameraModelId::kSimplePinhole) {
+    const double f = camera.params[0];
+    const double cx = camera.params[1];
+    const double cy = camera.params[2];
+    return {((pixel.x() - cx) / f) * depth,
+            ((pixel.y() - cy) / f) * depth,
+            depth};
+  }
+
   if (camera.model_id == CameraModelId::kSimpleRadial) {
     const double f = camera.params[0];
     const double cx = camera.params[1];
@@ -334,8 +395,38 @@ Eigen::Vector3d UnprojectPixel(const Camera& camera,
     const double k1 = camera.params[3];
     const Eigen::Vector2d distorted((pixel.x() - cx) / f,
                                     (pixel.y() - cy) / f);
+    const Eigen::Vector2d undistorted = RemoveDistortion(
+        distorted, [k1](const Eigen::Vector2d& point) {
+          return ApplySimpleRadialDistortion(point, k1);
+        });
+    return {undistorted.x() * depth, undistorted.y() * depth, depth};
+  }
+
+  if (camera.model_id == CameraModelId::kRadial) {
+    const double f = camera.params[0];
+    const double cx = camera.params[1];
+    const double cy = camera.params[2];
+    const double k1 = camera.params[3];
+    const double k2 = camera.params[4];
+    const Eigen::Vector2d distorted((pixel.x() - cx) / f,
+                                    (pixel.y() - cy) / f);
     const Eigen::Vector2d undistorted =
-        RemoveSimpleRadialDistortion(distorted, k1);
+        RemoveDistortion(distorted, [k1, k2](const Eigen::Vector2d& point) {
+          return DistortRadial(point, k1, k2);
+        });
+    return {undistorted.x() * depth, undistorted.y() * depth, depth};
+  }
+
+  if (camera.model_id == CameraModelId::kOpenCV) {
+    const Eigen::Vector2d distorted((pixel.x() - camera.params[2]) /
+                                        camera.params[0],
+                                    (pixel.y() - camera.params[3]) /
+                                        camera.params[1]);
+    const Eigen::Vector2d undistorted = RemoveDistortion(
+        distorted, [&](const Eigen::Vector2d& point) {
+          return DistortOpenCV(point, camera.params[4], camera.params[5],
+                               camera.params[6], camera.params[7]);
+        });
     return {undistorted.x() * depth, undistorted.y() * depth, depth};
   }
 
@@ -343,4 +434,3 @@ Eigen::Vector3d UnprojectPixel(const Camera& camera,
 }
 
 }  // namespace colite
-

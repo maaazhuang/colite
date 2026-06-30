@@ -1,5 +1,6 @@
 #include "colite/controllers/sequential_matcher.h"
 
+#include <algorithm>
 #include <fstream>
 #include <map>
 #include <stdexcept>
@@ -15,10 +16,6 @@ SequentialMatcherController::SequentialMatcherController(
     : options_(std::move(options)) {}
 
 SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
-  if (options_.overlap == 0) {
-    throw std::invalid_argument("--overlap must be positive");
-  }
-
   SequentialMatcherControllerSummary summary;
   const std::vector<Camera> cameras =
       ReadWorkspaceCameras(options_.workspace_path);
@@ -35,18 +32,28 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
   matching_options.max_ratio = options_.max_ratio;
   matching_options.mutual_check = options_.mutual_check;
 
-  for (std::size_t i = 0; i < images.size(); ++i) {
-    const std::size_t end = std::min(images.size(), i + options_.overlap + 1);
-    for (std::size_t j = i + 1; j < end; ++j) {
-      const FeatureSet* features1 = FindFeatures(graph, images[i].id);
-      const FeatureSet* features2 = FindFeatures(graph, images[j].id);
-      if (features1 == nullptr || features2 == nullptr) {
-        throw std::runtime_error("Workspace features are incomplete");
-      }
-      SetMatches(&graph, images[i].id, images[j].id,
-                 MatchFeatureSets(*features1, *features2, matching_options));
-      ++summary.num_pairs;
+  MatchingPairGeneratorOptions pair_options;
+  pair_options.strategy = options_.matching_strategy;
+  pair_options.sequential_overlap = options_.overlap;
+  pair_options.spatial_max_num_neighbors = options_.spatial_max_num_neighbors;
+  pair_options.spatial_max_distance = options_.spatial_max_distance;
+  pair_options.vocab_tree_num_images = options_.vocab_tree_num_images;
+  pair_options.vocab_tree_num_visual_words =
+      options_.vocab_tree_num_visual_words;
+  pair_options.vocab_tree_max_num_features =
+      options_.vocab_tree_max_num_features;
+  const std::vector<ImagePair> pairs =
+      GenerateMatchingPairs(images, graph, pair_options);
+
+  for (const ImagePair& pair : pairs) {
+    const FeatureSet* features1 = FindFeatures(graph, pair.image_id1);
+    const FeatureSet* features2 = FindFeatures(graph, pair.image_id2);
+    if (features1 == nullptr || features2 == nullptr) {
+      throw std::runtime_error("Workspace features are incomplete");
     }
+    SetMatches(&graph, pair.image_id1, pair.image_id2,
+               MatchFeatureSets(*features1, *features2, matching_options));
+    ++summary.num_pairs;
   }
   WriteWorkspaceMatches(options_.workspace_path, graph);
 

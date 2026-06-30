@@ -73,9 +73,9 @@ class MvsSweepScriptTest(unittest.TestCase):
         (run_dir / "stereo" / "patch_match.tsv").write_text(
             "\n".join(
                 [
-                    "image_id\tperturbation_geometric_candidate_rejections\tperturbation_geometric_candidate_acceptances\tperturbation_mean_abs_depth_update\tperturbation_max_abs_depth_update",
-                    "1\t10\t2\t0.5\t3.0",
-                    "2\t20\t4\t1.5\t5.0",
+                    "image_id\trequested_backend\tactual_backend\tperturbation_geometric_candidate_rejections\tperturbation_geometric_candidate_acceptances\tperturbation_mean_abs_depth_update\tperturbation_max_abs_depth_update",
+                    "1\tauto\tcpu\t10\t2\t0.5\t3.0",
+                    "2\tauto\tcpu\t20\t4\t1.5\t5.0",
                 ]
             )
             + "\n",
@@ -130,6 +130,8 @@ class MvsSweepScriptTest(unittest.TestCase):
         self.assertEqual(row["perturbation_mean_abs_depth_update_avg"], "1")
         self.assertEqual(row["perturbation_max_abs_depth_update_max"], "5")
         self.assertEqual(row["patch_match_geometric_consistency_weight"], "0.05")
+        self.assertEqual(row["patch_match_requested_backend"], "auto")
+        self.assertEqual(row["patch_match_actual_backend"], "cpu")
         self.assertEqual(row["fusion_relative_depth_error_p95"], "0.018")
         self.assertEqual(row["fusion_reprojection_error_pixels_p99"], "2.4")
         self.assertEqual(row["fusion_normal_angle_degrees_p50"], "2")

@@ -26,6 +26,10 @@ struct ImagePair {
     return std::tie(image_id1, image_id2) <
            std::tie(other.image_id1, other.image_id2);
   }
+
+  bool operator==(const ImagePair& other) const {
+    return image_id1 == other.image_id1 && image_id2 == other.image_id2;
+  }
 };
 
 // 特征与匹配缓存。它不属于最终稀疏模型，避免 Reconstruction 被中间数据污染。

@@ -75,6 +75,8 @@ TEST(ReconMvsExeTest, PrintsHelp) {
             std::string::npos);
   EXPECT_NE(out.str().find("--patch_match_propagation_schedule"),
             std::string::npos);
+  EXPECT_NE(out.str().find("--patch_match_backend"), std::string::npos);
+  EXPECT_NE(out.str().find("--patch_match_gpu_index"), std::string::npos);
   EXPECT_NE(out.str().find("--patch_match_pyramid_levels"),
             std::string::npos);
   EXPECT_NE(out.str().find("--patch_match_perturbation_samples"),
@@ -98,6 +100,25 @@ TEST(ReconMvsExeTest, PrintsHelp) {
   EXPECT_NE(out.str().find("--fusion_source_pixel_search_radius"),
             std::string::npos);
   EXPECT_TRUE(err.str().empty());
+}
+
+TEST(ReconMvsExeTest, RejectsInvalidPatchMatchBackend) {
+  std::ostringstream out;
+  std::ostringstream err;
+
+  const int exit_code = RunReconMvs(
+      {"recon_mvs",
+       "--model_path",
+       "model",
+       "--output_path",
+       "mvs",
+       "--patch_match_backend",
+       "metal"},
+      out,
+      err);
+
+  EXPECT_EQ(exit_code, 1);
+  EXPECT_NE(err.str().find("Invalid PatchMatch backend"), std::string::npos);
 }
 
 TEST(ReconMvsExeTest, RejectsInvalidPatchMatchPropagationSchedule) {
@@ -305,6 +326,12 @@ TEST(ReconMvsExeTest, RunsPatchMatchStereoWhenRequested) {
                 .find("valid_cost_pixels_before_filter"),
             std::string::npos);
   EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("requested_backend"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("actual_backend"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
                 .find("pyramid_levels"),
             std::string::npos);
   EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
@@ -365,7 +392,8 @@ TEST(ReconMvsExeTest, RunsPatchMatchStereoWithTwoThreadsWhenRequested) {
   EXPECT_TRUE(std::filesystem::exists(output_path / "stereo" /
                                       "patch_match.tsv"));
   EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
-                .find("image_id\tpyramid_levels\titerations\tvalid_cost_pixels"),
+                .find("image_id\trequested_backend\tactual_backend"
+                      "\tpyramid_levels\titerations\tvalid_cost_pixels"),
             std::string::npos);
 }
 

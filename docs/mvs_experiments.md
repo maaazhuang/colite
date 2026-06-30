@@ -1192,3 +1192,202 @@ Verification:
 ctest --test-dir build-wsl -R 'MvsPipelineTest|CpuPatchMatch|CpuStereoFusionTest|ReconMvsAppTest|MvsSweepScriptTest' --output-on-failure
 100% tests passed, 0 tests failed out of 68
 ```
+
+### Milestone 21: PatchMatch backend selection and CUDA entry point
+
+Goal: add a COLMAP-style backend boundary before porting PatchMatch kernels to
+CUDA. The CPU implementation remains the fallback path, while `auto` is now the
+default user-facing backend and will prefer CUDA once the real CUDA backend is
+compiled and available.
+
+Implemented:
+
+- Added `PatchMatchBackend { auto, cpu, cuda }` to `PatchMatchStereoOptions`.
+- Added `--patch_match_backend <auto|cpu|cuda>` and
+  `--patch_match_gpu_index <n>` to `recon_mvs`.
+- Added `PatchMatchStereoSummary::requested_backend` and `actual_backend`.
+- Added `stereo/patch_match.tsv` columns:
+  `requested_backend` and `actual_backend`.
+- Added optional `COLITE_ENABLE_CUDA_MVS` CMake switch and a CUDA PatchMatch
+  stub entry point. The stub intentionally reports unavailable until real CUDA
+  kernels are implemented.
+- Updated `scripts/mvs_sweep.py` to summarize requested/actual PatchMatch
+  backends.
+
+CUDA environment check:
+
+```text
+/usr/local/cuda-13.2/bin/nvcc -V
+Cuda compilation tools, release 13.2, V13.2.51
+```
+
+Current limitation:
+
+- This milestone does not yet implement the CUDA PatchMatch kernels. Forcing
+  `--patch_match_backend cuda` currently fails with a clear runtime error.
+- `--patch_match_backend auto` falls back to CPU in the current build.
+
+Verification:
+
+```text
+cmake --build build-wsl --target colite_core_tests -j2
+ctest --test-dir build-wsl -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+100% tests passed, 0 tests failed out of 25
+```
+
+### Milestone 22: first runnable CUDA PatchMatch backend
+
+Goal: replace the CUDA PatchMatch stub with a runnable GPU backend while
+keeping the CPU backend as the correctness baseline.
+
+Implemented:
+
+- `src/colite/mvs/patch_match_cuda.cu` now provides the compiled CUDA backend
+  when `COLITE_ENABLE_CUDA_MVS=ON`.
+- CMake selects `patch_match_cuda.cu` for CUDA builds and keeps
+  `patch_match_cuda_stub.cpp` for non-CUDA builds.
+- The CUDA backend now uploads:
+  - reference image,
+  - packed source image cache,
+  - optional packed source depth maps,
+  - relative reference-to-source camera transforms,
+  - depth, normal, cost, and summary counter buffers.
+- Implemented GPU kernels for:
+  - random depth hypothesis initialization,
+  - default normal initialization,
+  - ZNCC photometric cost,
+  - plane reprojection into source views,
+  - top-k multi-source cost aggregation,
+  - optional source-depth geometric penalty,
+  - forward/backward/four-direction propagation,
+  - random depth perturbation.
+- `auto` now uses CUDA in CUDA-enabled builds when the request is supported;
+  unsupported CUDA cases, such as multi-scale pyramid execution, still fall
+  back to CPU unless the user explicitly forces `cuda`.
+
+Current limitations:
+
+- The GPU path is a first runnable backend, not a full COLMAP CUDA port.
+- It supports single-scale execution only. `pyramid_levels > 1` falls back to
+  CPU in `auto` mode.
+- Normal perturbation is still minimal; the first GPU perturbation pass changes
+  depth hypotheses but keeps the current normal.
+- COLMAP selection probability maps, rotated sweep scheduling, incident-angle
+  weighting, and mature geometric filtering are not implemented yet.
+
+Verification:
+
+```text
+CUDA build:
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest' --output-on-failure
+100% tests passed, 0 tests failed out of 12
+
+CUDA recon_mvs integration:
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+100% tests passed, 0 tests failed out of 14
+
+CPU build:
+ctest --test-dir build-wsl -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+100% tests passed, 0 tests failed out of 26
+```
+
+### Milestone 23: CUDA layered texture image cache
+
+Goal: move the first CUDA backend closer to COLMAP's image access structure by
+using CUDA texture objects for reference images, source images, and optional
+source depth maps.
+
+Implemented:
+
+- Added an internal `FloatLayeredTexture` RAII wrapper in
+  `patch_match_cuda.cu`.
+- Reference image, packed source images, and optional source depth maps are now
+  uploaded to CUDA layered arrays.
+- Cost, propagation, and perturbation kernels now sample through
+  `cudaTextureObject_t` with linear filtering and border addressing.
+- The old manual bilinear sampling path for CUDA image/depth buffers was
+  removed.
+
+Why this matters:
+
+- This matches COLMAP's `CudaArrayLayeredTexture` direction more closely.
+- Texture sampling centralizes interpolation and prepares the backend for
+  COLMAP-style rotated sweeps, source-depth consistency, and texture-backed
+  pose/source data in later milestones.
+
+Still not complete:
+
+- Pose data is still passed through a device struct array, not a pose texture.
+- The CUDA backend still supports only single-scale execution.
+- Selection probability, rotation sweep scheduling, and full normal
+  perturbation are still pending.
+
+Verification:
+
+```text
+CUDA build:
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+100% tests passed, 0 tests failed out of 26
+
+CPU build:
+ctest --test-dir build-wsl -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+100% tests passed, 0 tests failed out of 26
+```
+
+### Milestone 24: CUDA pose texture and COLMAP-like geometry cost
+
+Goal: move CUDA PatchMatch pose/source geometry organization closer to COLMAP by
+storing per-source camera geometry in a texture-backed layout instead of a
+device struct array.
+
+Implemented:
+
+- Added a point-sampled layered pose texture in `patch_match_cuda.cu`.
+- The pose texture packs 43 float parameters per source view:
+  - intrinsics `K`: `fx, fy, cx, cy`,
+  - relative reference-to-source rotation `R`,
+  - relative translation `T`,
+  - source camera center `C`,
+  - projection matrix `P = K * [R | T]`,
+  - inverse projection block `invP = [R^T * K^-1 | -R^T * T]`.
+- CUDA kernels now read source intrinsics and relative pose through
+  `cudaTextureObject_t` rather than through the old `DeviceSourceView` array.
+- Source image metadata is reduced to image dimensions only, while all
+  source transform information lives in the pose texture.
+- The geometric consistency penalty now uses a more COLMAP-like
+  forward/backward depth check:
+  1. project the reference hypothesis into a source view with `P`,
+  2. sample the source depth map,
+  3. back-project the source depth through `invP`,
+  4. compare the returned reference-camera depth against the current
+     hypothesis depth.
+
+Why this matters:
+
+- Pose access is now organized like a compact texture cache, which prepares the
+  CUDA path for rotated sweeps, probability maps, and source-dependent geometry
+  weighting.
+- Geometry cost no longer compares source depth only in source-camera `z`.
+  It now measures source consistency after returning to the reference camera,
+  which is closer to COLMAP's PatchMatch geometric consistency formulation.
+
+Still not complete:
+
+- The pose texture currently stores only the base orientation; rotated sweep
+  transforms are not packed yet.
+- Selection probability maps, incident/view-angle weighting, and full
+  COLMAP-style geometric filtering remain future work.
+- CUDA PatchMatch still supports only single-scale execution; pyramid execution
+  continues to fall back to CPU in `auto` mode.
+
+Verification:
+
+```text
+CUDA build:
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+100% tests passed, 0 tests failed out of 26
+
+CPU build:
+ctest --test-dir build-wsl -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+100% tests passed, 0 tests failed out of 26
+```

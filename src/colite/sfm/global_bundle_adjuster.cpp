@@ -1,6 +1,9 @@
 #include "colite/sfm/global_bundle_adjuster.h"
 
+#include <algorithm>
+#include <cmath>
 #include <map>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -29,60 +32,156 @@ struct Observation {
   Eigen::Vector2d xy = Eigen::Vector2d::Zero();
 };
 
-struct ReprojectionCost {
+bool ProjectWithParams(CameraModelId model_id,
+                       const double* params,
+                       const Eigen::Vector3d& point_camera,
+                       Eigen::Vector2d* projected) {
+  if (point_camera.z() <= 0.0) {
+    return false;
+  }
+  const double x = point_camera.x() / point_camera.z();
+  const double y = point_camera.y() / point_camera.z();
+
+  if (model_id == CameraModelId::kSimplePinhole) {
+    *projected = {params[0] * x + params[1], params[0] * y + params[2]};
+    return true;
+  }
+  if (model_id == CameraModelId::kPinhole) {
+    *projected = {params[0] * x + params[2], params[1] * y + params[3]};
+    return true;
+  }
+  if (model_id == CameraModelId::kSimpleRadial) {
+    const double radius2 = x * x + y * y;
+    const double scale = 1.0 + params[3] * radius2;
+    *projected = {params[0] * x * scale + params[1],
+                  params[0] * y * scale + params[2]};
+    return true;
+  }
+  if (model_id == CameraModelId::kRadial) {
+    const double radius2 = x * x + y * y;
+    const double scale =
+        1.0 + params[3] * radius2 + params[4] * radius2 * radius2;
+    *projected = {params[0] * x * scale + params[1],
+                  params[0] * y * scale + params[2]};
+    return true;
+  }
+  if (model_id == CameraModelId::kOpenCV) {
+    const double x2 = x * x;
+    const double y2 = y * y;
+    const double xy = x * y;
+    const double radius2 = x2 + y2;
+    const double radial =
+        1.0 + params[4] * radius2 + params[5] * radius2 * radius2;
+    const double distorted_x =
+        x * radial + 2.0 * params[6] * xy +
+        params[7] * (radius2 + 2.0 * x2);
+    const double distorted_y =
+        y * radial + params[6] * (radius2 + 2.0 * y2) +
+        2.0 * params[7] * xy;
+    *projected = {params[0] * distorted_x + params[2],
+                  params[1] * distorted_y + params[3]};
+    return true;
+  }
+  return false;
+}
+
+class ReprojectionCost final : public ceres::CostFunction {
+ public:
   ReprojectionCost(CameraModelId model_id,
-                   std::vector<double> params,
-                   double observed_x,
-                   double observed_y)
-      : model_id(model_id),
-        params(std::move(params)),
-        observed_x(observed_x),
-        observed_y(observed_y) {}
+                   std::size_t num_camera_params,
+                   Eigen::Vector2d observed_xy)
+      : model_id_(model_id),
+        num_camera_params_(num_camera_params),
+        observed_xy_(std::move(observed_xy)) {
+    set_num_residuals(2);
+    mutable_parameter_block_sizes()->push_back(4);
+    mutable_parameter_block_sizes()->push_back(3);
+    mutable_parameter_block_sizes()->push_back(3);
+    mutable_parameter_block_sizes()->push_back(
+        static_cast<int>(num_camera_params_));
+  }
 
-  template <typename T>
-  bool operator()(const T* const q_xyzw,
-                  const T* const t,
-                  const T* const xyz,
-                  T* residuals) const {
-    const Eigen::Map<const Eigen::Quaternion<T>> q(q_xyzw);
-    const Eigen::Matrix<T, 3, 1> point_world(xyz[0], xyz[1], xyz[2]);
-    const Eigen::Matrix<T, 3, 1> point_camera =
-        q * point_world + Eigen::Matrix<T, 3, 1>(t[0], t[1], t[2]);
-
-    const T normalized_x = point_camera.x() / point_camera.z();
-    const T normalized_y = point_camera.y() / point_camera.z();
-
-    T projected_x = T(0);
-    T projected_y = T(0);
-    if (model_id == CameraModelId::kPinhole) {
-      projected_x = T(params[0]) * normalized_x + T(params[2]);
-      projected_y = T(params[1]) * normalized_y + T(params[3]);
-    } else if (model_id == CameraModelId::kSimpleRadial) {
-      const T radius2 = normalized_x * normalized_x + normalized_y * normalized_y;
-      const T scale = T(1) + T(params[3]) * radius2;
-      projected_x = T(params[0]) * normalized_x * scale + T(params[1]);
-      projected_y = T(params[0]) * normalized_y * scale + T(params[2]);
-    } else {
+  bool Evaluate(double const* const* parameters,
+                double* residuals,
+                double** jacobians) const override {
+    if (!EvaluateResidual(parameters[0], parameters[1], parameters[2],
+                          parameters[3], residuals)) {
       return false;
     }
+    if (jacobians == nullptr) {
+      return true;
+    }
 
-    residuals[0] = projected_x - T(observed_x);
-    residuals[1] = projected_y - T(observed_y);
+    constexpr double kEps = 1e-6;
+    const int block_sizes[4] = {4, 3, 3, static_cast<int>(num_camera_params_)};
+    for (int block_idx = 0; block_idx < 4; ++block_idx) {
+      if (jacobians[block_idx] == nullptr) {
+        continue;
+      }
+      for (int param_idx = 0; param_idx < block_sizes[block_idx]; ++param_idx) {
+        std::vector<double> perturbed(
+            parameters[block_idx],
+            parameters[block_idx] + block_sizes[block_idx]);
+        perturbed[param_idx] += kEps;
+        double const* plus_parameters[4] = {parameters[0], parameters[1],
+                                            parameters[2], parameters[3]};
+        plus_parameters[block_idx] = perturbed.data();
+        double plus_residuals[2] = {0.0, 0.0};
+        if (!EvaluateResidual(plus_parameters[0], plus_parameters[1],
+                              plus_parameters[2], plus_parameters[3],
+                              plus_residuals)) {
+          return false;
+        }
+        jacobians[block_idx][0 * block_sizes[block_idx] + param_idx] =
+            (plus_residuals[0] - residuals[0]) / kEps;
+        jacobians[block_idx][1 * block_sizes[block_idx] + param_idx] =
+            (plus_residuals[1] - residuals[1]) / kEps;
+      }
+    }
     return true;
   }
 
-  static ceres::CostFunction* Create(const Camera& camera,
-                                     const Eigen::Vector2d& observed_xy) {
-    return new ceres::AutoDiffCostFunction<ReprojectionCost, 2, 4, 3, 3>(
-        new ReprojectionCost(camera.model_id, camera.params, observed_xy.x(),
-                             observed_xy.y()));
+ private:
+  bool EvaluateResidual(const double* q_xyzw,
+                        const double* t,
+                        const double* xyz,
+                        const double* camera_params,
+                        double* residuals) const {
+    Eigen::Quaterniond q(q_xyzw[3], q_xyzw[0], q_xyzw[1], q_xyzw[2]);
+    q.normalize();
+    const Eigen::Vector3d point_world(xyz[0], xyz[1], xyz[2]);
+    const Eigen::Vector3d point_camera =
+        q * point_world + Eigen::Vector3d(t[0], t[1], t[2]);
+    Eigen::Vector2d projected;
+    if (!ProjectWithParams(model_id_, camera_params, point_camera,
+                           &projected)) {
+      return false;
+    }
+    residuals[0] = projected.x() - observed_xy_.x();
+    residuals[1] = projected.y() - observed_xy_.y();
+    return true;
   }
 
-  CameraModelId model_id;
-  std::vector<double> params;
-  double observed_x = 0.0;
-  double observed_y = 0.0;
+  CameraModelId model_id_ = CameraModelId::kInvalid;
+  std::size_t num_camera_params_ = 0;
+  Eigen::Vector2d observed_xy_ = Eigen::Vector2d::Zero();
 };
+
+std::vector<int> ConstantCameraParameterIndices(
+    const Camera& camera,
+    CameraParameterGroup refine_groups) {
+  const std::vector<std::size_t> variable_indices =
+      CameraParameterIndicesForGroups(camera.model_id, refine_groups);
+  std::set<std::size_t> variable_set(variable_indices.begin(),
+                                     variable_indices.end());
+  std::vector<int> constant_indices;
+  for (std::size_t idx = 0; idx < camera.params.size(); ++idx) {
+    if (variable_set.find(idx) == variable_set.end()) {
+      constant_indices.push_back(static_cast<int>(idx));
+    }
+  }
+  return constant_indices;
+}
 
 PoseBlock MakePoseBlock(const Pose3& pose) {
   PoseBlock block;
@@ -191,6 +290,11 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
     point_blocks.emplace(point3d_id, MakePointBlock(point3d));
   }
 
+  std::map<CameraId, std::vector<double>> camera_blocks;
+  for (const auto& [camera_id, camera] : reconstruction->Cameras()) {
+    camera_blocks.emplace(camera_id, camera.params);
+  }
+
   ceres::Problem problem;
   for (auto& [image_id, block] : pose_blocks) {
     problem.AddParameterBlock(
@@ -226,6 +330,25 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
     }
   }
 
+  for (auto& [camera_id, params] : camera_blocks) {
+    Camera& camera = reconstruction->GetCamera(camera_id);
+    problem.AddParameterBlock(params.data(),
+                              static_cast<int>(params.size()));
+    const std::vector<int> constant_indices =
+        ConstantCameraParameterIndices(camera, options.refine_camera_params);
+    if (constant_indices.size() == params.size()) {
+      problem.SetParameterBlockConstant(params.data());
+    } else {
+      ++summary.num_variable_cameras;
+      if (!constant_indices.empty()) {
+        problem.SetParameterization(
+            params.data(),
+            new ceres::SubsetParameterization(
+                static_cast<int>(params.size()), constant_indices));
+      }
+    }
+  }
+
   for (const Observation& observation : observations) {
     const Image& image = reconstruction->GetImage(observation.image_id);
     const Camera& camera = reconstruction->GetCamera(image.camera_id);
@@ -233,10 +356,13 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
         options.loss_scale > 0.0 ? new ceres::SoftLOneLoss(options.loss_scale)
                                  : nullptr;
     problem.AddResidualBlock(
-        ReprojectionCost::Create(camera, observation.xy), loss_function,
+        new ReprojectionCost(camera.model_id, camera.params.size(),
+                             observation.xy),
+        loss_function,
         pose_blocks.at(observation.image_id).q_xyzw,
         pose_blocks.at(observation.image_id).t,
-        point_blocks.at(observation.point3d_id).xyz);
+        point_blocks.at(observation.point3d_id).xyz,
+        camera_blocks.at(image.camera_id).data());
   }
 
   ceres::Solver::Options solver_options;
@@ -254,6 +380,9 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
   }
   for (const auto& [point3d_id, block] : point_blocks) {
     WritePointBlock(block, &reconstruction->GetPoint3D(point3d_id));
+  }
+  for (const auto& [camera_id, params] : camera_blocks) {
+    reconstruction->GetCamera(camera_id).params = params;
   }
 
   summary.final_mean_reprojection_error =

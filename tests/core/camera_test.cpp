@@ -28,6 +28,27 @@ Camera SimpleRadialCamera() {
   return camera;
 }
 
+Camera RadialCamera() {
+  Camera camera;
+  camera.id = 3;
+  camera.model_id = CameraModelId::kRadial;
+  camera.width = 1920;
+  camera.height = 1080;
+  camera.params = {1000.0, 960.0, 540.0, 0.01, -0.001};
+  return camera;
+}
+
+Camera OpenCVCamera() {
+  Camera camera;
+  camera.id = 4;
+  camera.model_id = CameraModelId::kOpenCV;
+  camera.width = 1920;
+  camera.height = 1080;
+  camera.params = {1000.0, 980.0, 960.0, 540.0,
+                   0.01, -0.001, 0.0005, -0.0003};
+  return camera;
+}
+
 TEST(CameraModelTest, RegistersCompleteModelFamily) {
   EXPECT_EQ(CameraModelNameToId("PINHOLE"), CameraModelId::kPinhole);
   EXPECT_EQ(CameraModelNameToId("FULL_OPENCV"), CameraModelId::kFullOpenCV);
@@ -37,9 +58,11 @@ TEST(CameraModelTest, RegistersCompleteModelFamily) {
 }
 
 TEST(CameraModelTest, TracksProjectionImplementationState) {
+  EXPECT_TRUE(CameraModelProjectionImplemented(CameraModelId::kSimplePinhole));
   EXPECT_TRUE(CameraModelProjectionImplemented(CameraModelId::kPinhole));
   EXPECT_TRUE(CameraModelProjectionImplemented(CameraModelId::kSimpleRadial));
-  EXPECT_FALSE(CameraModelProjectionImplemented(CameraModelId::kOpenCV));
+  EXPECT_TRUE(CameraModelProjectionImplemented(CameraModelId::kRadial));
+  EXPECT_TRUE(CameraModelProjectionImplemented(CameraModelId::kOpenCV));
 }
 
 TEST(CameraModelTest, InitializesSingleAndDoubleFocalModels) {
@@ -97,6 +120,32 @@ TEST(CameraTest, SimpleRadialProjectionAndUnprojectionRoundTrip) {
   EXPECT_NEAR(round_trip.z(), point_camera.z(), 1e-12);
 }
 
+TEST(CameraTest, RadialProjectionAndUnprojectionRoundTrip) {
+  const Camera camera = RadialCamera();
+  const Eigen::Vector3d point_camera(0.16, -0.07, 2.0);
+
+  const Eigen::Vector2d pixel = ProjectPoint(camera, point_camera);
+  const Eigen::Vector3d round_trip =
+      UnprojectPixel(camera, pixel, point_camera.z());
+
+  EXPECT_NEAR(round_trip.x(), point_camera.x(), 1e-9);
+  EXPECT_NEAR(round_trip.y(), point_camera.y(), 1e-9);
+  EXPECT_NEAR(round_trip.z(), point_camera.z(), 1e-12);
+}
+
+TEST(CameraTest, OpenCVProjectionAndUnprojectionRoundTrip) {
+  const Camera camera = OpenCVCamera();
+  const Eigen::Vector3d point_camera(0.18, -0.09, 2.0);
+
+  const Eigen::Vector2d pixel = ProjectPoint(camera, point_camera);
+  const Eigen::Vector3d round_trip =
+      UnprojectPixel(camera, pixel, point_camera.z());
+
+  EXPECT_NEAR(round_trip.x(), point_camera.x(), 1e-9);
+  EXPECT_NEAR(round_trip.y(), point_camera.y(), 1e-9);
+  EXPECT_NEAR(round_trip.z(), point_camera.z(), 1e-12);
+}
+
 TEST(CameraTest, ProjectionRejectsNonPositiveDepth) {
   const Camera camera = PinholeCamera();
   EXPECT_THROW(ProjectPoint(camera, Eigen::Vector3d(0.0, 0.0, 0.0)),
@@ -106,7 +155,7 @@ TEST(CameraTest, ProjectionRejectsNonPositiveDepth) {
 TEST(CameraTest, UnimplementedProjectionThrows) {
   Camera camera;
   camera.id = 3;
-  camera.model_id = CameraModelId::kOpenCV;
+  camera.model_id = CameraModelId::kFOV;
   camera.width = 1920;
   camera.height = 1080;
   camera.params = InitializeCameraParams(camera.model_id, 1000.0, 1920, 1080);
@@ -117,4 +166,3 @@ TEST(CameraTest, UnimplementedProjectionThrows) {
 
 }  // namespace
 }  // namespace colite
-

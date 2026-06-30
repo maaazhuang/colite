@@ -1,4 +1,4 @@
-#include "colite/exe/recon_sfm.h"
+﻿#include "colite/exe/recon_sfm.h"
 
 #include <filesystem>
 #include <fstream>
@@ -12,12 +12,9 @@
 #include "colite/core/camera.h"
 #include "colite/core/match_graph.h"
 #include "colite/core/pose.h"
-#include "colite/exe/recon_sfm.h"
+#include "colite/io/camera_prior.h"
 
-namespace colite::exe {
-
-double EstimateInitialFocalLengthFromImage(const std::filesystem::path& image_path,
-                                           double user_focal_length);
+namespace colite {
 
 namespace {
 
@@ -45,7 +42,7 @@ FeatureSet MakeRatioSensitiveFeatures2() {
     features.descriptors(0, col) = 128.0F;
     features.descriptors(1, col) = 128.0F;
   }
-  // 构造一个 ratio-sensitive pair：0.8 下拒绝，0.9 下接受。
+  // Build a ratio-sensitive pair: rejected at 0.8, accepted at 0.9.
   features.descriptors(0, 15) = 120.0F;
   features.descriptors(1, 15) = 116.0F;
   return features;
@@ -55,12 +52,17 @@ TEST(ReconSfmExeTest, PrintsHelp) {
   std::ostringstream out;
   std::ostringstream err;
 
-  const int exit_code = RunReconSfm({"recon_sfm", "--help"}, out, err);
+  const int exit_code = exe::RunReconSfm({"recon_sfm", "--help"}, out, err);
 
   EXPECT_EQ(exit_code, 0);
   EXPECT_NE(out.str().find("Usage:"), std::string::npos);
   EXPECT_NE(out.str().find("--feature_extractor"), std::string::npos);
   EXPECT_NE(out.str().find("--feature_num_threads"), std::string::npos);
+  EXPECT_NE(out.str().find("--ba_refine_focal_length"), std::string::npos);
+  EXPECT_NE(out.str().find("--ba_refine_principal_point"), std::string::npos);
+  EXPECT_NE(out.str().find("--ba_refine_extra_params"), std::string::npos);
+  EXPECT_NE(out.str().find("--max_registration_trials_per_image"),
+            std::string::npos);
   EXPECT_NE(out.str().find("cudasift"), std::string::npos);
   EXPECT_TRUE(err.str().empty());
 }
@@ -78,10 +80,10 @@ TEST(ReconSfmExeTest, PrintsHelpThroughExeLayer) {
 }
 
 TEST(ReconSfmExeTest, ComputesEffectiveFeatureExtractionThreads) {
-  EXPECT_EQ(EffectiveFeatureExtractionThreads(1), 1);
-  EXPECT_EQ(EffectiveFeatureExtractionThreads(2), 2);
-  EXPECT_GT(EffectiveFeatureExtractionThreads(0), 0);
-  EXPECT_GT(EffectiveFeatureExtractionThreads(-1), 0);
+  EXPECT_EQ(controllers::EffectiveFeatureExtractionThreads(1), 1);
+  EXPECT_EQ(controllers::EffectiveFeatureExtractionThreads(2), 2);
+  EXPECT_GT(controllers::EffectiveFeatureExtractionThreads(0), 0);
+  EXPECT_GT(controllers::EffectiveFeatureExtractionThreads(-1), 0);
 }
 
 TEST(ReconSfmControllerTest, ComputesEffectiveFeatureExtractionThreads) {
@@ -96,10 +98,24 @@ TEST(ReconSfmExeTest, RejectsMissingRequiredArguments) {
   std::ostringstream err;
 
   const int exit_code =
-      RunReconSfm({"recon_sfm", "--image_path", "images"}, out, err);
+      exe::RunReconSfm({"recon_sfm", "--image_path", "images"}, out, err);
 
   EXPECT_NE(exit_code, 0);
   EXPECT_NE(err.str().find("--output_path"), std::string::npos);
+}
+
+TEST(ReconSfmExeTest, RejectsInvalidRegistrationTrialLimit) {
+  std::ostringstream out;
+  std::ostringstream err;
+
+  const int exit_code = exe::RunReconSfm(
+      {"recon_sfm", "--image_path", "images", "--output_path", "out",
+       "--max_registration_trials_per_image", "0"},
+      out, err);
+
+  EXPECT_NE(exit_code, 0);
+  EXPECT_NE(err.str().find("--max_registration_trials_per_image"),
+            std::string::npos);
 }
 
 TEST(ReconSfmExeTest, EstimatesInitialFocalLengthFromJpegExif) {
@@ -150,7 +166,7 @@ TEST(ReconSfmExeTest, WritesColmapTextModel) {
 
   const std::filesystem::path output_path =
       std::filesystem::temp_directory_path() / "colite_colmap_export_test";
-  WriteColmapTextModel(output_path, reconstruction);
+  controllers::WriteColmapTextModel(output_path, reconstruction);
 
   const std::string cameras = ReadTextFile(output_path / "cameras.txt");
   const std::string images = ReadTextFile(output_path / "images.txt");
@@ -202,8 +218,8 @@ TEST(ReconSfmExeTest, WritesQualitySummaryAndPlyPointCloud) {
   track.AddElement(2, 0);
   reconstruction.AddPoint3D(Eigen::Vector3d(0.0, 0.0, 5.0), track);
 
-  const ReconstructionQualityStats stats =
-      ComputeReconstructionQualityStats(reconstruction);
+  const controllers::ReconstructionQualityStats stats =
+      controllers::ComputeReconstructionQualityStats(reconstruction);
   EXPECT_EQ(stats.num_observations, 2U);
   EXPECT_NEAR(stats.mean_reprojection_error, 0.0, 1e-12);
   EXPECT_NEAR(stats.max_reprojection_error, 0.0, 1e-12);
@@ -215,9 +231,9 @@ TEST(ReconSfmExeTest, WritesQualitySummaryAndPlyPointCloud) {
 
   const std::filesystem::path output_path =
       std::filesystem::temp_directory_path() / "colite_summary_ply_test";
-  WriteRunSummary(output_path, reconstruction, summary,
+  controllers::WriteRunSummary(output_path, reconstruction, summary,
                   /*feature_extraction_seconds=*/1.25);
-  WritePlyPointCloud(output_path / "points3D.ply", reconstruction);
+  controllers::WritePlyPointCloud(output_path / "points3D.ply", reconstruction);
 
   const std::string summary_text = ReadTextFile(output_path / "summary.txt");
   const std::string ply_text = ReadTextFile(output_path / "points3D.ply");
@@ -266,7 +282,7 @@ TEST(ReconSfmExeTest, WritesPairDiagnosticsForVerifiedMatches) {
 
   const std::filesystem::path output_path =
       std::filesystem::temp_directory_path() / "colite_pair_diag_test";
-  WritePairDiagnostics(output_path, reconstruction, graph);
+  controllers::WritePairDiagnostics(output_path, reconstruction, graph);
 
   const std::string diagnostics =
       ReadTextFile(output_path / "pair_diagnostics.tsv");
@@ -276,6 +292,85 @@ TEST(ReconSfmExeTest, WritesPairDiagnosticsForVerifiedMatches) {
             std::string::npos);
   EXPECT_NE(diagnostics.find("1\t2\timage1.jpg\timage2.jpg\t3\t2"
                              "\tCALIBRATED_ESSENTIAL\t1.5"),
+            std::string::npos);
+}
+
+TEST(ReconSfmExeTest, WritesRegistrationDiagnosticsForMappingRounds) {
+  IncrementalMappingSummary summary;
+  summary.success = true;
+
+  IncrementalMapperSummary registration;
+  registration.success = true;
+  registration.registration_order = 2;
+  registration.image_id = 7;
+  registration.candidate_num_visible_points = 128;
+  registration.candidate_num_visible_observations = 256;
+  registration.candidate_mean_track_length = 2.0;
+  registration.candidate_num_registered_neighbors = 4;
+  registration.candidate_num_verified_inliers_to_registered_images = 512;
+  registration.candidate_score = 128500.0;
+  registration.registration_attempts_before_success = 1;
+  registration.registration.num_correspondences = 140;
+  registration.registration.num_inliers = 120;
+  registration.track_completion.num_completed_observations = 11;
+  registration.track_completion.num_merged_points = 2;
+  registration.track_completion.num_merged_observations = 3;
+  registration.triangulation.num_created_points = 23;
+  registration.triangulation.num_created_observations = 46;
+  registration.local_retriangulation.num_created_points = 5;
+  registration.local_retriangulation.num_created_observations = 10;
+  registration.local_retriangulation.num_merged_points = 1;
+  registration.local_retriangulation.num_merged_observations = 2;
+  registration.local_retriangulation.num_filtered_points = 2;
+  registration.local_bundle_adjustment.local_image_ids = {7, 8, 9};
+  registration.local_bundle_adjustment.fixed_image_ids = {3, 4};
+  registration.local_bundle_adjustment.num_local_images = 3;
+  registration.local_bundle_adjustment.num_constant_images = 2;
+  registration.local_bundle_adjustment.num_variable_images = 6;
+  registration.local_bundle_adjustment.num_variable_points = 80;
+  registration.local_bundle_adjustment.num_residuals = 260;
+  registration.local_bundle_adjustment.initial_mean_reprojection_error = 1.25;
+  registration.local_bundle_adjustment.final_mean_reprojection_error = 0.75;
+  registration.observation_filter.num_removed_observations = 3;
+  registration.observation_filter.num_removed_points = 1;
+  summary.registrations.push_back(registration);
+
+  ImageRegistrationFailureSummary failure;
+  failure.image_id = 9;
+  failure.attempt = 2;
+  failure.candidate_num_visible_points = 64;
+  failure.candidate_num_visible_observations = 96;
+  failure.candidate_mean_track_length = 1.5;
+  failure.candidate_num_registered_neighbors = 2;
+  failure.candidate_num_verified_inliers_to_registered_images = 180;
+  failure.candidate_score = 64200.0;
+  failure.message = "Not enough inliers";
+  summary.failed_registrations.push_back(failure);
+
+  const std::filesystem::path output_path =
+      std::filesystem::temp_directory_path() / "colite_registration_diag_test";
+  controllers::WriteRegistrationDiagnostics(output_path, summary);
+
+  const std::string diagnostics =
+      ReadTextFile(output_path / "registration_diagnostics.tsv");
+  EXPECT_NE(diagnostics.find(
+                "order\timage_id\tcandidate_visible_points"
+                "\tcandidate_visible_observations\tcandidate_mean_track_length"
+                "\tcandidate_registered_neighbors"),
+            std::string::npos);
+  EXPECT_NE(diagnostics.find(
+                "2\t7\t128\t256\t2\t4\t512\t128500\t1\t140\t120\t11\t2"
+                "\t3\t23\t46\t5\t10\t1\t2\t2\t3\t2\t2\t6\t80\t260"
+                "\t1.25\t0.75\t3\t1"),
+            std::string::npos);
+
+  const std::string failures =
+      ReadTextFile(output_path / "registration_failures.tsv");
+  EXPECT_NE(failures.find(
+                "image_id\tattempt\tcandidate_visible_points"
+                "\tcandidate_visible_observations\tcandidate_mean_track_length"),
+            std::string::npos);
+  EXPECT_NE(failures.find("9\t2\t64\t96\t1.5\t2\t180\t64200\tNot enough inliers"),
             std::string::npos);
 }
 
@@ -289,11 +384,11 @@ TEST(ReconSfmExeTest, BoostsOnlyNearbyPairMatchesWithRelaxedRatio) {
   base_options.max_ratio = 0.8;
   base_options.mutual_check = true;
 
-  NearbyPairMatchingOptions nearby_options;
+  controllers::NearbyPairMatchingOptions nearby_options;
   nearby_options.image_index_window = 1;
   nearby_options.max_ratio = 0.9;
 
-  MatchAllImagePairs({1, 2, 4}, base_options, nearby_options, &graph);
+  controllers::MatchAllImagePairs({1, 2, 4}, base_options, nearby_options, &graph);
 
   const std::vector<FeatureMatch>* nearby_matches = FindMatches(graph, 1, 2);
   const std::vector<FeatureMatch>* distant_matches = FindMatches(graph, 1, 4);
@@ -304,4 +399,4 @@ TEST(ReconSfmExeTest, BoostsOnlyNearbyPairMatchesWithRelaxedRatio) {
 }
 
 }  // namespace
-}  // namespace colite::exe
+}  // namespace colite

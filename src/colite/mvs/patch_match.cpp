@@ -17,8 +17,69 @@
 #include <opencv2/imgproc.hpp>
 
 #include "colite/core/camera.h"
+#include "colite/mvs/patch_match_cuda.h"
 
 namespace colite::mvs {
+
+std::string_view PatchMatchBackendToName(PatchMatchBackend backend) {
+  switch (backend) {
+    case PatchMatchBackend::kAuto:
+      return "auto";
+    case PatchMatchBackend::kCpu:
+      return "cpu";
+    case PatchMatchBackend::kCuda:
+      return "cuda";
+  }
+  return "unknown";
+}
+
+PatchMatchBackend PatchMatchBackendFromName(std::string_view name) {
+  if (name == "auto") {
+    return PatchMatchBackend::kAuto;
+  }
+  if (name == "cpu") {
+    return PatchMatchBackend::kCpu;
+  }
+  if (name == "cuda" || name == "gpu") {
+    return PatchMatchBackend::kCuda;
+  }
+  throw std::invalid_argument("Invalid PatchMatch backend: " +
+                              std::string(name));
+}
+
+bool IsCudaPatchMatchCompiled() {
+#ifdef COLITE_ENABLE_CUDA_MVS
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool IsCudaPatchMatchAvailable() {
+  if (!IsCudaPatchMatchCompiled()) {
+    return false;
+  }
+  std::string unavailable_reason;
+  const std::optional<PatchMatchStereoResult> result =
+      RunCudaPatchMatchStereo({}, &unavailable_reason);
+  (void)result;
+  return unavailable_reason.empty();
+}
+
+std::string CudaPatchMatchUnavailableReason() {
+  if (!IsCudaPatchMatchCompiled()) {
+    return "CUDA PatchMatch backend was not compiled in this build.";
+  }
+  std::string unavailable_reason;
+  const std::optional<PatchMatchStereoResult> result =
+      RunCudaPatchMatchStereo({}, &unavailable_reason);
+  (void)result;
+  if (unavailable_reason.empty()) {
+    return {};
+  }
+  return unavailable_reason;
+}
+
 namespace {
 
 constexpr char kConsistencyGraphBinaryMagic[] =
@@ -2236,6 +2297,51 @@ PatchMatchStereoResult RunPatchMatchStereoForImageImpl(
   return final_result;
 }
 
+PatchMatchStereoResult RunPatchMatchStereoForImageDispatch(
+    const PatchMatchView& reference_view,
+    const std::vector<PatchMatchView>& source_views,
+    const MvsImage& reference_image,
+    const std::vector<MvsImage>& source_images,
+    const std::vector<DenseDepthMap>* source_depth_maps,
+    float depth_min,
+    float depth_max,
+    const PatchMatchStereoOptions& options) {
+  if (options.backend == PatchMatchBackend::kAuto ||
+      options.backend == PatchMatchBackend::kCuda) {
+    CudaPatchMatchRequest request;
+    request.reference_view = &reference_view;
+    request.source_views = &source_views;
+    request.reference_image = &reference_image;
+    request.source_images = &source_images;
+    request.source_depth_maps = source_depth_maps;
+    request.depth_min = depth_min;
+    request.depth_max = depth_max;
+    request.options = options;
+
+    std::string unavailable_reason;
+    std::optional<PatchMatchStereoResult> cuda_result =
+        RunCudaPatchMatchStereo(request, &unavailable_reason);
+    if (cuda_result.has_value()) {
+      cuda_result->summary.requested_backend = options.backend;
+      cuda_result->summary.actual_backend = PatchMatchBackend::kCuda;
+      return *cuda_result;
+    }
+    if (options.backend == PatchMatchBackend::kCuda) {
+      if (unavailable_reason.empty()) {
+        unavailable_reason = "CUDA PatchMatch backend is unavailable.";
+      }
+      throw std::runtime_error(unavailable_reason);
+    }
+  }
+
+  PatchMatchStereoResult cpu_result = RunPatchMatchStereoForImageImpl(
+      reference_view, source_views, reference_image, source_images,
+      source_depth_maps, depth_min, depth_max, options);
+  cpu_result.summary.requested_backend = options.backend;
+  cpu_result.summary.actual_backend = PatchMatchBackend::kCpu;
+  return cpu_result;
+}
+
 PatchMatchStereoResult RunPatchMatchStereoForImage(
     const PatchMatchView& reference_view,
     const std::vector<PatchMatchView>& source_views,
@@ -2244,10 +2350,9 @@ PatchMatchStereoResult RunPatchMatchStereoForImage(
     float depth_min,
     float depth_max,
     const PatchMatchStereoOptions& options) {
-  return RunPatchMatchStereoForImageImpl(reference_view, source_views,
-                                         reference_image, source_images,
-                                         nullptr, depth_min, depth_max,
-                                         options);
+  return RunPatchMatchStereoForImageDispatch(
+      reference_view, source_views, reference_image, source_images, nullptr,
+      depth_min, depth_max, options);
 }
 
 PatchMatchStereoResult RunPatchMatchStereoForImageWithSourceDepths(
@@ -2259,7 +2364,7 @@ PatchMatchStereoResult RunPatchMatchStereoForImageWithSourceDepths(
     float depth_min,
     float depth_max,
     const PatchMatchStereoOptions& options) {
-  return RunPatchMatchStereoForImageImpl(
+  return RunPatchMatchStereoForImageDispatch(
       reference_view, source_views, reference_image, source_images,
       &source_depth_maps, depth_min, depth_max, options);
 }

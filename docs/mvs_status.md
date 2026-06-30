@@ -506,3 +506,151 @@ Verification command for milestone completion remains:
 ```bash
 wsl -d Ubuntu-22.04 -- bash -lc "cd /mnt/d/Code/CXX/colite && cmake --build --preset wsl-debug && ctest --test-dir build-wsl --output-on-failure"
 ```
+
+## 2026-06-30 PatchMatch CUDA backend boundary
+
+本轮先完成 GPU PatchMatch 的工程边界，而不是直接替换 CPU
+PatchMatch 算法：
+
+- `PatchMatchStereoOptions` 新增 `backend` 和 `cuda_gpu_index`。
+- `PatchMatchBackend` 支持 `auto`、`cpu`、`cuda`；`auto` 是默认值，后续
+  CUDA backend 可用时优先走 CUDA，否则回退 CPU。
+- `recon_mvs` 新增：
+  - `--patch_match_backend <auto|cpu|cuda>`
+  - `--patch_match_gpu_index <n>`
+- `PatchMatchStereoSummary` 新增 `requested_backend` 和 `actual_backend`。
+- `stereo/patch_match.tsv` 新增 `requested_backend`、`actual_backend` 诊断列。
+- CMake 新增 `COLITE_ENABLE_CUDA_MVS` 选项，并加入 CUDA PatchMatch stub
+  入口，后续真实 CUDA kernel 会从该入口替换。
+
+当前状态：
+
+- `--patch_match_backend auto` 在当前构建中回退 CPU。
+- `--patch_match_backend cpu` 强制 CPU。
+- `--patch_match_backend cuda` 在 CUDA kernel 未实现前会明确失败。
+- WSL 中已确认 CUDA 编译器路径：
+  `/usr/local/cuda-13.2/bin/nvcc`，版本 `13.2.51`。
+
+验证：
+
+```text
+cmake --build build-wsl --target colite_core_tests -j2
+ctest --test-dir build-wsl -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+25/25 passed
+```
+
+## 2026-06-30 First runnable CUDA PatchMatch backend
+
+本轮将 CUDA PatchMatch 从 stub 推进到可运行的第一版 GPU backend：
+
+- CUDA build 下使用 `src/colite/mvs/patch_match_cuda.cu`。
+- 非 CUDA build 下仍使用 `src/colite/mvs/patch_match_cuda_stub.cpp`。
+- GPU backend 已实现：
+  - reference/source 图像上传；
+  - packed source image cache；
+  - optional source depth map cache；
+  - reference-to-source 相对位姿上传；
+  - depth/normal/cost device map；
+  - 随机 depth 初始化；
+  - 默认 normal 初始化；
+  - ZNCC photometric cost；
+  - plane reprojection；
+  - top-k multi-source cost aggregation；
+  - source-depth geometric penalty；
+  - propagation kernel；
+  - random depth perturbation kernel。
+- `COLITE_ENABLE_CUDA_MVS=ON` 时，`--patch_match_backend auto` 会优先尝试
+  CUDA。CUDA 当前不支持的请求会在 auto 模式回退 CPU；强制
+  `--patch_match_backend cuda` 时会返回明确错误。
+
+当前限制：
+
+- 这是第一版可运行 CUDA backend，不是完整 COLMAP CUDA PatchMatch。
+- 当前只支持 single-scale；`patch_match_pyramid_levels > 1` 会回退 CPU。
+- GPU perturbation 当前主要扰动 depth，normal perturbation 仍需补齐。
+- 尚未实现 COLMAP 的 selection probability、rotation sweep、incident angle
+  weighting 和完整 GPU 几何过滤。
+
+验证：
+
+```text
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest' --output-on-failure
+12/12 passed
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+14/14 passed
+
+ctest --test-dir build-wsl -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+26/26 passed
+```
+
+## 2026-06-30 CUDA layered texture image cache
+
+本轮继续向 COLMAP CUDA PatchMatch 靠拢，将 CUDA backend 的图像访问从
+packed linear buffer 升级为 layered CUDA texture：
+
+- `patch_match_cuda.cu` 内部新增 `FloatLayeredTexture` RAII 封装。
+- reference image、source image cache、optional source depth map cache 现在
+  上传到 CUDA layered array。
+- cost / propagation / perturbation kernels 通过 `cudaTextureObject_t` 采样。
+- texture 使用 linear filtering、border addressing、unnormalized coordinates。
+- CUDA 侧旧的手写图像双线性采样路径已移除。
+
+当前仍未完成的 COLMAP CUDA 细节：
+
+- pose 仍通过 device struct array 传入，尚未改成 COLMAP 风格 pose texture。
+- 暂不支持 CUDA multi-scale pyramid。
+- selection probability、rotation sweep scheduling、normal perturbation 和更完整
+  geometric filtering 仍待实现。
+
+验证：
+
+```text
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+26/26 passed
+
+ctest --test-dir build-wsl -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+26/26 passed
+```
+
+## 2026-06-30 CUDA pose texture 与几何代价组织
+
+本轮继续按 COLMAP CUDA PatchMatch 的方向推进，把 CUDA backend 中的 source
+pose 从 device struct array 改为 texture-backed pose cache：
+
+- `patch_match_cuda.cu` 新增 pose layered texture，每个 source view 打包 43
+  个 float 参数。
+- 打包内容包括 `K`、reference-to-source `R/T`、source camera center、`P`
+  以及 `invP`。
+- CUDA kernel 现在通过 `cudaTextureObject_t` 读取 source intrinsics /
+  transform；source metadata struct 只保留图像尺寸。
+- 几何一致性代价从“直接比较 source camera z 深度”改为更接近 COLMAP 的
+  forward/backward depth check：
+  - reference hypothesis 通过 source `P` 投影到 source depth map；
+  - 采样 source depth；
+  - 通过 source `invP` 回投到 reference camera；
+  - 比较回投后的 reference depth 与当前 hypothesis depth。
+
+当前意义：
+
+- CUDA PatchMatch 的数据组织更接近 COLMAP 的 pose/source texture cache。
+- 后续加入 rotated sweeps、selection probability、source view 几何权重时，
+  不需要再把 pose 组织重写一遍。
+
+仍未完成：
+
+- pose texture 目前只保存基础方向，尚未打包 rotated sweep 变体。
+- selection probability、incident/view-angle weighting、完整几何过滤仍待实现。
+- CUDA backend 仍只支持 single-scale；multi-scale pyramid 在 `auto` 模式下继续回退 CPU。
+
+验证：
+
+```text
+CUDA:
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+26/26 passed
+
+CPU:
+ctest --test-dir build-wsl -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+26/26 passed
+```

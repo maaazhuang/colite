@@ -139,5 +139,59 @@ TEST(GlobalBundleAdjusterTest, ReducesReprojectionErrorForWholeModel) {
   EXPECT_LT(error_after, error_before * 0.5);
 }
 
+TEST(GlobalBundleAdjusterTest, RefinesOnlyRequestedCameraParameterGroups) {
+  Camera true_camera = MakeCamera();
+  const std::vector<Eigen::Vector3d> true_points = MakeScenePoints();
+  const std::vector<Pose3> true_poses = {
+      CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0)),
+      CameraAt(Eigen::Vector3d(1.0, 0.0, 0.0)),
+      CameraAt(Eigen::Vector3d(0.35, 0.15, 0.0))};
+
+  Reconstruction reconstruction;
+  Camera estimated_camera = true_camera;
+  estimated_camera.params[0] = 630.0;
+  estimated_camera.params[1] = 630.0;
+  reconstruction.AddCamera(estimated_camera);
+
+  for (std::size_t i = 0; i < true_poses.size(); ++i) {
+    Image image =
+        MakeRegisteredImage(static_cast<ImageId>(i + 1), true_poses[i]);
+    AddImageObservations(true_camera, true_poses[i], &image, true_points);
+    reconstruction.AddImage(image);
+  }
+  for (std::size_t i = 0; i < true_points.size(); ++i) {
+    Track track;
+    for (ImageId image_id = 1; image_id <= 3; ++image_id) {
+      track.AddElement(image_id, static_cast<Point2DIdx>(i));
+    }
+    reconstruction.AddPoint3D(true_points[i], track);
+  }
+
+  const double initial_fx_error =
+      std::abs(reconstruction.GetCamera(1).params[0] - true_camera.params[0]);
+  const double fixed_cx = reconstruction.GetCamera(1).params[2];
+  const double fixed_cy = reconstruction.GetCamera(1).params[3];
+
+  GlobalBundleAdjustmentOptions options;
+  options.max_num_iterations = 80;
+  options.loss_scale = 0.0;
+  options.refine_poses = false;
+  options.refine_points = false;
+  options.refine_camera_params = CameraParameterGroup::kFocalLength;
+
+  const GlobalBundleAdjustmentSummary summary =
+      AdjustGlobalBundle(options, &reconstruction);
+
+  const Camera& refined_camera = reconstruction.GetCamera(1);
+  EXPECT_TRUE(summary.success);
+  EXPECT_EQ(summary.num_variable_cameras, 1U);
+  EXPECT_LT(std::abs(refined_camera.params[0] - true_camera.params[0]),
+            initial_fx_error * 0.25);
+  EXPECT_LT(std::abs(refined_camera.params[1] - true_camera.params[1]),
+            initial_fx_error * 0.25);
+  EXPECT_DOUBLE_EQ(refined_camera.params[2], fixed_cx);
+  EXPECT_DOUBLE_EQ(refined_camera.params[3], fixed_cy);
+}
+
 }  // namespace
 }  // namespace colite

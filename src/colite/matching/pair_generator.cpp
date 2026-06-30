@@ -1,0 +1,345 @@
+#include "colite/matching/pair_generator.h"
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <map>
+#include <set>
+#include <stdexcept>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+namespace colite {
+namespace {
+
+void AddPair(ImageId image_id1,
+             ImageId image_id2,
+             std::set<ImagePair>* pairs) {
+  if (image_id1 == image_id2) {
+    return;
+  }
+  pairs->insert(ImagePair::Ordered(image_id1, image_id2));
+}
+
+std::vector<ImagePair> ToVector(const std::set<ImagePair>& pairs) {
+  return {pairs.begin(), pairs.end()};
+}
+
+std::vector<ImagePair> GenerateExhaustivePairs(
+    const std::vector<Image>& images) {
+  std::set<ImagePair> pairs;
+  for (std::size_t i = 0; i < images.size(); ++i) {
+    for (std::size_t j = i + 1; j < images.size(); ++j) {
+      AddPair(images[i].id, images[j].id, &pairs);
+    }
+  }
+  return ToVector(pairs);
+}
+
+std::vector<ImagePair> GenerateSequentialPairs(
+    const std::vector<Image>& images,
+    const std::size_t overlap) {
+  if (overlap == 0) {
+    throw std::invalid_argument("sequential overlap must be positive");
+  }
+  std::set<ImagePair> pairs;
+  for (std::size_t i = 0; i < images.size(); ++i) {
+    const std::size_t end = std::min(images.size(), i + overlap + 1);
+    for (std::size_t j = i + 1; j < end; ++j) {
+      AddPair(images[i].id, images[j].id, &pairs);
+    }
+  }
+  return ToVector(pairs);
+}
+
+std::vector<ImagePair> GenerateSpatialPairs(
+    const std::vector<Image>& images,
+    const std::size_t max_num_neighbors,
+    const double max_distance) {
+  if (max_num_neighbors == 0) {
+    throw std::invalid_argument("spatial max_num_neighbors must be positive");
+  }
+  for (const Image& image : images) {
+    if (!image.prior_position.has_value()) {
+      throw std::invalid_argument(
+          "spatial matching requires every image to have a prior position");
+    }
+  }
+
+  std::set<ImagePair> pairs;
+  for (std::size_t i = 0; i < images.size(); ++i) {
+    std::vector<std::pair<double, std::size_t>> neighbors;
+    neighbors.reserve(images.size() > 0 ? images.size() - 1 : 0);
+    for (std::size_t j = 0; j < images.size(); ++j) {
+      if (i == j) {
+        continue;
+      }
+      const double distance =
+          (*images[i].prior_position - *images[j].prior_position).norm();
+      if (max_distance > 0.0 && distance > max_distance) {
+        continue;
+      }
+      neighbors.emplace_back(distance, j);
+    }
+    std::sort(neighbors.begin(), neighbors.end(),
+              [&](const auto& lhs, const auto& rhs) {
+                return std::tie(lhs.first, images[lhs.second].id) <
+                       std::tie(rhs.first, images[rhs.second].id);
+              });
+    const std::size_t num_neighbors =
+        std::min(max_num_neighbors, neighbors.size());
+    for (std::size_t k = 0; k < num_neighbors; ++k) {
+      AddPair(images[i].id, images[neighbors[k].second].id, &pairs);
+    }
+  }
+  return ToVector(pairs);
+}
+
+using DescriptorVector = std::vector<float>;
+
+struct DescriptorSample {
+  ImageId image_id = kInvalidImageId;
+  DescriptorVector values;
+};
+
+double SquaredDistance(const DescriptorVector& lhs,
+                       const DescriptorVector& rhs) {
+  double distance = 0.0;
+  const std::size_t size = std::min(lhs.size(), rhs.size());
+  for (std::size_t i = 0; i < size; ++i) {
+    const double diff = static_cast<double>(lhs[i]) - rhs[i];
+    distance += diff * diff;
+  }
+  return distance;
+}
+
+std::vector<DescriptorSample> CollectDescriptorSamples(
+    const std::vector<Image>& images,
+    const MatchGraph& graph,
+    const std::size_t max_num_features_per_image) {
+  std::vector<DescriptorSample> samples;
+  for (const Image& image : images) {
+    const FeatureSet* features = FindFeatures(graph, image.id);
+    if (features == nullptr || features->descriptors.rows() == 0 ||
+        features->descriptors.cols() == 0) {
+      continue;
+    }
+    const std::size_t rows =
+        static_cast<std::size_t>(features->descriptors.rows());
+    const std::size_t cols =
+        static_cast<std::size_t>(features->descriptors.cols());
+    const std::size_t step =
+        max_num_features_per_image > 0 && rows > max_num_features_per_image
+            ? (rows + max_num_features_per_image - 1) / max_num_features_per_image
+            : 1;
+    for (std::size_t row = 0; row < rows; row += step) {
+      DescriptorSample sample;
+      sample.image_id = image.id;
+      sample.values.resize(cols);
+      for (std::size_t col = 0; col < cols; ++col) {
+        sample.values[col] =
+            features->descriptors(static_cast<int>(row), static_cast<int>(col));
+      }
+      samples.push_back(std::move(sample));
+    }
+  }
+  return samples;
+}
+
+std::vector<DescriptorVector> TrainVisualWords(
+    const std::vector<DescriptorSample>& samples,
+    const std::size_t num_visual_words) {
+  if (samples.empty()) {
+    return {};
+  }
+  const std::size_t num_words =
+      std::max<std::size_t>(1, std::min(num_visual_words, samples.size()));
+  std::vector<DescriptorVector> words;
+  words.reserve(num_words);
+  for (std::size_t i = 0; i < num_words; ++i) {
+    const std::size_t sample_idx =
+        num_words == 1 ? 0 : (i * (samples.size() - 1)) / (num_words - 1);
+    words.push_back(samples[sample_idx].values);
+  }
+
+  // 小型 deterministic k-means。真实 COLMAP 使用离线词汇树；这里为文件 workspace
+  // 提供无需外部 vocab 文件的第一版候选检索能力。
+  for (int iteration = 0; iteration < 6; ++iteration) {
+    std::vector<DescriptorVector> sums(words.size(),
+                                       DescriptorVector(words[0].size(), 0.0F));
+    std::vector<std::size_t> counts(words.size(), 0);
+    for (const DescriptorSample& sample : samples) {
+      std::size_t best_word = 0;
+      double best_distance = std::numeric_limits<double>::max();
+      for (std::size_t word_idx = 0; word_idx < words.size(); ++word_idx) {
+        const double distance = SquaredDistance(sample.values, words[word_idx]);
+        if (distance < best_distance) {
+          best_distance = distance;
+          best_word = word_idx;
+        }
+      }
+      for (std::size_t dim = 0; dim < sample.values.size(); ++dim) {
+        sums[best_word][dim] += sample.values[dim];
+      }
+      ++counts[best_word];
+    }
+    for (std::size_t word_idx = 0; word_idx < words.size(); ++word_idx) {
+      if (counts[word_idx] == 0) {
+        continue;
+      }
+      for (float& value : sums[word_idx]) {
+        value /= static_cast<float>(counts[word_idx]);
+      }
+      words[word_idx] = std::move(sums[word_idx]);
+    }
+  }
+  return words;
+}
+
+std::size_t AssignVisualWord(const DescriptorVector& descriptor,
+                             const std::vector<DescriptorVector>& words) {
+  std::size_t best_word = 0;
+  double best_distance = std::numeric_limits<double>::max();
+  for (std::size_t word_idx = 0; word_idx < words.size(); ++word_idx) {
+    const double distance = SquaredDistance(descriptor, words[word_idx]);
+    if (distance < best_distance) {
+      best_distance = distance;
+      best_word = word_idx;
+    }
+  }
+  return best_word;
+}
+
+std::vector<ImagePair> GenerateVocabTreePairs(
+    const std::vector<Image>& images,
+    const MatchGraph& graph,
+    const std::size_t num_images,
+    const std::size_t num_visual_words,
+    const std::size_t max_num_features_per_image) {
+  if (num_images == 0) {
+    throw std::invalid_argument("vocab_tree num_images must be positive");
+  }
+  const std::vector<DescriptorSample> samples =
+      CollectDescriptorSamples(images, graph, max_num_features_per_image);
+  if (samples.empty()) {
+    throw std::invalid_argument(
+        "vocab tree matching requires workspace features");
+  }
+  const std::vector<DescriptorVector> words =
+      TrainVisualWords(samples, num_visual_words);
+
+  std::map<ImageId, std::map<std::size_t, double>> histograms;
+  for (const DescriptorSample& sample : samples) {
+    ++histograms[sample.image_id][AssignVisualWord(sample.values, words)];
+  }
+
+  std::map<std::size_t, std::size_t> document_frequency;
+  for (const auto& [image_id, histogram] : histograms) {
+    (void)image_id;
+    for (const auto& [word_id, count] : histogram) {
+      (void)count;
+      ++document_frequency[word_id];
+    }
+  }
+
+  const double num_docs = static_cast<double>(histograms.size());
+  for (auto& [image_id, histogram] : histograms) {
+    (void)image_id;
+    double norm = 0.0;
+    for (auto& [word_id, value] : histogram) {
+      const double idf =
+          std::log((num_docs + 1.0) /
+                   (static_cast<double>(document_frequency[word_id]) + 1.0)) +
+          1.0;
+      value *= idf;
+      norm += value * value;
+    }
+    norm = std::sqrt(norm);
+    if (norm > 0.0) {
+      for (auto& [word_id, value] : histogram) {
+        (void)word_id;
+        value /= norm;
+      }
+    }
+  }
+
+  std::set<ImagePair> pairs;
+  for (const Image& image : images) {
+    const auto query_it = histograms.find(image.id);
+    if (query_it == histograms.end()) {
+      continue;
+    }
+    std::vector<std::pair<double, ImageId>> scored_images;
+    for (const Image& other : images) {
+      if (other.id == image.id) {
+        continue;
+      }
+      const auto other_it = histograms.find(other.id);
+      if (other_it == histograms.end()) {
+        continue;
+      }
+      double score = 0.0;
+      const auto* smaller = &query_it->second;
+      const auto* larger = &other_it->second;
+      if (smaller->size() > larger->size()) {
+        std::swap(smaller, larger);
+      }
+      for (const auto& [word_id, value] : *smaller) {
+        const auto value_it = larger->find(word_id);
+        if (value_it != larger->end()) {
+          score += value * value_it->second;
+        }
+      }
+      if (score > 0.0) {
+        scored_images.emplace_back(score, other.id);
+      }
+    }
+    std::sort(scored_images.begin(), scored_images.end(),
+              [](const auto& lhs, const auto& rhs) {
+                if (lhs.first != rhs.first) {
+                  return lhs.first > rhs.first;
+                }
+                return lhs.second < rhs.second;
+              });
+    const std::size_t keep = std::min(num_images, scored_images.size());
+    for (std::size_t i = 0; i < keep; ++i) {
+      AddPair(image.id, scored_images[i].second, &pairs);
+    }
+  }
+  return ToVector(pairs);
+}
+
+}  // namespace
+
+std::vector<ImagePair> GenerateMatchingPairs(
+    const std::vector<Image>& images,
+    const MatchingPairGeneratorOptions& options) {
+  switch (options.strategy) {
+    case MatchingStrategy::kExhaustive:
+      return GenerateExhaustivePairs(images);
+    case MatchingStrategy::kSequential:
+      return GenerateSequentialPairs(images, options.sequential_overlap);
+    case MatchingStrategy::kSpatial:
+      return GenerateSpatialPairs(images, options.spatial_max_num_neighbors,
+                                  options.spatial_max_distance);
+    case MatchingStrategy::kVocabTree:
+      throw std::invalid_argument(
+          "vocab tree matching requires a MatchGraph with features");
+  }
+  throw std::invalid_argument("unsupported matching strategy");
+}
+
+std::vector<ImagePair> GenerateMatchingPairs(
+    const std::vector<Image>& images,
+    const MatchGraph& graph,
+    const MatchingPairGeneratorOptions& options) {
+  if (options.strategy == MatchingStrategy::kVocabTree) {
+    return GenerateVocabTreePairs(images, graph, options.vocab_tree_num_images,
+                                  options.vocab_tree_num_visual_words,
+                                  options.vocab_tree_max_num_features);
+  }
+  return GenerateMatchingPairs(images, options);
+}
+
+}  // namespace colite

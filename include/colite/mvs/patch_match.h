@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include <Eigen/Core>
@@ -81,6 +83,18 @@ enum class PatchMatchPropagationSchedule {
   kCheckerboard,
 };
 
+enum class PatchMatchBackend {
+  kAuto,
+  kCpu,
+  kCuda,
+};
+
+std::string_view PatchMatchBackendToName(PatchMatchBackend backend);
+PatchMatchBackend PatchMatchBackendFromName(std::string_view name);
+bool IsCudaPatchMatchCompiled();
+bool IsCudaPatchMatchAvailable();
+std::string CudaPatchMatchUnavailableReason();
+
 struct PatchMatchSweepSummary {
   std::size_t num_pixels_visited = 0;
   std::size_t num_candidate_evaluations = 0;
@@ -120,6 +134,8 @@ struct PatchMatchNormalRefinementSummary {
 };
 
 struct PatchMatchStereoOptions {
+  PatchMatchBackend backend = PatchMatchBackend::kAuto;
+  int cuda_gpu_index = -1;
   PatchMatchInitializationOptions initialization;
   PatchMatchCostOptions cost;
   PatchMatchPerturbationOptions perturbation;
@@ -137,6 +153,8 @@ struct PatchMatchStereoOptions {
 };
 
 struct PatchMatchStereoSummary {
+  PatchMatchBackend requested_backend = PatchMatchBackend::kAuto;
+  PatchMatchBackend actual_backend = PatchMatchBackend::kCpu;
   std::size_t num_pyramid_levels = 1;
   std::size_t num_iterations = 0;
   std::size_t num_forward_sweeps = 0;

@@ -120,10 +120,16 @@ void WriteWorkspaceImages(const std::filesystem::path& workspace_path,
                           const std::vector<Image>& images) {
   std::filesystem::create_directories(workspace_path);
   std::ofstream file(workspace_path / "images.tsv");
-  file << "# image_id\tcamera_id\tname\tfile_path\n";
+  file << "# image_id\tcamera_id\tname\tfile_path\tprior_x\tprior_y\tprior_z\n";
   for (const Image& image : images) {
     file << image.id << "\t" << image.camera_id << "\t" << image.name << "\t"
-         << image.file_path << "\n";
+         << image.file_path;
+    if (image.prior_position.has_value()) {
+      file << "\t" << std::setprecision(17) << image.prior_position->x()
+           << "\t" << image.prior_position->y() << "\t"
+           << image.prior_position->z();
+    }
+    file << "\n";
   }
 }
 
@@ -140,7 +146,22 @@ std::vector<Image> ReadWorkspaceImages(
     image.id = static_cast<ImageId>(std::stoul(image_id_text));
     image.camera_id = static_cast<CameraId>(std::stoul(camera_id_text));
     std::getline(stream, image.name, '\t');
-    std::getline(stream, image.file_path);
+    std::getline(stream, image.file_path, '\t');
+    if (!stream.eof()) {
+      std::string x_text;
+      std::string y_text;
+      std::string z_text;
+      std::getline(stream, x_text, '\t');
+      std::getline(stream, y_text, '\t');
+      std::getline(stream, z_text);
+      if (x_text.empty() || y_text.empty() || z_text.empty()) {
+        throw std::runtime_error("Invalid workspace image prior entry: " +
+                                 line);
+      }
+      image.prior_position = Eigen::Vector3d(std::stod(x_text),
+                                             std::stod(y_text),
+                                             std::stod(z_text));
+    }
     if (image.id == kInvalidImageId || image.camera_id == kInvalidCameraId ||
         image.name.empty()) {
       throw std::runtime_error("Invalid workspace image entry: " + line);

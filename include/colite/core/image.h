@@ -18,6 +18,9 @@ struct Image {
   CameraId camera_id = kInvalidCameraId;
   std::string name;
   std::string file_path;
+  // 图像的空间先验位置，通常来自 EXIF GPS、飞控记录或外部轨迹。
+  // spatial matcher 只依赖该通用三维坐标，不限定坐标系单位。
+  std::optional<Eigen::Vector3d> prior_position;
   bool registered = false;
   std::optional<Pose3> cam_from_world;
   std::vector<Point2D> points2d;
@@ -42,4 +45,3 @@ struct Image {
 };
 
 }  // namespace colite
-

@@ -1,6 +1,9 @@
 set(COLITE_CUDA_SIFT_SOURCES
   features/backends/cuda_sift_extractor_stub.cpp
 )
+set(COLITE_CUDA_MVS_SOURCES
+  mvs/patch_match_cuda_stub.cpp
+)
 
 if(COLITE_ENABLE_CUDA_SIFT)
   set(COLITE_CUDA_SIFT_SOURCES
@@ -25,6 +28,12 @@ if(COLITE_ENABLE_CUDA_SIFT)
   )
 endif()
 
+if(COLITE_ENABLE_CUDA_MVS)
+  set(COLITE_CUDA_MVS_SOURCES
+    mvs/patch_match_cuda.cu
+  )
+endif()
+
 add_library(colite_core
   core/camera.cpp
   core/geometry.cpp
@@ -32,6 +41,7 @@ add_library(colite_core
   core/reconstruction.cpp
   core/version.cpp
   controllers/recon_sfm_controller.cpp
+  controllers/recon_mvs_controller.cpp
   controllers/feature_extractor.cpp
   controllers/sequential_matcher.cpp
   controllers/mapper.cpp
@@ -43,6 +53,7 @@ add_library(colite_core
   io/sfm_workspace.cpp
   matching/descriptor_matcher.cpp
   matching/guided_matching.cpp
+  matching/pair_generator.cpp
   matching/two_view_geometry_batch.cpp
   matching/two_view_geometry_verifier.cpp
   matching/weak_pair_rematcher.cpp
@@ -51,12 +62,14 @@ add_library(colite_core
   mvs/image_workspace.cpp
   mvs/mvs_pipeline.cpp
   mvs/patch_match.cpp
+  ${COLITE_CUDA_MVS_SOURCES}
   sfm/global_bundle_adjuster.cpp
   sfm/image_registrar.cpp
   sfm/incremental_initializer.cpp
   sfm/incremental_mapper.cpp
   sfm/incremental_triangulator.cpp
   sfm/local_bundle_adjuster.cpp
+  sfm/observation_manager.cpp
   sfm/observation_filter.cpp
 )
 
@@ -88,16 +101,29 @@ if(COLITE_ENABLE_CUDA_SIFT)
   target_compile_definitions(colite_core PUBLIC COLITE_ENABLE_CUDA_SIFT)
 endif()
 
+if(COLITE_ENABLE_CUDA_MVS)
+  target_compile_definitions(colite_core PUBLIC COLITE_ENABLE_CUDA_MVS)
+  target_compile_options(colite_core
+    PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math;--expt-relaxed-constexpr;-Xcudafe=--diag_suppress=20012>
+  )
+endif()
+
 if(MSVC)
   target_compile_options(colite_core PRIVATE /W4)
 else()
-  target_compile_options(colite_core PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(colite_core
+    PRIVATE
+      $<$<COMPILE_LANGUAGE:C>:-Wall;-Wextra;-Wpedantic>
+      $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>
+  )
 endif()
 
 set_source_files_properties(
   features/backends/sift_opencv.cpp
   features/backends/sift_vlfeat.c
   features/backends/cuda_sift_extractor_stub.cpp
+  mvs/patch_match_cuda_stub.cpp
   PROPERTIES
     COMPILE_OPTIONS "-Wno-pedantic;-Wno-unused-function"
 )

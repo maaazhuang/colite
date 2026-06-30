@@ -1,17 +1,21 @@
 #pragma once
 
 #include <cstddef>
+#include <filesystem>
+#include <iosfwd>
 #include <vector>
 
 #include "colite/core/match_graph.h"
 #include "colite/core/reconstruction.h"
 #include "colite/features/sift_extractor.h"
 #include "colite/matching/descriptor_matcher.h"
+#include "colite/sfm/incremental_mapper.h"
 
 namespace colite::controllers {
 
 struct ReconSfmControllerOptions {
-  // 输入图像目录和输出目录由 exe 层解析，controller 只关心已验证后的配置。
+  std::filesystem::path image_path;
+  std::filesystem::path output_path;
   double focal_length = 0.0;
   int max_num_features = 4096;
   int feature_num_threads = -1;
@@ -19,6 +23,8 @@ struct ReconSfmControllerOptions {
   bool use_flann = false;
   std::size_t nearby_match_window = 2;
   double nearby_match_ratio = 0.9;
+  std::size_t max_registration_trials_per_image = 3;
+  CameraParameterGroup ba_refine_camera_params = CameraParameterGroup::kNone;
 };
 
 struct NearbyPairMatchingOptions {
@@ -43,6 +49,8 @@ class ReconSfmController {
 
   int EffectiveFeatureExtractionThreads() const;
 
+  int Run(std::ostream& out) const;
+
   void MatchAllImagePairs(const std::vector<ImageId>& image_ids,
                           const DescriptorMatchingOptions& base_options,
                           MatchGraph* graph) const;
@@ -55,6 +63,25 @@ int EffectiveFeatureExtractionThreads(int requested_threads);
 
 ReconstructionQualityStats ComputeReconstructionQualityStats(
     const Reconstruction& reconstruction);
+
+void WriteRunSummary(const std::filesystem::path& output_path,
+                     const Reconstruction& reconstruction,
+                     const IncrementalMappingSummary& summary,
+                     double feature_extraction_seconds = 0.0);
+
+void WriteColmapTextModel(const std::filesystem::path& output_path,
+                          const Reconstruction& reconstruction);
+
+void WritePairDiagnostics(const std::filesystem::path& output_path,
+                          const Reconstruction& reconstruction,
+                          const MatchGraph& graph);
+
+void WriteRegistrationDiagnostics(
+    const std::filesystem::path& output_path,
+    const IncrementalMappingSummary& summary);
+
+void WritePlyPointCloud(const std::filesystem::path& ply_path,
+                        const Reconstruction& reconstruction);
 
 void MatchAllImagePairs(
     const std::vector<ImageId>& image_ids,

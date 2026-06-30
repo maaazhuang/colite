@@ -9,10 +9,11 @@ project(
 
 option(COLITE_BUILD_TESTS "Build unit tests" ON)
 option(COLITE_ENABLE_CUDA_SIFT "Build the optional CudaSift feature backend" OFF)
+option(COLITE_ENABLE_CUDA_MVS "Build the optional CUDA MVS PatchMatch backend" OFF)
 
-if(COLITE_ENABLE_CUDA_SIFT)
+if(COLITE_ENABLE_CUDA_SIFT OR COLITE_ENABLE_CUDA_MVS)
   set(CMAKE_CUDA_ARCHITECTURES "89" CACHE STRING
-      "CUDA architectures used for the optional CudaSift backend")
+      "CUDA architectures used for optional CUDA backends")
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)

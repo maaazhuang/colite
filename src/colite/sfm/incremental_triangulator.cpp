@@ -5,6 +5,7 @@
 #include <set>
 
 #include "colite/core/geometry.h"
+#include "colite/sfm/observation_manager.h"
 
 namespace colite {
 namespace {
@@ -127,19 +128,8 @@ bool TryCreatePointFromMatch(const ImagePair& pair,
   Track track;
   track.AddElement(pair.image_id1, match.idx1);
   track.AddElement(pair.image_id2, match.idx2);
-  reconstruction->AddPoint3D(*point, track);
-  return true;
-}
-
-bool TrackAlreadyHasObservation(const Point3D& point3d,
-                                ImageId image_id,
-                                Point2DIdx point2d_idx) {
-  for (const TrackElement& element : point3d.track.elements) {
-    if (element.image_id == image_id && element.point2d_idx == point2d_idx) {
-      return true;
-    }
-  }
-  return false;
+  ObservationManager observation_manager(reconstruction);
+  return observation_manager.AddPoint3D(*point, track).has_value();
 }
 
 bool TrackHasImageConflict(const Track& track1, const Track& track2) {
@@ -216,23 +206,9 @@ bool TryMergePoint3Ds(Point3DId target_point3d_id,
     return false;
   }
 
-  const Track source_track = source_point3d.track;
-  reconstruction->DeletePoint3D(source_point3d_id);
-
-  Point3D& merged_point3d = reconstruction->GetPoint3D(target_point3d_id);
-  merged_point3d.xyz = merged_xyz;
-  for (const TrackElement& element : source_track.elements) {
-    Image& image = reconstruction->GetImage(element.image_id);
-    if (element.point2d_idx >= image.points2d.size()) {
-      continue;
-    }
-    image.points2d[element.point2d_idx].point3d_id = target_point3d_id;
-    if (!TrackAlreadyHasObservation(merged_point3d, element.image_id,
-                                    element.point2d_idx)) {
-      merged_point3d.track.AddElement(element.image_id, element.point2d_idx);
-    }
-  }
-  return true;
+  ObservationManager observation_manager(reconstruction);
+  return observation_manager.MergePoints(target_point3d_id, source_point3d_id,
+                                         merged_xyz);
 }
 
 bool TryCompleteTargetObservation(const ImagePair& pair,
@@ -272,14 +248,9 @@ bool TryCompleteTargetObservation(const ImagePair& pair,
     return false;
   }
 
-  Point3D& point3d = reconstruction->GetPoint3D(source_point2d.point3d_id);
-  if (TrackAlreadyHasObservation(point3d, target_image_id, target_idx)) {
-    return false;
-  }
-
-  target_point2d.point3d_id = source_point2d.point3d_id;
-  point3d.track.AddElement(target_image_id, target_idx);
-  return true;
+  ObservationManager observation_manager(reconstruction);
+  return observation_manager.AddObservation(source_point2d.point3d_id,
+                                            target_image_id, target_idx);
 }
 
 bool TryMergeMatchedExistingPoints(const ImagePair& pair,
@@ -305,9 +276,26 @@ bool TryMergeMatchedExistingPoints(const ImagePair& pair,
     return false;
   }
 
-  return TryMergePoint3Ds(target_point2d.point3d_id,
-                          source_point2d.point3d_id, options,
+  const Point3DId kept_point3d_id =
+      std::min(target_point2d.point3d_id, source_point2d.point3d_id);
+  const Point3DId merged_point3d_id =
+      std::max(target_point2d.point3d_id, source_point2d.point3d_id);
+  return TryMergePoint3Ds(kept_point3d_id, merged_point3d_id, options,
                           reconstruction);
+}
+
+bool HasTrackUpdates(const IncrementalTriangulatorSummary& summary) {
+  return summary.num_completed_observations > 0 ||
+         summary.num_merged_points > 0 || summary.num_created_points > 0;
+}
+
+void AccumulateTrackUpdates(const IncrementalTriangulatorSummary& update,
+                            IncrementalTriangulatorSummary* summary) {
+  summary->num_created_points += update.num_created_points;
+  summary->num_created_observations += update.num_created_observations;
+  summary->num_completed_observations += update.num_completed_observations;
+  summary->num_merged_points += update.num_merged_points;
+  summary->num_merged_observations += update.num_merged_observations;
 }
 
 }  // namespace
@@ -356,6 +344,19 @@ IncrementalTriangulatorSummary TriangulateRegisteredImage(
     }
   }
 
+  for (std::size_t iteration = 1;
+       summary.num_created_points > 0 &&
+       iteration < options.max_track_update_iterations;
+       ++iteration) {
+    const IncrementalTriangulatorSummary completion =
+        CompleteTracksForRegisteredImage(graph, image_id, options,
+                                         reconstruction);
+    if (!HasTrackUpdates(completion)) {
+      break;
+    }
+    AccumulateTrackUpdates(completion, &summary);
+  }
+
   summary.message = "Triangulation finished";
   return summary;
 }
@@ -397,11 +398,14 @@ IncrementalTriangulatorSummary CompleteTracksForRegisteredImage(
       }
 
       if (TryCompleteTargetObservation(pair, image_id, match, options,
-                                       reconstruction) ||
-          TryMergeMatchedExistingPoints(pair, image_id, match, options,
-                                        reconstruction)) {
+                                       reconstruction)) {
         tried_observations.insert(target_observation);
         ++summary.num_completed_observations;
+      } else if (TryMergeMatchedExistingPoints(pair, image_id, match, options,
+                                               reconstruction)) {
+        tried_observations.insert(target_observation);
+        ++summary.num_merged_points;
+        ++summary.num_merged_observations;
       }
     }
   }

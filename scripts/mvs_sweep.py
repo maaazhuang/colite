@@ -58,6 +58,8 @@ FUSION_ERROR_PERCENTILES = ["p50", "p95", "p99"]
 SUMMARY_COLUMNS = [
     "case",
     "output_path",
+    "patch_match_requested_backend",
+    "patch_match_actual_backend",
     "patch_match_geometric_consistency_weight",
     "patch_match_geometric_max_relative_depth_error",
     "normal_refinement_max_relative_depth_difference",
@@ -217,6 +219,20 @@ def summarize_run(run_dir: Path) -> Dict[str, str]:
         "multi_observation_track_ratio",
     ]:
         row[key] = fusion.get(key, "")
+
+    if patch_rows:
+        row["patch_match_requested_backend"] = patch_rows[0].get(
+            "requested_backend", ""
+        )
+        actual_backends = {
+            row_data.get("actual_backend", "")
+            for row_data in patch_rows
+            if row_data.get("actual_backend", "") != ""
+        }
+        if len(actual_backends) == 1:
+            row["patch_match_actual_backend"] = next(iter(actual_backends))
+        elif len(actual_backends) > 1:
+            row["patch_match_actual_backend"] = "mixed"
 
     for column in PAIR_SUM_COLUMNS:
         row[f"pair_{column}_sum"] = format_number(numeric_sum(pair_rows, column))

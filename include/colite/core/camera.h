@@ -10,7 +10,8 @@
 
 namespace colite {
 
-// 相机模型 ID。模型族先完整登记，第一阶段只实现 Pinhole 和 SimpleRadial 的投影。
+// 相机模型 ID。模型族按 COLMAP 组织；当前已实现常用透视模型的投影：
+// SIMPLE_PINHOLE、PINHOLE、SIMPLE_RADIAL、RADIAL、OPENCV。
 enum class CameraModelId {
   kInvalid = -1,
   kSimplePinhole = 0,          // f, cx, cy

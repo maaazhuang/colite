@@ -14,6 +14,8 @@ struct IncrementalTriangulatorOptions {
   double min_triangulation_angle_deg = 0.5;
   double min_pair_median_triangulation_angle_deg = 0.0;
   double create_max_reprojection_error_px = 4.0;
+  // 新建点后追加执行的 track completion / merge 轮数上限，接近 COLMAP 的 complete-merge-create 局部循环。
+  std::size_t max_track_update_iterations = 2;
   bool ignore_two_view_tracks = false;
 };
 
@@ -22,6 +24,8 @@ struct IncrementalTriangulatorSummary {
   std::size_t num_created_points = 0;
   std::size_t num_created_observations = 0;
   std::size_t num_completed_observations = 0;
+  std::size_t num_merged_points = 0;
+  std::size_t num_merged_observations = 0;
   std::size_t num_filtered_observations = 0;
   std::size_t num_filtered_points = 0;
   std::string message;

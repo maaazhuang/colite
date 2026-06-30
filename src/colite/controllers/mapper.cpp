@@ -3,6 +3,7 @@
 #include <fstream>
 #include <stdexcept>
 
+#include "colite/controllers/recon_sfm_controller.h"
 #include "colite/io/sfm_workspace.h"
 #include "colite/sfm/incremental_mapper.h"
 
@@ -41,6 +42,8 @@ MapperControllerSummary MapperController::Run() const {
       RunIncrementalMapping(graph, mapping_options, &reconstruction);
 
   WriteWorkspaceSparseReconstruction(options_.workspace_path, reconstruction);
+  WriteRegistrationDiagnostics(WorkspaceSparsePath(options_.workspace_path),
+                               mapping_summary);
   std::ofstream summary_file(WorkspaceSparsePath(options_.workspace_path) /
                              "summary.txt");
   summary_file << "success " << (mapping_summary.success ? 1 : 0) << "\n"

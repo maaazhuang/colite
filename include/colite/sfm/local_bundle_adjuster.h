@@ -4,6 +4,7 @@
 #include <set>
 #include <string>
 
+#include "colite/core/camera.h"
 #include "colite/core/reconstruction.h"
 
 namespace colite {
@@ -14,8 +15,11 @@ struct LocalBundleAdjustmentOptions {
   int max_num_iterations = 25;
   double loss_scale = 4.0;
   std::size_t max_num_images = 8;
+  // 不参与位姿优化、但对局部 3D 点提供约束的 fixed images 数量上限。
+  std::size_t max_num_fixed_images = 8;
   bool refine_poses = true;
   bool refine_points = true;
+  CameraParameterGroup refine_camera_params = CameraParameterGroup::kNone;
 
   // 用于固定 gauge 的图像。若为空，局部窗口中 ID 最小的图像会被固定。
   std::set<ImageId> constant_image_ids;
@@ -24,8 +28,13 @@ struct LocalBundleAdjustmentOptions {
 struct LocalBundleAdjustmentSummary {
   bool success = false;
   ImageId root_image_id = kInvalidImageId;
+  std::set<ImageId> local_image_ids;
+  std::set<ImageId> fixed_image_ids;
+  std::size_t num_local_images = 0;
+  std::size_t num_constant_images = 0;
   std::size_t num_variable_images = 0;
   std::size_t num_variable_points = 0;
+  std::size_t num_variable_cameras = 0;
   std::size_t num_residuals = 0;
   double initial_mean_reprojection_error = -1.0;
   double final_mean_reprojection_error = -1.0;

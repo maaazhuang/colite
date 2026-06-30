@@ -11,6 +11,7 @@ add_executable(colite_core_tests
   integration/sfm_dependency_boundary_test.cpp
   matching/descriptor_matcher_test.cpp
   matching/guided_matching_test.cpp
+  matching/pair_generator_test.cpp
   matching/two_view_geometry_batch_test.cpp
   matching/two_view_geometry_verifier_test.cpp
   matching/weak_pair_rematcher_test.cpp
@@ -25,6 +26,7 @@ add_executable(colite_core_tests
   sfm/incremental_mapper_test.cpp
   sfm/incremental_triangulator_test.cpp
   sfm/local_bundle_adjuster_test.cpp
+  sfm/observation_manager_test.cpp
   sfm/observation_filter_test.cpp
 )
 
@@ -69,6 +71,7 @@ target_compile_options(vlfeat_original_reference
 target_link_libraries(colite_core_tests
   PRIVATE
     colite_core
+    colite_command_exe
     colite_sfm_command_exe
     colite_recon_mvs_exe
     colite_recon_sfm_exe

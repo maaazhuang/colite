@@ -1,6 +1,7 @@
 #include "colite/sfm/local_bundle_adjuster.h"
 
 #include <cmath>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -59,6 +60,24 @@ void AddImageObservations(const Camera& camera,
     image->points2d.push_back(
         {*pixel, static_cast<Point2DIdx>(i), kInvalidPoint3DId});
   }
+}
+
+void AddTrackedPoint(Reconstruction* reconstruction,
+                     const Camera& camera,
+                     const std::map<ImageId, Pose3>& true_poses,
+                     const Eigen::Vector3d& point,
+                     const std::vector<ImageId>& image_ids) {
+  Track track;
+  for (const ImageId image_id : image_ids) {
+    const auto pixel = ProjectWorldPoint(camera, true_poses.at(image_id), point);
+    ASSERT_TRUE(pixel.has_value());
+    Image& image = reconstruction->GetImage(image_id);
+    const Point2DIdx point2d_idx =
+        static_cast<Point2DIdx>(image.points2d.size());
+    image.points2d.push_back({*pixel, point2d_idx, kInvalidPoint3DId});
+    track.AddElement(image_id, point2d_idx);
+  }
+  reconstruction->AddPoint3D(point, track);
 }
 
 double MeanReprojectionError(const Reconstruction& reconstruction) {
@@ -136,6 +155,57 @@ TEST(LocalBundleAdjusterTest, ReducesReprojectionErrorForLocalWindow) {
   EXPECT_LT(summary.final_mean_reprojection_error,
             summary.initial_mean_reprojection_error);
   EXPECT_LT(error_after, error_before * 0.5);
+}
+
+TEST(LocalBundleAdjusterTest,
+     SelectsLocalImagesBySharedPointsAndAddsFixedObservers) {
+  const Camera camera = MakeCamera();
+  const std::map<ImageId, Pose3> true_poses = {
+      {1, CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0))},
+      {2, CameraAt(Eigen::Vector3d(1.0, 0.0, 0.0))},
+      {3, CameraAt(Eigen::Vector3d(0.5, 0.2, 0.0))},
+      {4, CameraAt(Eigen::Vector3d(-0.4, 0.1, 0.0))},
+      {5, CameraAt(Eigen::Vector3d(2.0, 0.0, 0.0))},
+  };
+
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  for (const auto& [image_id, pose] : true_poses) {
+    reconstruction.AddImage(MakeImage(image_id, pose));
+  }
+
+  for (int i = 0; i < 10; ++i) {
+    AddTrackedPoint(&reconstruction, camera, true_poses,
+                    Eigen::Vector3d(-0.8 + 0.1 * i, -0.2, 4.5),
+                    {1, 2});
+  }
+  for (int i = 0; i < 6; ++i) {
+    AddTrackedPoint(&reconstruction, camera, true_poses,
+                    Eigen::Vector3d(-0.4 + 0.1 * i, 0.1, 4.8),
+                    {1, 3});
+  }
+  for (int i = 0; i < 2; ++i) {
+    AddTrackedPoint(&reconstruction, camera, true_poses,
+                    Eigen::Vector3d(0.2 + 0.1 * i, 0.3, 5.0),
+                    {1, 4});
+  }
+  AddTrackedPoint(&reconstruction, camera, true_poses,
+                  Eigen::Vector3d(0.5, -0.3, 5.2), {5});
+
+  LocalBundleAdjustmentOptions options;
+  options.max_num_images = 3;
+  options.max_num_fixed_images = 2;
+  options.max_num_iterations = 1;
+
+  const LocalBundleAdjustmentSummary summary =
+      AdjustLocalBundle(1, options, &reconstruction);
+
+  EXPECT_TRUE(summary.success);
+  EXPECT_EQ(summary.local_image_ids, (std::set<ImageId>{1, 2, 3}));
+  EXPECT_EQ(summary.fixed_image_ids, (std::set<ImageId>{4}));
+  EXPECT_EQ(summary.num_local_images, 3U);
+  EXPECT_EQ(summary.num_constant_images, 1U);
+  EXPECT_GT(summary.num_residuals, 2U * (10U + 6U));
 }
 
 }  // namespace

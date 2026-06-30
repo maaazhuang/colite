@@ -102,5 +102,24 @@ TEST(SfmDependencyBoundaryTest, SiftBackendsUseColiteOwnedNames) {
   }
 }
 
+TEST(SfmDependencyBoundaryTest, ReconCommandsKeepPipelineLogicInControllers) {
+  const std::filesystem::path source_dir = COLITE_SOURCE_DIR;
+
+  const std::string recon_sfm_exe =
+      ReadTextFile(source_dir / "src" / "colite" / "exe" / "recon_sfm.cpp");
+  EXPECT_EQ(recon_sfm_exe.find("RunPipeline"), std::string::npos);
+  EXPECT_EQ(recon_sfm_exe.find("WriteColmapTextModel"), std::string::npos);
+  EXPECT_EQ(recon_sfm_exe.find("WritePlyPointCloud"), std::string::npos);
+  EXPECT_EQ(recon_sfm_exe.find("RunIncrementalMapping"), std::string::npos);
+
+  const std::string recon_mvs_exe =
+      ReadTextFile(source_dir / "src" / "colite" / "exe" / "recon_mvs.cpp");
+  EXPECT_EQ(recon_mvs_exe.find("RunPipeline"), std::string::npos);
+  EXPECT_EQ(recon_mvs_exe.find("ReadCameras"), std::string::npos);
+  EXPECT_EQ(recon_mvs_exe.find("RunMvsPipeline"), std::string::npos);
+  EXPECT_EQ(recon_mvs_exe.find("RunPatchMatchStereoForImage"), std::string::npos);
+  EXPECT_EQ(recon_mvs_exe.find("WriteFusedPointCloudPly"), std::string::npos);
+}
+
 }  // namespace
 }  // namespace colite

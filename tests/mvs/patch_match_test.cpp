@@ -714,6 +714,7 @@ TEST(CpuPatchMatchPerturbationTest,
 TEST(CpuPatchMatchStereoTest, RunsIterationsAndProducesBestCostMap) {
   const MvsImage reference = MakeGradientImage(5, 5);
   PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kCpu;
   options.initialization.random_seed = 19;
   options.perturbation.random_seed = 23;
   options.num_iterations = 2;
@@ -734,10 +735,131 @@ TEST(CpuPatchMatchStereoTest, RunsIterationsAndProducesBestCostMap) {
   EXPECT_EQ(result.summary.num_valid_cost_pixels, 9U);
 }
 
+TEST(PatchMatchBackendTest, ParsesBackendNames) {
+  EXPECT_EQ(PatchMatchBackendFromName("auto"), PatchMatchBackend::kAuto);
+  EXPECT_EQ(PatchMatchBackendFromName("cpu"), PatchMatchBackend::kCpu);
+  EXPECT_EQ(PatchMatchBackendFromName("cuda"), PatchMatchBackend::kCuda);
+  EXPECT_EQ(PatchMatchBackendFromName("gpu"), PatchMatchBackend::kCuda);
+  EXPECT_EQ(PatchMatchBackendToName(PatchMatchBackend::kAuto), "auto");
+  EXPECT_EQ(PatchMatchBackendToName(PatchMatchBackend::kCpu), "cpu");
+  EXPECT_EQ(PatchMatchBackendToName(PatchMatchBackend::kCuda), "cuda");
+  EXPECT_THROW((void)PatchMatchBackendFromName("metal"),
+               std::invalid_argument);
+}
+
+TEST(PatchMatchBackendTest, AutoFallsBackToCpuWhenCudaIsUnavailable) {
+  const MvsImage reference = MakeGradientImage(5, 5);
+  PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kAuto;
+  options.num_iterations = 0;
+
+  const PatchMatchStereoResult result =
+      RunPatchMatchStereoForImage(MakeView(1), {MakeView(2)}, reference,
+                                  {reference}, 2.0F, 6.0F, options);
+
+  EXPECT_EQ(result.summary.requested_backend, PatchMatchBackend::kAuto);
+  if (IsCudaPatchMatchAvailable()) {
+    EXPECT_EQ(result.summary.actual_backend, PatchMatchBackend::kCuda);
+  } else {
+    EXPECT_EQ(result.summary.actual_backend, PatchMatchBackend::kCpu);
+  }
+}
+
+TEST(PatchMatchBackendTest, ForcedCpuUsesCpuBackend) {
+  const MvsImage reference = MakeGradientImage(5, 5);
+  PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kCpu;
+  options.num_iterations = 0;
+
+  const PatchMatchStereoResult result =
+      RunPatchMatchStereoForImage(MakeView(1), {}, reference, {}, 2.0F, 6.0F,
+                                  options);
+
+  EXPECT_EQ(result.summary.requested_backend, PatchMatchBackend::kCpu);
+  EXPECT_EQ(result.summary.actual_backend, PatchMatchBackend::kCpu);
+}
+
+TEST(PatchMatchBackendTest, ForcedCudaFailsWhenCudaIsUnavailable) {
+  if (IsCudaPatchMatchAvailable()) {
+    GTEST_SKIP() << "CUDA PatchMatch backend is available in this build.";
+  }
+  const MvsImage reference = MakeGradientImage(5, 5);
+  PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kCuda;
+  options.num_iterations = 0;
+
+  EXPECT_THROW(RunPatchMatchStereoForImage(MakeView(1), {}, reference, {},
+                                           2.0F, 6.0F, options),
+               std::runtime_error);
+  EXPECT_FALSE(CudaPatchMatchUnavailableReason().empty());
+}
+
+TEST(PatchMatchBackendTest, CudaBackendRunsBasicStereoWhenCompiled) {
+  if (!IsCudaPatchMatchCompiled()) {
+    GTEST_SKIP() << "CUDA PatchMatch backend is not compiled in this build.";
+  }
+  ASSERT_TRUE(IsCudaPatchMatchAvailable())
+      << CudaPatchMatchUnavailableReason();
+
+  const MvsImage reference = MakeGradientImage(5, 5);
+  PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kCuda;
+  options.initialization.random_seed = 19;
+  options.perturbation.random_seed = 23;
+  options.num_iterations = 1;
+  options.cost.window_radius = 1;
+  options.perturbation.num_samples_per_pixel = 1;
+
+  const PatchMatchStereoResult result =
+      RunPatchMatchStereoForImage(MakeView(1), {MakeView(2)}, reference,
+                                  {reference}, 2.0F, 6.0F, options);
+
+  EXPECT_EQ(result.summary.requested_backend, PatchMatchBackend::kCuda);
+  EXPECT_EQ(result.summary.actual_backend, PatchMatchBackend::kCuda);
+  EXPECT_EQ(result.depth_map.Width(), 5U);
+  EXPECT_EQ(result.normal_map.Height(), 5U);
+  EXPECT_GT(result.cost_map.ValidPixelCount(), 0U);
+  EXPECT_EQ(result.summary.num_iterations, 1U);
+  EXPECT_GT(result.summary.num_candidate_evaluations, 0U);
+  EXPECT_GT(result.summary.num_perturbation_passes, 0U);
+}
+
+TEST(PatchMatchBackendTest, CudaBackendRunsPyramidStereoWhenCompiled) {
+  if (!IsCudaPatchMatchCompiled()) {
+    GTEST_SKIP() << "CUDA PatchMatch backend is not compiled in this build.";
+  }
+  ASSERT_TRUE(IsCudaPatchMatchAvailable())
+      << CudaPatchMatchUnavailableReason();
+
+  const MvsImage reference = MakeGradientImage(8, 8);
+  PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kCuda;
+  options.initialization.random_seed = 19;
+  options.perturbation.random_seed = 23;
+  options.num_iterations = 1;
+  options.pyramid_levels = 2;
+  options.cost.window_radius = 1;
+  options.perturbation.num_samples_per_pixel = 1;
+
+  const PatchMatchStereoResult result =
+      RunPatchMatchStereoForImage(MakeView(1), {MakeView(2)}, reference,
+                                  {reference}, 2.0F, 6.0F, options);
+
+  EXPECT_EQ(result.summary.requested_backend, PatchMatchBackend::kCuda);
+  EXPECT_EQ(result.summary.actual_backend, PatchMatchBackend::kCuda);
+  EXPECT_EQ(result.summary.num_pyramid_levels, 2U);
+  EXPECT_EQ(result.depth_map.Width(), 8U);
+  EXPECT_EQ(result.depth_map.Height(), 8U);
+  EXPECT_GT(result.cost_map.ValidPixelCount(), 0U);
+  EXPECT_EQ(result.summary.num_iterations, 2U);
+  EXPECT_GT(result.summary.num_candidate_evaluations, 0U);
+}
+
 TEST(CpuPatchMatchStereoTest,
      PyramidInitializationUpsamplesCoarseDepthToFineLevel) {
   const MvsImage reference = MakeGradientImage(4, 4);
   PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kCpu;
   options.initialization.random_seed = 19;
   options.num_iterations = 0;
   options.pyramid_levels = 2;
@@ -762,6 +884,7 @@ TEST(CpuPatchMatchStereoTest,
 TEST(CpuPatchMatchStereoTest, RefinesNormalsFromDepthWhenEnabled) {
   const MvsImage reference = MakeGradientImage(5, 5);
   PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kCpu;
   options.num_iterations = 0;
   options.initialization.default_normal = Eigen::Vector3f(0.0F, 0.0F, 1.0F);
   options.normal_refinement.enabled = true;
@@ -781,6 +904,7 @@ TEST(CpuPatchMatchStereoTest, RefinesNormalsFromDepthWhenEnabled) {
 TEST(CpuPatchMatchStereoTest, CheckerboardScheduleRunsFourRedBlackRounds) {
   const MvsImage reference = MakeGradientImage(5, 5);
   PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kCpu;
   options.initialization.random_seed = 19;
   options.perturbation.random_seed = 23;
   options.num_iterations = 1;
@@ -801,6 +925,7 @@ TEST(CpuPatchMatchStereoTest, CheckerboardScheduleRunsFourRedBlackRounds) {
 TEST(CpuPatchMatchStereoTest, RecordsAdaptivePerturbationSummaryPerIteration) {
   const MvsImage reference = MakeGradientImage(5, 5);
   PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kCpu;
   options.initialization.random_seed = 19;
   options.perturbation.random_seed = 23;
   options.num_iterations = 3;
@@ -827,6 +952,7 @@ TEST(CpuPatchMatchStereoTest, RecordsAdaptivePerturbationSummaryPerIteration) {
 TEST(CpuPatchMatchStereoTest, AdaptivePerturbationShrinksFasterWhenUpdatesAreLow) {
   const MvsImage reference = MakeGradientImage(5, 5);
   PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kCpu;
   options.initialization.random_seed = 19;
   options.perturbation.random_seed = 23;
   options.num_iterations = 2;
@@ -852,6 +978,7 @@ TEST(CpuPatchMatchStereoTest, RunsGeometricRefinementWithSourceDepthMaps) {
   source_depth_map.Fill(3.0F);
 
   PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kCpu;
   options.initialization.random_seed = 19;
   options.perturbation.random_seed = 23;
   options.num_iterations = 1;

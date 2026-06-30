@@ -1,6 +1,7 @@
 #include "colite/sfm/incremental_mapper.h"
 
 #include <algorithm>
+#include <map>
 #include <optional>
 #include <set>
 #include <utility>
@@ -14,8 +15,12 @@ namespace {
 struct ImageCandidate {
   ImageId image_id = kInvalidImageId;
   std::size_t num_visible_points = 0;
+  std::size_t num_visible_observations = 0;
+  double mean_track_length = 0.0;
   std::size_t num_registered_neighbors = 0;
   std::size_t num_verified_inliers_to_registered_images = 0;
+  double score = 0.0;
+  std::size_t num_registration_attempts = 0;
 };
 
 bool PairContainsImage(const ImagePair& pair, ImageId image_id) {
@@ -37,6 +42,15 @@ bool HasValidFeatureIndex(const FeatureSet* features, Point2DIdx idx) {
          idx < features->keypoints.size();
 }
 
+double ComputeCandidateScore(const ImageCandidate& candidate) {
+  return static_cast<double>(candidate.num_visible_points) * 1000.0 +
+         static_cast<double>(candidate.num_registered_neighbors) * 100.0 +
+         candidate.mean_track_length * 20.0 +
+         static_cast<double>(
+             candidate.num_verified_inliers_to_registered_images) *
+             0.01;
+}
+
 ImageCandidate AnalyzeImageCandidate(const MatchGraph& graph,
                                      ImageId image_id,
                                      const Reconstruction& reconstruction) {
@@ -54,6 +68,7 @@ ImageCandidate AnalyzeImageCandidate(const MatchGraph& graph,
 
   std::set<ImageId> registered_neighbors;
   std::set<Point2DIdx> visible_target_points;
+  std::set<Point3DId> visible_point3d_ids;
   for (const auto& [pair, geometry] : graph.verified_geometries) {
     if (!PairContainsImage(pair, image_id) || !IsUsableGeometry(geometry)) {
       continue;
@@ -84,24 +99,48 @@ ImageCandidate AnalyzeImageCandidate(const MatchGraph& graph,
       if (neighbor_point.HasPoint3D() &&
           reconstruction.ExistsPoint3D(neighbor_point.point3d_id)) {
         visible_target_points.insert(target_idx);
+        visible_point3d_ids.insert(neighbor_point.point3d_id);
       }
     }
   }
 
   candidate.num_visible_points = visible_target_points.size();
+  for (const Point3DId point3d_id : visible_point3d_ids) {
+    candidate.num_visible_observations +=
+        reconstruction.GetPoint3D(point3d_id).track.Length();
+  }
+  if (!visible_point3d_ids.empty()) {
+    candidate.mean_track_length =
+        static_cast<double>(candidate.num_visible_observations) /
+        static_cast<double>(visible_point3d_ids.size());
+  }
   candidate.num_registered_neighbors = registered_neighbors.size();
+  candidate.score = ComputeCandidateScore(candidate);
   return candidate;
 }
 
 std::vector<ImageCandidate> CollectImageCandidates(
     const MatchGraph& graph,
     const IncrementalMapperOptions& options,
-    const Reconstruction& reconstruction) {
+    const Reconstruction& reconstruction,
+    const std::map<ImageId, std::size_t>* registration_trials = nullptr,
+    std::size_t max_num_registration_trials_per_image = 0) {
   std::vector<ImageCandidate> candidates;
   for (const auto& [image_id, image] : reconstruction.Images()) {
     (void)image;
-    const ImageCandidate candidate =
+    ImageCandidate candidate =
         AnalyzeImageCandidate(graph, image_id, reconstruction);
+    if (registration_trials != nullptr) {
+      const auto trial_it = registration_trials->find(image_id);
+      if (trial_it != registration_trials->end()) {
+        candidate.num_registration_attempts = trial_it->second;
+      }
+    }
+    if (max_num_registration_trials_per_image > 0 &&
+        candidate.num_registration_attempts >=
+            max_num_registration_trials_per_image) {
+      continue;
+    }
     if (candidate.num_visible_points >=
         options.registration.min_num_correspondences) {
       candidates.push_back(candidate);
@@ -110,8 +149,21 @@ std::vector<ImageCandidate> CollectImageCandidates(
 
   std::sort(candidates.begin(), candidates.end(),
             [](const ImageCandidate& lhs, const ImageCandidate& rhs) {
+              if (lhs.num_registration_attempts !=
+                  rhs.num_registration_attempts) {
+                return lhs.num_registration_attempts <
+                       rhs.num_registration_attempts;
+              }
+              if (lhs.score != rhs.score) {
+                return lhs.score > rhs.score;
+              }
               if (lhs.num_visible_points != rhs.num_visible_points) {
                 return lhs.num_visible_points > rhs.num_visible_points;
+              }
+              if (lhs.num_visible_observations !=
+                  rhs.num_visible_observations) {
+                return lhs.num_visible_observations >
+                       rhs.num_visible_observations;
               }
               if (lhs.num_registered_neighbors !=
                   rhs.num_registered_neighbors) {
@@ -126,6 +178,41 @@ std::vector<ImageCandidate> CollectImageCandidates(
               return lhs.image_id < rhs.image_id;
             });
   return candidates;
+}
+
+void CopyCandidateStatsToSummary(const ImageCandidate& candidate,
+                                 IncrementalMapperSummary* summary) {
+  summary->candidate_num_visible_points = candidate.num_visible_points;
+  summary->candidate_num_visible_observations =
+      candidate.num_visible_observations;
+  summary->candidate_mean_track_length = candidate.mean_track_length;
+  summary->candidate_num_registered_neighbors =
+      candidate.num_registered_neighbors;
+  summary->candidate_num_verified_inliers_to_registered_images =
+      candidate.num_verified_inliers_to_registered_images;
+  summary->candidate_score = candidate.score;
+  summary->registration_attempts_before_success =
+      candidate.num_registration_attempts;
+}
+
+ImageRegistrationFailureSummary MakeFailureSummary(
+    const ImageCandidate& candidate,
+    std::size_t attempt,
+    const std::string& message) {
+  ImageRegistrationFailureSummary failure;
+  failure.image_id = candidate.image_id;
+  failure.attempt = attempt;
+  failure.candidate_num_visible_points = candidate.num_visible_points;
+  failure.candidate_num_visible_observations =
+      candidate.num_visible_observations;
+  failure.candidate_mean_track_length = candidate.mean_track_length;
+  failure.candidate_num_registered_neighbors =
+      candidate.num_registered_neighbors;
+  failure.candidate_num_verified_inliers_to_registered_images =
+      candidate.num_verified_inliers_to_registered_images;
+  failure.candidate_score = candidate.score;
+  failure.message = message;
+  return failure;
 }
 
 std::set<Point3DId> CollectPoint3DIds(const Reconstruction& reconstruction) {
@@ -339,6 +426,8 @@ IncrementalTriangulatorSummary RetriangulateLocalNeighborhood(
         CompleteTracksForRegisteredImage(graph, local_image_id, options,
                                          reconstruction);
     summary.num_completed_observations += completion.num_completed_observations;
+    summary.num_merged_points += completion.num_merged_points;
+    summary.num_merged_observations += completion.num_merged_observations;
 
     const IncrementalTriangulatorSummary triangulation =
         TriangulateRegisteredImage(graph, local_image_id, options,
@@ -394,9 +483,12 @@ IncrementalMappingSummary RunIncrementalMapping(
     }
   }
 
+  std::map<ImageId, std::size_t> registration_trials;
   for (std::size_t i = 0; i < options.max_num_registrations; ++i) {
     const std::vector<ImageCandidate> candidates =
-        CollectImageCandidates(graph, options.mapper, *reconstruction);
+        CollectImageCandidates(graph, options.mapper, *reconstruction,
+                               &registration_trials,
+                               options.max_num_registration_trials_per_image);
     if (candidates.empty()) {
       break;
     }
@@ -406,9 +498,14 @@ IncrementalMappingSummary RunIncrementalMapping(
       IncrementalMapperSummary registration = RegisterNextImage(
           graph, candidate.image_id, options.mapper, reconstruction);
       if (!registration.success) {
+        const std::size_t attempt = ++registration_trials[candidate.image_id];
+        summary.failed_registrations.push_back(MakeFailureSummary(
+            candidate, attempt, registration.message));
         continue;
       }
 
+      registration.registration_order = summary.registrations.size() + 1;
+      CopyCandidateStatsToSummary(candidate, &registration);
       summary.registrations.push_back(std::move(registration));
       registered_any_image = true;
       break;

@@ -249,6 +249,17 @@ TEST(IncrementalMapperTest, RunsCompleteIncrementalMappingLoop) {
   EXPECT_TRUE(summary.final_global_bundle_adjustment.success);
   EXPECT_GT(summary.final_global_bundle_adjustment.num_residuals, 0U);
   EXPECT_EQ(summary.registrations.size(), 2U);
+  EXPECT_EQ(summary.registrations[0].registration_order, 1U);
+  EXPECT_EQ(summary.registrations[1].registration_order, 2U);
+  EXPECT_GE(summary.registrations[0].candidate_num_visible_points,
+            options.mapper.registration.min_num_correspondences);
+  EXPECT_GE(summary.registrations[0].candidate_num_registered_neighbors, 2U);
+  EXPECT_GE(
+      summary.registrations[0].candidate_num_verified_inliers_to_registered_images,
+      options.mapper.registration.min_num_inliers);
+  EXPECT_GT(summary.registrations[0].candidate_num_visible_observations, 0U);
+  EXPECT_GT(summary.registrations[0].candidate_mean_track_length, 0.0);
+  EXPECT_GT(summary.registrations[0].candidate_score, 0.0);
   EXPECT_EQ(summary.num_registered_images, 4U);
   EXPECT_EQ(reconstruction.RegisteredImageIds().size(), 4U);
   EXPECT_TRUE(reconstruction.IsImageRegistered(1));
@@ -261,6 +272,86 @@ TEST(IncrementalMapperTest, RunsCompleteIncrementalMappingLoop) {
     EXPECT_TRUE(registration.local_bundle_adjustment.success);
     EXPECT_TRUE(registration.observation_filter.success);
   }
+}
+
+TEST(IncrementalMapperTest, DemotesFailedCandidatesAndStopsAfterTrialLimit) {
+  const Camera camera = MakeCamera(1);
+  const std::vector<Eigen::Vector3d> points = MakeScenePoints();
+  const Pose3 cam1_from_world = CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0));
+  const Pose3 cam2_from_world = CameraAt(Eigen::Vector3d(1.0, 0.0, 0.0));
+  const Pose3 cam4_from_world = CameraAt(Eigen::Vector3d(0.5, 0.1, 0.0));
+
+  const FeatureSet features1 = ProjectFeatures(camera, cam1_from_world, points);
+  const FeatureSet features2 = ProjectFeatures(camera, cam2_from_world, points);
+  const FeatureSet features4 = ProjectFeatures(camera, cam4_from_world, points);
+  FeatureSet bad_features3;
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    bad_features3.keypoints.push_back({12.0F, 12.0F, 1.0F, 0.0F});
+  }
+
+  const std::vector<FeatureMatch> matches_existing = IdentityMatches(0, 30);
+  const std::vector<FeatureMatch> matches_all = IdentityMatches(0, points.size());
+
+  MatchGraph graph;
+  SetFeatures(&graph, 1, features1);
+  SetFeatures(&graph, 2, features2);
+  SetFeatures(&graph, 3, bad_features3);
+  SetFeatures(&graph, 4, features4);
+  SetMatches(&graph, 1, 2, matches_existing);
+  SetMatches(&graph, 1, 3, matches_all);
+  SetMatches(&graph, 2, 3, matches_all);
+  SetMatches(&graph, 1, 4, matches_all);
+  SetMatches(&graph, 2, 4, matches_all);
+  SetVerifiedGeometry(&graph, 1, 2,
+                      EstimateGeometry(camera, features1, features2,
+                                       matches_existing));
+  SetVerifiedGeometry(&graph, 1, 3, MakeVerifiedGeometry(matches_all));
+  SetVerifiedGeometry(&graph, 2, 3, MakeVerifiedGeometry(matches_all));
+  SetVerifiedGeometry(&graph, 1, 4, MakeVerifiedGeometry(matches_all));
+  SetVerifiedGeometry(&graph, 2, 4, MakeVerifiedGeometry(matches_all));
+
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  reconstruction.AddImage(MakeImage(1, 1));
+  reconstruction.AddImage(MakeImage(2, 1));
+  reconstruction.AddImage(MakeImage(3, 1));
+  reconstruction.AddImage(MakeImage(4, 1));
+
+  IncrementalInitializerOptions init_options;
+  init_options.min_num_inliers = 20;
+  init_options.min_num_triangulated_points = 20;
+  init_options.min_triangulation_angle_deg = 0.1;
+  init_options.max_reprojection_error_px = 1.0;
+  ASSERT_TRUE(InitializeReconstructionFromPair(graph, ImagePair::Ordered(1, 2),
+                                               init_options, &reconstruction)
+                  .success);
+
+  IncrementalMappingOptions options;
+  options.max_num_registrations = 4;
+  options.max_num_registration_trials_per_image = 1;
+  options.run_global_track_completion = false;
+  options.run_global_bundle_adjustment = false;
+  options.mapper.registration.min_num_correspondences = 20;
+  options.mapper.registration.min_num_inliers = 20;
+  options.mapper.registration.max_reprojection_error_px = 0.25;
+  options.mapper.triangulation.min_triangulation_angle_deg = 0.1;
+  options.mapper.triangulation.create_max_reprojection_error_px = 2.0;
+  options.mapper.run_local_bundle_adjustment = false;
+  options.mapper.run_local_retriangulation_filter = false;
+  options.mapper.run_observation_filter = false;
+
+  const IncrementalMappingSummary summary =
+      RunIncrementalMapping(graph, options, &reconstruction);
+
+  ASSERT_EQ(summary.failed_registrations.size(), 1U);
+  EXPECT_EQ(summary.failed_registrations[0].image_id, 3U);
+  EXPECT_EQ(summary.failed_registrations[0].attempt, 1U);
+  EXPECT_GT(summary.failed_registrations[0].candidate_score, 0.0);
+  ASSERT_EQ(summary.registrations.size(), 1U);
+  EXPECT_EQ(summary.registrations[0].image_id, 4U);
+  EXPECT_EQ(summary.registrations[0].registration_attempts_before_success, 0U);
+  EXPECT_TRUE(reconstruction.IsImageRegistered(4));
+  EXPECT_FALSE(reconstruction.IsImageRegistered(3));
 }
 
 TEST(IncrementalMapperTest, SelectsCandidateWithStrongerRegisteredConnectivity) {
