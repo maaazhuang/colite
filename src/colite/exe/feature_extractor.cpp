@@ -76,6 +76,7 @@ int RunFeatureExtractor(const std::vector<std::string>& args,
     const auto summary =
         controllers::FeatureExtractorController(options).Run();
     out << "Images: " << summary.num_images << "\n"
+        << "Feature cache hit: " << (summary.cache_hit ? 1 : 0) << "\n"
         << "Feature extraction seconds: " << summary.elapsed_seconds << "\n";
     return summary.success ? EXIT_SUCCESS : EXIT_FAILURE;
   } catch (const std::exception& exception) {

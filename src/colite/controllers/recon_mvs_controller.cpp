@@ -337,6 +337,18 @@ std::string FormatStat(double value) {
   return stream.str();
 }
 
+template <typename T>
+std::string JoinDiagnosticVector(const std::vector<T>& values) {
+  std::ostringstream stream;
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    if (i > 0) {
+      stream << ",";
+    }
+    stream << values[i];
+  }
+  return stream.str();
+}
+
 std::string FormatDistributionValue(double value) {
   if (std::isinf(value)) {
     return value > 0.0 ? "inf" : "-inf";
@@ -1111,6 +1123,9 @@ std::size_t RunPatchMatchForWorkspace(
   diagnostics << "image_id\trequested_backend\tactual_backend"
               << "\tpyramid_levels\titerations\tvalid_cost_pixels\tcandidate_evaluations"
               << "\tpropagation_updates\tperturbation_updates"
+              << "\tsource_selection_tests"
+              << "\tsource_selection_acceptances"
+              << "\tsource_selection_rejections"
               << "\tperturbation_mean_abs_depth_update"
               << "\tperturbation_max_abs_depth_update"
               << "\tperturbation_mean_normal_angle_degrees"
@@ -1120,6 +1135,14 @@ std::size_t RunPatchMatchForWorkspace(
               << "\tforward_sweeps\tbackward_sweeps"
               << "\ttop_down_sweeps\tbottom_up_sweeps"
               << "\tcheckerboard_passes"
+              << "\titeration_levels"
+              << "\titeration_indices"
+              << "\titeration_candidate_evaluations"
+              << "\titeration_propagation_updates"
+              << "\titeration_perturbation_updates"
+              << "\titeration_source_selection_tests"
+              << "\titeration_source_selection_acceptances"
+              << "\titeration_source_selection_rejections"
               << "\tnormal_refinement_pixels"
               << "\tnormal_refined_pixels"
               << "\tnormal_refinement_skipped_pixels"
@@ -1159,6 +1182,11 @@ std::size_t RunPatchMatchForWorkspace(
                 << result.result.summary.num_candidate_evaluations << "\t"
                 << result.result.summary.num_propagation_updates << "\t"
                 << result.result.summary.num_perturbation_updates << "\t"
+                << result.result.summary.num_source_selection_tests << "\t"
+                << result.result.summary.num_source_selection_acceptances
+                << "\t"
+                << result.result.summary.num_source_selection_rejections
+                << "\t"
                 << FormatStat(
                        result.result.summary
                            .perturbation_mean_abs_depth_update)
@@ -1186,6 +1214,33 @@ std::size_t RunPatchMatchForWorkspace(
                 << result.result.summary.num_top_down_sweeps << "\t"
                 << result.result.summary.num_bottom_up_sweeps << "\t"
                 << result.result.summary.num_checkerboard_passes << "\t"
+                << JoinDiagnosticVector(
+                       result.result.summary.iteration_pyramid_levels)
+                << "\t"
+                << JoinDiagnosticVector(
+                       result.result.summary.iteration_indices)
+                << "\t"
+                << JoinDiagnosticVector(
+                       result.result.summary
+                           .iteration_candidate_evaluations)
+                << "\t"
+                << JoinDiagnosticVector(
+                       result.result.summary.iteration_propagation_updates)
+                << "\t"
+                << JoinDiagnosticVector(
+                       result.result.summary.iteration_perturbation_updates)
+                << "\t"
+                << JoinDiagnosticVector(
+                       result.result.summary.iteration_source_selection_tests)
+                << "\t"
+                << JoinDiagnosticVector(
+                       result.result.summary
+                           .iteration_source_selection_acceptances)
+                << "\t"
+                << JoinDiagnosticVector(
+                       result.result.summary
+                           .iteration_source_selection_rejections)
+                << "\t"
                 << result.result.summary.num_normal_refinement_pixels << "\t"
                 << result.result.summary.num_normal_refined_pixels << "\t"
                 << result.result.summary.num_normal_refinement_skipped_pixels

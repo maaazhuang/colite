@@ -2,10 +2,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <set>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -197,6 +200,49 @@ std::vector<DescriptorVector> TrainVisualWords(
   return words;
 }
 
+std::vector<DescriptorVector> LoadVisualWordsFromTextFile(
+    const std::filesystem::path& path) {
+  std::ifstream file(path);
+  if (!file.is_open()) {
+    throw std::invalid_argument("failed to open vocab tree file: " +
+                                path.string());
+  }
+
+  std::string magic;
+  int version = 0;
+  std::size_t descriptor_dim = 0;
+  file >> magic >> version >> descriptor_dim;
+  if (magic != "COLITE_VOCAB_TREE" || version != 1 || descriptor_dim == 0) {
+    throw std::invalid_argument(
+        "unsupported vocab tree file header: " + path.string());
+  }
+
+  std::vector<DescriptorVector> words;
+  std::string line;
+  std::getline(file, line);
+  while (std::getline(file, line)) {
+    if (line.empty() || line[0] == '#') {
+      continue;
+    }
+    std::istringstream stream(line);
+    DescriptorVector word(descriptor_dim, 0.0F);
+    for (std::size_t dim = 0; dim < descriptor_dim; ++dim) {
+      if (!(stream >> word[dim])) {
+        throw std::invalid_argument(
+            "vocab tree word has wrong descriptor dimension: " +
+            path.string());
+      }
+    }
+    words.push_back(std::move(word));
+  }
+
+  if (words.empty()) {
+    throw std::invalid_argument("vocab tree file contains no visual words: " +
+                                path.string());
+  }
+  return words;
+}
+
 std::size_t AssignVisualWord(const DescriptorVector& descriptor,
                              const std::vector<DescriptorVector>& words) {
   std::size_t best_word = 0;
@@ -216,7 +262,8 @@ std::vector<ImagePair> GenerateVocabTreePairs(
     const MatchGraph& graph,
     const std::size_t num_images,
     const std::size_t num_visual_words,
-    const std::size_t max_num_features_per_image) {
+    const std::size_t max_num_features_per_image,
+    const std::filesystem::path& vocab_tree_path) {
   if (num_images == 0) {
     throw std::invalid_argument("vocab_tree num_images must be positive");
   }
@@ -227,7 +274,9 @@ std::vector<ImagePair> GenerateVocabTreePairs(
         "vocab tree matching requires workspace features");
   }
   const std::vector<DescriptorVector> words =
-      TrainVisualWords(samples, num_visual_words);
+      vocab_tree_path.empty()
+          ? TrainVisualWords(samples, num_visual_words)
+          : LoadVisualWordsFromTextFile(vocab_tree_path);
 
   std::map<ImageId, std::map<std::size_t, double>> histograms;
   for (const DescriptorSample& sample : samples) {
@@ -337,7 +386,8 @@ std::vector<ImagePair> GenerateMatchingPairs(
   if (options.strategy == MatchingStrategy::kVocabTree) {
     return GenerateVocabTreePairs(images, graph, options.vocab_tree_num_images,
                                   options.vocab_tree_num_visual_words,
-                                  options.vocab_tree_max_num_features);
+                                  options.vocab_tree_max_num_features,
+                                  options.vocab_tree_path);
   }
   return GenerateMatchingPairs(images, options);
 }

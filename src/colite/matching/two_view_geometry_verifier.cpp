@@ -331,6 +331,26 @@ double NormalizedRansacThreshold(const Camera& camera1,
   return max_error_px / focal;
 }
 
+double InlierRatio(const std::size_t numerator,
+                   const std::size_t denominator) {
+  if (denominator == 0) {
+    return numerator == 0 ? 0.0 : std::numeric_limits<double>::infinity();
+  }
+  return static_cast<double>(numerator) / static_cast<double>(denominator);
+}
+
+bool HasEnoughInliers(const MatrixRansacResult& result,
+                      const TwoViewGeometryOptions& options) {
+  return result.inlier_indices.size() >=
+         static_cast<std::size_t>(std::max(options.min_num_inliers, 0));
+}
+
+const std::vector<std::size_t>& PreferMoreInliers(
+    const std::vector<std::size_t>& lhs,
+    const std::vector<std::size_t>& rhs) {
+  return rhs.size() > lhs.size() ? rhs : lhs;
+}
+
 std::optional<Eigen::Vector3d> TriangulateNormalizedPoint(
     const Eigen::Vector2d& point1,
     const Eigen::Vector2d& point2,
@@ -447,6 +467,66 @@ double ComputeMedianTriangulationAngle(
   return angles[angles.size() / 2];
 }
 
+bool HomographyLooksLikePureRotation(const Camera& camera1,
+                                     const Camera& camera2,
+                                     const Eigen::Matrix3d& homography) {
+  if (homography.norm() <= 0.0) {
+    return false;
+  }
+
+  const Eigen::Matrix3d normalized =
+      camera2.CalibrationMatrix().inverse() * homography *
+      camera1.CalibrationMatrix();
+  const Eigen::JacobiSVD<Eigen::Matrix3d> svd(
+      normalized, Eigen::ComputeFullU | Eigen::ComputeFullV);
+  const Eigen::Vector3d singular_values = svd.singularValues();
+  const double min_sv = singular_values.minCoeff();
+  const double max_sv = singular_values.maxCoeff();
+  if (min_sv <= 0.0 || !std::isfinite(min_sv) || !std::isfinite(max_sv)) {
+    return false;
+  }
+
+  // 纯旋转单应在归一化相机平面中等价于一个旋转矩阵乘尺度，
+  // 因此三个奇异值应非常接近；平面+平移通常会拉开奇异值。
+  return max_sv / min_sv < 1.02;
+}
+
+Pose3 PoseFromPureRotationHomography(const Camera& camera1,
+                                     const Camera& camera2,
+                                     const Eigen::Matrix3d& homography) {
+  const Eigen::Matrix3d normalized =
+      camera2.CalibrationMatrix().inverse() * homography *
+      camera1.CalibrationMatrix();
+  const Eigen::JacobiSVD<Eigen::Matrix3d> svd(
+      normalized, Eigen::ComputeFullU | Eigen::ComputeFullV);
+  Eigen::Matrix3d rotation = svd.matrixU() * svd.matrixV().transpose();
+  if (rotation.determinant() < 0.0) {
+    rotation = -rotation;
+  }
+
+  Pose3 pose;
+  pose.q_cw = Eigen::Quaterniond(rotation).normalized();
+  pose.t_cw = Eigen::Vector3d::Zero();
+  return pose;
+}
+
+TwoViewGeometry::Type ClassifyHomographyDegeneracy(
+    const Camera& camera1,
+    const Camera& camera2,
+    const Eigen::Matrix3d& homography,
+    const double median_triangulation_angle,
+    const TwoViewGeometryOptions& options) {
+  if (median_triangulation_angle >= 0.0 &&
+      median_triangulation_angle <=
+          options.max_panoramic_triangulation_angle_deg) {
+    return TwoViewGeometry::Type::kPanoramic;
+  }
+  if (HomographyLooksLikePureRotation(camera1, camera2, homography)) {
+    return TwoViewGeometry::Type::kPanoramic;
+  }
+  return TwoViewGeometry::Type::kPlanarHomography;
+}
+
 }  // namespace
 
 TwoViewGeometry EstimateTwoViewGeometry(
@@ -482,8 +562,9 @@ TwoViewGeometry EstimateTwoViewGeometry(
     geometry.F = fundamental.model;
   }
 
+  MatrixRansacResult homography;
   if (options.estimate_homography) {
-    const MatrixRansacResult homography = RunMatrixRansac(
+    homography = RunMatrixRansac(
         points.matches.size(), 4, options.max_num_iterations,
         options.max_error_px,
         [&](const std::vector<std::size_t>& sample) {
@@ -513,26 +594,90 @@ TwoViewGeometry EstimateTwoViewGeometry(
                             points.normalized2[idx]);
       });
 
-  if (essential.inlier_indices.size() >=
-      static_cast<std::size_t>(options.min_num_inliers)) {
+  const bool essential_valid = HasEnoughInliers(essential, options);
+  const bool fundamental_valid = HasEnoughInliers(fundamental, options);
+  const bool homography_valid =
+      options.estimate_homography && HasEnoughInliers(homography, options);
+
+  if (!essential_valid && !fundamental_valid && !homography_valid) {
+    geometry.type = TwoViewGeometry::Type::kDegenerate;
+    geometry.inlier_matches.clear();
+    geometry.median_triangulation_angle = -1.0;
+    return geometry;
+  }
+
+  if (essential_valid &&
+      InlierRatio(essential.inlier_indices.size(),
+                  fundamental.inlier_indices.size()) >
+          options.min_E_F_inlier_ratio) {
     geometry.E = essential.model;
     geometry.cam2_from_cam1 = ChoosePoseFromEssentialMatrix(
         geometry.E, points.normalized1, points.normalized2,
         essential.inlier_indices);
-    geometry.inlier_matches =
-        MatchesFromInlierIndices(points.matches, essential.inlier_indices);
+    const std::vector<std::size_t>& epipolar_inliers =
+        PreferMoreInliers(essential.inlier_indices,
+                          fundamental.inlier_indices);
+    geometry.inlier_matches = MatchesFromInlierIndices(points.matches,
+                                                       epipolar_inliers);
     geometry.median_triangulation_angle = ComputeMedianTriangulationAngle(
         camera1, features1, camera2, features2, geometry.cam2_from_cam1,
         geometry.inlier_matches);
+    if (homography_valid &&
+        InlierRatio(homography.inlier_indices.size(),
+                    essential.inlier_indices.size()) >
+            options.max_H_inlier_ratio) {
+      if (homography.inlier_indices.size() > geometry.inlier_matches.size()) {
+        geometry.inlier_matches =
+            MatchesFromInlierIndices(points.matches, homography.inlier_indices);
+      }
+      geometry.type = ClassifyHomographyDegeneracy(
+          camera1, camera2, geometry.H, geometry.median_triangulation_angle,
+          options);
+      if (geometry.type == TwoViewGeometry::Type::kPanoramic) {
+        geometry.cam2_from_cam1 =
+            PoseFromPureRotationHomography(camera1, camera2, geometry.H);
+        geometry.median_triangulation_angle = 0.0;
+      }
+      return geometry;
+    }
     geometry.type = TwoViewGeometry::Type::kCalibratedEssential;
     return geometry;
   }
 
-  if (fundamental.inlier_indices.size() >=
-      static_cast<std::size_t>(options.min_num_inliers)) {
+  if (fundamental_valid) {
+    if (homography_valid &&
+        InlierRatio(homography.inlier_indices.size(),
+                    fundamental.inlier_indices.size()) >
+            options.max_H_inlier_ratio) {
+      geometry.inlier_matches =
+          MatchesFromInlierIndices(points.matches, homography.inlier_indices);
+      geometry.type = ClassifyHomographyDegeneracy(
+          camera1, camera2, geometry.H, geometry.median_triangulation_angle,
+          options);
+      if (geometry.type == TwoViewGeometry::Type::kPanoramic) {
+        geometry.cam2_from_cam1 =
+            PoseFromPureRotationHomography(camera1, camera2, geometry.H);
+        geometry.median_triangulation_angle = 0.0;
+      }
+      return geometry;
+    }
     geometry.type = TwoViewGeometry::Type::kUncalibratedFundamental;
     geometry.inlier_matches =
         MatchesFromInlierIndices(points.matches, fundamental.inlier_indices);
+    return geometry;
+  }
+
+  if (homography_valid) {
+    geometry.type = ClassifyHomographyDegeneracy(
+        camera1, camera2, geometry.H, geometry.median_triangulation_angle,
+        options);
+    geometry.inlier_matches =
+        MatchesFromInlierIndices(points.matches, homography.inlier_indices);
+    if (geometry.type == TwoViewGeometry::Type::kPanoramic) {
+      geometry.cam2_from_cam1 =
+          PoseFromPureRotationHomography(camera1, camera2, geometry.H);
+      geometry.median_triangulation_angle = 0.0;
+    }
     return geometry;
   }
 

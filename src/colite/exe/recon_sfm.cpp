@@ -2,6 +2,7 @@
 
 #include <exception>
 #include <ostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -42,6 +43,15 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --max_registration_trials_per_image <n>\n"
          "                            Maximum registration attempts per image, "
          "default 3.\n"
+      << "  --max_initialization_trials <n>\n"
+         "                            Maximum initial image-pair candidates to "
+         "try, default 3.\n"
+      << "  --registration_retry_error_multiplier <r>\n"
+         "                            PnP reprojection threshold multiplier per "
+         "failed retry, default 1.5.\n"
+      << "  --registration_retry_max_error <px>\n"
+         "                            Maximum relaxed PnP reprojection "
+         "threshold, default 8.\n"
       << "  --ba_refine_focal_length <0|1>\n"
          "                            Refine focal length in local/global BA, "
          "default 0.\n"
@@ -50,7 +60,10 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
          "default 0.\n"
       << "  --ba_refine_extra_params <0|1>\n"
          "                            Refine distortion/extra camera params in "
-         "local/global BA, default 0.\n";
+         "local/global BA, default 0.\n"
+      << "  --ba_refine_params <names>\n"
+         "                            Comma-separated camera params to refine, "
+         "e.g. fx,fy,k1,p2.\n";
 }
 
 std::string RequireValue(const std::vector<std::string>& args,
@@ -71,6 +84,27 @@ bool ParseBoolFlagValue(const std::string& value, std::string_view flag) {
     return false;
   }
   throw std::invalid_argument("Expected 0/1 for " + std::string(flag));
+}
+
+std::set<std::string> ParseCommaSeparatedNames(const std::string& value,
+                                               std::string_view flag) {
+  std::set<std::string> names;
+  std::size_t start = 0;
+  while (start <= value.size()) {
+    const std::size_t comma = value.find(',', start);
+    const std::size_t end =
+        comma == std::string::npos ? value.size() : comma;
+    const std::string name = value.substr(start, end - start);
+    if (name.empty()) {
+      throw std::invalid_argument("Empty name in " + std::string(flag));
+    }
+    names.insert(name);
+    if (comma == std::string::npos) {
+      break;
+    }
+    start = comma + 1;
+  }
+  return names;
 }
 
 ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
@@ -107,6 +141,15 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--max_registration_trials_per_image") {
       options.max_registration_trials_per_image =
           static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
+    } else if (arg == "--max_initialization_trials") {
+      options.max_initialization_trials =
+          static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
+    } else if (arg == "--registration_retry_error_multiplier") {
+      options.registration_retry_reprojection_error_multiplier =
+          std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--registration_retry_max_error") {
+      options.registration_retry_max_reprojection_error_px =
+          std::stod(RequireValue(args, &i, arg));
     } else if (arg == "--ba_refine_focal_length") {
       options.ba_refine_focal_length =
           ParseBoolFlagValue(RequireValue(args, &i, arg), arg);
@@ -116,6 +159,9 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--ba_refine_extra_params") {
       options.ba_refine_extra_params =
           ParseBoolFlagValue(RequireValue(args, &i, arg), arg);
+    } else if (arg == "--ba_refine_params") {
+      options.ba_refine_params =
+          ParseCommaSeparatedNames(RequireValue(args, &i, arg), arg);
     } else if (arg == "--matcher") {
       const std::string matcher = RequireValue(args, &i, arg);
       if (matcher == "bf") {
@@ -156,6 +202,17 @@ void ValidateOptions(const ReconSfmCliOptions& options) {
     throw std::invalid_argument(
         "--max_registration_trials_per_image must be positive");
   }
+  if (options.max_initialization_trials == 0) {
+    throw std::invalid_argument("--max_initialization_trials must be positive");
+  }
+  if (options.registration_retry_reprojection_error_multiplier < 1.0) {
+    throw std::invalid_argument(
+        "--registration_retry_error_multiplier must be >= 1");
+  }
+  if (options.registration_retry_max_reprojection_error_px <= 0.0) {
+    throw std::invalid_argument(
+        "--registration_retry_max_error must be positive");
+  }
 }
 
 controllers::ReconSfmControllerOptions ToControllerOptions(
@@ -172,6 +229,12 @@ controllers::ReconSfmControllerOptions ToControllerOptions(
   controller_options.nearby_match_ratio = options.nearby_match_ratio;
   controller_options.max_registration_trials_per_image =
       options.max_registration_trials_per_image;
+  controller_options.max_initialization_trials =
+      options.max_initialization_trials;
+  controller_options.registration_retry_reprojection_error_multiplier =
+      options.registration_retry_reprojection_error_multiplier;
+  controller_options.registration_retry_max_reprojection_error_px =
+      options.registration_retry_max_reprojection_error_px;
   if (options.ba_refine_focal_length) {
     controller_options.ba_refine_camera_params =
         controller_options.ba_refine_camera_params |
@@ -187,6 +250,7 @@ controllers::ReconSfmControllerOptions ToControllerOptions(
         controller_options.ba_refine_camera_params |
         CameraParameterGroup::kDistortion;
   }
+  controller_options.ba_refine_camera_param_names = options.ba_refine_params;
   return controller_options;
 }
 

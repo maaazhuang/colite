@@ -75,6 +75,8 @@ void PrintHelp(std::string_view executable,
       << "  --vocab_tree_max_num_features <n>\n"
       << "                            Max descriptors per image used to build "
          "retrieval histograms, default 5000.\n"
+      << "  --vocab_tree_path <file>  Load a COLITE text vocab tree file instead "
+         "of training temporary visual words.\n"
       << "  --matcher <bf|flann>     Descriptor matcher backend, default flann.\n"
       << "  --max_ratio <r>          Lowe ratio, default 0.8.\n";
 }
@@ -131,6 +133,8 @@ int RunMatcherCommand(const std::vector<std::string>& args,
       } else if (arg == "--vocab_tree_max_num_features") {
         options.vocab_tree_max_num_features =
             static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
+      } else if (arg == "--vocab_tree_path") {
+        options.vocab_tree_path = RequireValue(args, &i, arg);
       } else if (arg == "--max_ratio") {
         options.max_ratio = std::stod(RequireValue(args, &i, arg));
       } else if (arg == "--matcher") {
@@ -152,6 +156,10 @@ int RunMatcherCommand(const std::vector<std::string>& args,
     const auto summary =
         controllers::SequentialMatcherController(options).Run();
     out << "Pairs: " << summary.num_pairs << "\n"
+        << "Raw match cache hit: "
+        << (summary.raw_match_cache_hit ? 1 : 0) << "\n"
+        << "Geometry cache hit: " << (summary.geometry_cache_hit ? 1 : 0)
+        << "\n"
         << "Verified pairs: " << summary.num_verified_pairs << "\n"
         << "Verified inliers: " << summary.num_verified_inliers << "\n";
     return summary.success ? EXIT_SUCCESS : EXIT_FAILURE;

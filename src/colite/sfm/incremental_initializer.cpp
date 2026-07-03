@@ -159,29 +159,53 @@ void AddTriangulatedObservations(
 
 }  // namespace
 
-std::optional<ImagePair> SelectInitialImagePair(
+std::vector<ImagePair> SelectInitialImagePairCandidates(
     const MatchGraph& graph,
     const IncrementalInitializerOptions& options) {
-  std::optional<ImagePair> best_pair;
-  const TwoViewGeometry* best_geometry = nullptr;
+  std::vector<std::pair<ImagePair, const TwoViewGeometry*>> candidates;
 
   for (const auto& [pair, geometry] : graph.verified_geometries) {
     if (!IsUsableInitialGeometry(geometry, options)) {
       continue;
     }
-    if (best_geometry == nullptr ||
-        geometry.inlier_matches.size() >
-            best_geometry->inlier_matches.size() ||
-        (geometry.inlier_matches.size() ==
-             best_geometry->inlier_matches.size() &&
-         geometry.median_triangulation_angle >
-             best_geometry->median_triangulation_angle)) {
-      best_pair = pair;
-      best_geometry = &geometry;
-    }
+    candidates.emplace_back(pair, &geometry);
   }
 
-  return best_pair;
+  std::sort(candidates.begin(), candidates.end(),
+            [](const auto& lhs, const auto& rhs) {
+              const TwoViewGeometry& lhs_geometry = *lhs.second;
+              const TwoViewGeometry& rhs_geometry = *rhs.second;
+              if (lhs_geometry.inlier_matches.size() !=
+                  rhs_geometry.inlier_matches.size()) {
+                return lhs_geometry.inlier_matches.size() >
+                       rhs_geometry.inlier_matches.size();
+              }
+              if (lhs_geometry.median_triangulation_angle !=
+                  rhs_geometry.median_triangulation_angle) {
+                return lhs_geometry.median_triangulation_angle >
+                       rhs_geometry.median_triangulation_angle;
+              }
+              return lhs.first < rhs.first;
+            });
+
+  std::vector<ImagePair> pairs;
+  pairs.reserve(candidates.size());
+  for (const auto& [pair, geometry] : candidates) {
+    (void)geometry;
+    pairs.push_back(pair);
+  }
+  return pairs;
+}
+
+std::optional<ImagePair> SelectInitialImagePair(
+    const MatchGraph& graph,
+    const IncrementalInitializerOptions& options) {
+  const std::vector<ImagePair> candidates =
+      SelectInitialImagePairCandidates(graph, options);
+  if (candidates.empty()) {
+    return std::nullopt;
+  }
+  return candidates.front();
 }
 
 IncrementalInitializerSummary InitializeReconstructionFromPair(
@@ -249,15 +273,39 @@ IncrementalInitializerSummary InitializeReconstructionFromBestPair(
     const MatchGraph& graph,
     const IncrementalInitializerOptions& options,
     Reconstruction* reconstruction) {
-  const std::optional<ImagePair> initial_pair =
-      SelectInitialImagePair(graph, options);
-  if (!initial_pair.has_value()) {
-    IncrementalInitializerSummary summary;
-    summary.message = "No usable initial image pair";
-    return summary;
+  IncrementalInitializerSummary final_summary;
+  const std::vector<ImagePair> candidates =
+      SelectInitialImagePairCandidates(graph, options);
+  if (candidates.empty()) {
+    final_summary.message = "No usable initial image pair";
+    return final_summary;
   }
-  return InitializeReconstructionFromPair(graph, *initial_pair, options,
-                                          reconstruction);
+
+  const std::size_t max_trials =
+      options.max_num_initialization_trials == 0
+          ? candidates.size()
+          : std::min(options.max_num_initialization_trials, candidates.size());
+  for (std::size_t idx = 0; idx < max_trials; ++idx) {
+    const ImagePair pair = candidates[idx];
+    final_summary.attempted_initial_pairs.push_back(pair);
+    final_summary.num_initialization_attempts =
+        final_summary.attempted_initial_pairs.size();
+
+    IncrementalInitializerSummary attempt =
+        InitializeReconstructionFromPair(graph, pair, options, reconstruction);
+    attempt.attempted_initial_pairs = final_summary.attempted_initial_pairs;
+    attempt.num_initialization_attempts =
+        final_summary.num_initialization_attempts;
+    if (attempt.success) {
+      return attempt;
+    }
+    final_summary = std::move(attempt);
+  }
+
+  if (final_summary.message.empty()) {
+    final_summary.message = "No initial image pair could be initialized";
+  }
+  return final_summary;
 }
 
 }  // namespace colite

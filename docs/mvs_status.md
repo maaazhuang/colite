@@ -654,3 +654,114 @@ CPU:
 ctest --test-dir build-wsl -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
 26/26 passed
 ```
+
+## 2026-06-30 CUDA PatchMatch 细节补齐：sweep / selection / angle / pyramid
+
+本轮继续补齐 CUDA PatchMatch 的 COLMAP 化细节：
+
+- pose texture 从 43 个参数扩展为 47 个参数，并使用 3 个 layered sweep
+  variant。
+- 每个 source view 现在在 pose texture 中额外保存：
+  - source geometry weight；
+  - source selection probability；
+  - rotated patch sweep 的 `cos/sin`。
+- CUDA cost evaluation 会对每个 source 的 3 个 rotated sweep variant 取最优
+  cost。
+- 多源聚合新增：
+  - per-pixel/source deterministic selection；
+  - source geometry weight；
+  - 基于 hypothesis normal 与 source camera center 的 incident-angle penalty。
+- CUDA backend 已支持 multi-scale pyramid：
+  - 每层缩放 reference/source 图像；
+  - 每层缩放相机内参；
+  - source depth map 随层缩放；
+  - coarse depth/normal 通过最近邻上采样作为下一层初值。
+- CUDA single-scale 结果现在会在开启 `--refine_normals_from_depth` 时调用
+  现有 normal refinement，并写回 summary 统计，避免默认 `auto` backend 下
+  `recon_mvs` 诊断缺失。
+
+当前边界：
+
+- rotated sweep 目前是 patch 坐标旋转变体，不是完整 COLMAP sweep scheduler。
+- selection probability 目前是 source-level 概率并按 pixel/source 确定性采样，
+  还不是 dense probability map。
+- angle weighting 仍较保守，完整 normal/view-angle 过滤主要仍在 fusion 阶段。
+- pyramid 层间 coarse map 通过 host memory 传递，后续可继续优化为 GPU cache。
+
+验证：
+
+```text
+CUDA:
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+27/27 passed
+
+CPU:
+本轮 CPU 回归命令因 WSL 执行触发环境用量限制未运行；CUDA 构建与 CUDA MVS 回归已通过。
+```
+
+## 2026-07-01 CUDA normal perturbation 与法线扰动诊断
+
+本轮继续完善 CUDA PatchMatch 的随机扰动阶段：
+
+- GPU 端新增 `float3` normal 运算 helper。
+- `PerturbationKernel` 现在会在当前 normal 周围做球冠采样，生成
+  `(depth, normal)` 联合候选，而不是只扰动 depth。
+- 接受候选时会同时写回 depth map 和 normal map。
+- CUDA summary 现在会记录 normal perturbation 的：
+  - total normal angle；
+  - max normal angle；
+  - mean normal angle。
+- 新增 CUDA 回归测试：初始 depth 固定、depth perturbation radius 为 0，
+  确认 CUDA 路径可以通过 normal hypothesis 产生扰动更新。
+
+验证：
+
+```text
+CUDA:
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+28/28 passed
+
+CPU:
+ctest --test-dir build-wsl -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+28/28 passed
+```
+
+## 2026-07-01 CUDA per-iteration diagnostics 与 source selection 统计
+
+本轮给 CUDA PatchMatch 补充可调参诊断：
+
+- `PatchMatchStereoSummary` 新增 source selection 总量：
+  - tests；
+  - acceptances；
+  - rejections。
+- 新增 per-level / per-iteration 诊断向量：
+  - pyramid level；
+  - iteration index；
+  - candidate evaluations；
+  - propagation updates；
+  - perturbation updates；
+  - source selection tests / acceptances / rejections。
+- CUDA kernel 在 source selection gate 处统计每次 source 被考虑、接受或拒绝。
+- CUDA 单尺度执行每轮 reset/copy counter，写入真实 per-iteration 诊断。
+- CUDA pyramid 执行会把每层 iteration 记录标记为真实 coarse-to-fine level。
+- `stereo/patch_match.tsv` 新增 aggregate selection counter 和 per-iteration CSV
+  向量列，便于后续用脚本分析每轮行为。
+
+验证：
+
+```text
+cmake --build build-wsl-cuda-mvs-tests --target colite_core colite_recon_mvs_exe -j2
+passed
+
+cmake --build build-wsl --target colite_core colite_recon_mvs_exe -j2
+passed
+
+cmake --build build-wsl-cuda-mvs-tests --target tests/CMakeFiles/colite_core_tests.dir/mvs/patch_match_test.cpp.o -j2
+passed
+```
+
+说明：
+
+- 完整 `colite_core_tests` 当前被 unrelated SfM 测试编译错误阻塞，错误来自
+  `incremental_mapper_test.cpp` 对 `IncrementalMappingOptions` 中不存在字段的引用；
+  本轮未修改该部分。

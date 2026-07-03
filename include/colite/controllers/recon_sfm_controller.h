@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <filesystem>
 #include <iosfwd>
+#include <set>
+#include <string>
 #include <vector>
 
 #include "colite/core/match_graph.h"
@@ -24,7 +26,11 @@ struct ReconSfmControllerOptions {
   std::size_t nearby_match_window = 2;
   double nearby_match_ratio = 0.9;
   std::size_t max_registration_trials_per_image = 3;
+  std::size_t max_initialization_trials = 3;
+  double registration_retry_reprojection_error_multiplier = 1.5;
+  double registration_retry_max_reprojection_error_px = 8.0;
   CameraParameterGroup ba_refine_camera_params = CameraParameterGroup::kNone;
+  std::set<std::string> ba_refine_camera_param_names;
 };
 
 struct NearbyPairMatchingOptions {

@@ -146,6 +146,69 @@ TEST(IncrementalInitializerTest, InitializesReconstructionFromVerifiedPair) {
   EXPECT_GT(reconstruction.GetImage(2).NumPoints3D(), 0U);
 }
 
+TEST(IncrementalInitializerTest, TriesNextInitialPairWhenBestCandidateFails) {
+  const Camera camera = MakeCamera(1);
+  MatchGraph graph;
+
+  TwoViewGeometry bad_best_geometry;
+  bad_best_geometry.type = TwoViewGeometry::Type::kCalibratedEssential;
+  bad_best_geometry.inlier_matches = std::vector<FeatureMatch>(40, {0, 0});
+  bad_best_geometry.median_triangulation_angle = 3.0;
+  SetVerifiedGeometry(&graph, 1, 2, bad_best_geometry);
+
+  const Pose3 cam3_from_world = CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0));
+  const Pose3 cam4_from_world = CameraAt(Eigen::Vector3d(1.0, 0.0, 0.0));
+  FeatureSet features3;
+  FeatureSet features4;
+  std::vector<FeatureMatch> fallback_matches;
+  for (int y = 0; y < 5; ++y) {
+    for (int x = 0; x < 6; ++x) {
+      AddProjectedMatch(camera, cam3_from_world, cam4_from_world,
+                        Eigen::Vector3d(-1.0 + 0.4 * x,
+                                        -0.6 + 0.3 * y,
+                                        4.0 + 0.07 * x + 0.11 * y +
+                                            0.03 * x * y),
+                        &features3, &features4, &fallback_matches);
+    }
+  }
+  TwoViewGeometryOptions verify_options;
+  verify_options.max_error_px = 1.0;
+  verify_options.min_num_inliers = 20;
+  const TwoViewGeometry fallback_geometry = EstimateTwoViewGeometry(
+      camera, features3, camera, features4, fallback_matches, verify_options);
+  SetFeatures(&graph, 3, features3);
+  SetFeatures(&graph, 4, features4);
+  SetMatches(&graph, 3, 4, fallback_matches);
+  SetVerifiedGeometry(&graph, 3, 4, fallback_geometry);
+
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  reconstruction.AddImage(MakeImage(1, 1));
+  reconstruction.AddImage(MakeImage(2, 1));
+  reconstruction.AddImage(MakeImage(3, 1));
+  reconstruction.AddImage(MakeImage(4, 1));
+
+  IncrementalInitializerOptions options;
+  options.min_num_inliers = 20;
+  options.min_num_triangulated_points = 20;
+  options.min_triangulation_angle_deg = 0.1;
+  options.max_reprojection_error_px = 1.0;
+  options.max_num_initialization_trials = 3;
+
+  const IncrementalInitializerSummary summary =
+      InitializeReconstructionFromBestPair(graph, options, &reconstruction);
+
+  EXPECT_TRUE(summary.success);
+  EXPECT_EQ(summary.initial_pair.image_id1, 3U);
+  EXPECT_EQ(summary.initial_pair.image_id2, 4U);
+  EXPECT_EQ(summary.num_initialization_attempts, 2U);
+  ASSERT_EQ(summary.attempted_initial_pairs.size(), 2U);
+  EXPECT_EQ(summary.attempted_initial_pairs[0], ImagePair::Ordered(1, 2));
+  EXPECT_EQ(summary.attempted_initial_pairs[1], ImagePair::Ordered(3, 4));
+  EXPECT_TRUE(reconstruction.IsImageRegistered(3));
+  EXPECT_TRUE(reconstruction.IsImageRegistered(4));
+}
+
 TEST(IncrementalInitializerTest, FailsWhenNoUsableInitialPairExists) {
   MatchGraph graph;
   TwoViewGeometry geometry;

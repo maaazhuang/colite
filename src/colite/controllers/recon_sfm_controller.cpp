@@ -120,6 +120,12 @@ std::string TwoViewGeometryTypeName(const TwoViewGeometry& geometry) {
       return "UNCALIBRATED_FUNDAMENTAL";
     case TwoViewGeometry::Type::kCalibratedEssential:
       return "CALIBRATED_ESSENTIAL";
+    case TwoViewGeometry::Type::kPlanarHomography:
+      return "PLANAR_HOMOGRAPHY";
+    case TwoViewGeometry::Type::kPanoramic:
+      return "PANORAMIC";
+    case TwoViewGeometry::Type::kMultiple:
+      return "MULTIPLE";
   }
   return "UNKNOWN";
 }
@@ -221,6 +227,8 @@ void WriteRunSummary(const std::filesystem::path& output_path,
                << feature_extraction_seconds << "\n"
                << "incremental_registrations "
                << summary.registrations.size() << "\n"
+               << "initialization_attempts "
+               << summary.initialization.num_initialization_attempts << "\n"
                << "num_observations " << stats.num_observations << "\n"
                << "mean_reprojection_error "
                << stats.mean_reprojection_error << "\n"
@@ -340,6 +348,7 @@ void WriteRegistrationDiagnostics(
          "\tcandidate_registered_neighbors"
          "\tcandidate_verified_inliers_to_registered"
          "\tcandidate_score\tregistration_attempts_before_success"
+         "\tregistration_max_reprojection_error_px"
          "\tregistration_correspondences\tregistration_inliers"
          "\tcompleted_observations\ttrack_merged_points"
          "\ttrack_merged_observations"
@@ -368,6 +377,7 @@ void WriteRegistrationDiagnostics(
         << registration.candidate_num_verified_inliers_to_registered_images
         << "\t" << registration.candidate_score << "\t"
         << registration.registration_attempts_before_success << "\t"
+        << registration.registration_max_reprojection_error_px << "\t"
         << registration.registration.num_correspondences << "\t"
         << registration.registration.num_inliers << "\t"
         << registration.track_completion.num_completed_observations << "\t"
@@ -399,7 +409,8 @@ void WriteRegistrationDiagnostics(
          "\tcandidate_visible_observations\tcandidate_mean_track_length"
          "\tcandidate_registered_neighbors"
          "\tcandidate_verified_inliers_to_registered"
-         "\tcandidate_score\tmessage\n";
+         "\tcandidate_score\tregistration_max_reprojection_error_px"
+         "\tmessage\n";
   for (const ImageRegistrationFailureSummary& failure :
        summary.failed_registrations) {
     failures_file << std::setprecision(17) << failure.image_id << "\t"
@@ -410,6 +421,7 @@ void WriteRegistrationDiagnostics(
                   << failure.candidate_num_registered_neighbors << "\t"
                   << failure.candidate_num_verified_inliers_to_registered_images
                   << "\t" << failure.candidate_score << "\t"
+                  << failure.registration_max_reprojection_error_px << "\t"
                   << failure.message << "\n";
   }
 }
@@ -607,10 +619,20 @@ int ReconSfmController::Run(std::ostream& out) const {
       .min_triangulation_angle_deg = 1.0;
   mapping_options.mapper.local_bundle_adjustment.refine_camera_params =
       options.ba_refine_camera_params;
+  mapping_options.mapper.local_bundle_adjustment.refine_camera_param_names =
+      options.ba_refine_camera_param_names;
   mapping_options.global_bundle_adjustment.refine_camera_params =
       options.ba_refine_camera_params;
+  mapping_options.global_bundle_adjustment.refine_camera_param_names =
+      options.ba_refine_camera_param_names;
   mapping_options.max_num_registration_trials_per_image =
       options.max_registration_trials_per_image;
+  mapping_options.initialization.max_num_initialization_trials =
+      options.max_initialization_trials;
+  mapping_options.registration_retry_reprojection_error_multiplier =
+      options.registration_retry_reprojection_error_multiplier;
+  mapping_options.registration_retry_max_reprojection_error_px =
+      options.registration_retry_max_reprojection_error_px;
   IncrementalMappingSummary summary =
       RunIncrementalMapping(graph, mapping_options, &reconstruction);
   std::filesystem::create_directories(output_dir);

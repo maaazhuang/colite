@@ -1,6 +1,9 @@
 #pragma once
 
 #include <filesystem>
+#include <map>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "colite/core/camera.h"
@@ -16,6 +19,35 @@ std::filesystem::path WorkspaceMatchesPath(
     const std::filesystem::path& workspace_path);
 std::filesystem::path WorkspaceSparsePath(
     const std::filesystem::path& workspace_path);
+
+struct WorkspaceCacheMetadata {
+  std::string stage;
+  std::string config_hash;
+  std::map<std::string, std::string> values;
+  std::vector<std::filesystem::path> required_files;
+};
+
+std::string StableConfigHash(
+    const std::vector<std::pair<std::string, std::string>>& entries);
+
+std::filesystem::path WorkspaceCacheMetadataPath(
+    const std::filesystem::path& workspace_path,
+    const std::string& stage);
+
+void WriteWorkspaceCacheMetadata(
+    const std::filesystem::path& workspace_path,
+    const std::string& stage,
+    const std::string& config_hash,
+    const std::map<std::string, std::string>& values,
+    const std::vector<std::filesystem::path>& required_files);
+
+WorkspaceCacheMetadata ReadWorkspaceCacheMetadata(
+    const std::filesystem::path& workspace_path,
+    const std::string& stage);
+
+bool WorkspaceCacheIsValid(const std::filesystem::path& workspace_path,
+                           const std::string& stage,
+                           const std::string& config_hash);
 
 void WriteWorkspaceCameras(const std::filesystem::path& workspace_path,
                            const std::vector<Camera>& cameras);

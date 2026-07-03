@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <set>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -43,6 +45,13 @@ CameraParameterGroup operator|(CameraParameterGroup lhs,
 CameraParameterGroup operator&(CameraParameterGroup lhs,
                                CameraParameterGroup rhs);
 bool HasAny(CameraParameterGroup groups, CameraParameterGroup flag);
+
+// 相机内参优化掩码。groups 用于 COLMAP 风格的焦距/主点/额外参数组，
+// parameter_names 用于按参数名细化，例如 {"fx", "k1", "p2"}。
+struct CameraParameterRefinementMask {
+  CameraParameterGroup groups = CameraParameterGroup::kNone;
+  std::set<std::string> parameter_names;
+};
 
 // 相机模型规格。所有参数通过 param_names 的顺序存入 Camera::params。
 struct CameraModelSpec {
@@ -87,6 +96,15 @@ std::vector<double> InitializeCameraParams(CameraModelId model_id,
 std::vector<std::size_t> CameraParameterIndicesForGroups(
     CameraModelId model_id,
     CameraParameterGroup groups);
+
+std::vector<std::size_t> CameraParameterIndicesForMask(
+    CameraModelId model_id,
+    const CameraParameterRefinementMask& mask);
+
+bool ProjectPointWithCameraParams(CameraModelId model_id,
+                                  const double* params,
+                                  const Eigen::Vector3d& point_camera,
+                                  Eigen::Vector2d* projected);
 
 Eigen::Vector2d ProjectPoint(const Camera& camera,
                              const Eigen::Vector3d& point_camera);

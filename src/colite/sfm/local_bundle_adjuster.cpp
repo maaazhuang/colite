@@ -36,52 +36,8 @@ bool ProjectWithParams(CameraModelId model_id,
                        const double* params,
                        const Eigen::Vector3d& point_camera,
                        Eigen::Vector2d* projected) {
-  if (point_camera.z() <= 0.0) {
-    return false;
-  }
-  const double x = point_camera.x() / point_camera.z();
-  const double y = point_camera.y() / point_camera.z();
-  if (model_id == CameraModelId::kSimplePinhole) {
-    *projected = {params[0] * x + params[1], params[0] * y + params[2]};
-    return true;
-  }
-  if (model_id == CameraModelId::kPinhole) {
-    *projected = {params[0] * x + params[2], params[1] * y + params[3]};
-    return true;
-  }
-  if (model_id == CameraModelId::kSimpleRadial) {
-    const double radius2 = x * x + y * y;
-    const double scale = 1.0 + params[3] * radius2;
-    *projected = {params[0] * x * scale + params[1],
-                  params[0] * y * scale + params[2]};
-    return true;
-  }
-  if (model_id == CameraModelId::kRadial) {
-    const double radius2 = x * x + y * y;
-    const double scale =
-        1.0 + params[3] * radius2 + params[4] * radius2 * radius2;
-    *projected = {params[0] * x * scale + params[1],
-                  params[0] * y * scale + params[2]};
-    return true;
-  }
-  if (model_id == CameraModelId::kOpenCV) {
-    const double x2 = x * x;
-    const double y2 = y * y;
-    const double xy = x * y;
-    const double radius2 = x2 + y2;
-    const double radial =
-        1.0 + params[4] * radius2 + params[5] * radius2 * radius2;
-    const double distorted_x =
-        x * radial + 2.0 * params[6] * xy +
-        params[7] * (radius2 + 2.0 * x2);
-    const double distorted_y =
-        y * radial + params[6] * (radius2 + 2.0 * y2) +
-        2.0 * params[7] * xy;
-    *projected = {params[0] * distorted_x + params[2],
-                  params[1] * distorted_y + params[3]};
-    return true;
-  }
-  return false;
+  return ProjectPointWithCameraParams(model_id, params, point_camera,
+                                      projected);
 }
 
 class ReprojectionCost final : public ceres::CostFunction {
@@ -168,9 +124,13 @@ class ReprojectionCost final : public ceres::CostFunction {
 
 std::vector<int> ConstantCameraParameterIndices(
     const Camera& camera,
-    CameraParameterGroup refine_groups) {
+    CameraParameterGroup refine_groups,
+    const std::set<std::string>& refine_param_names) {
+  CameraParameterRefinementMask mask;
+  mask.groups = refine_groups;
+  mask.parameter_names = refine_param_names;
   const std::vector<std::size_t> variable_indices =
-      CameraParameterIndicesForGroups(camera.model_id, refine_groups);
+      CameraParameterIndicesForMask(camera.model_id, mask);
   std::set<std::size_t> variable_set(variable_indices.begin(),
                                      variable_indices.end());
   std::vector<int> constant_indices;
@@ -180,6 +140,30 @@ std::vector<int> ConstantCameraParameterIndices(
     }
   }
   return constant_indices;
+}
+
+std::map<ImageId, std::vector<int>> BuildGaugeTranslationConstraints(
+    const BundleGaugeFixing gauge_fixing,
+    const std::map<ImageId, PoseBlock>& pose_blocks,
+    const std::set<ImageId>& constant_pose_image_ids,
+    const std::map<ImageId, std::vector<int>>& explicit_constraints,
+    std::set<ImageId>* gauge_constant_pose_image_ids) {
+  std::map<ImageId, std::vector<int>> constraints = explicit_constraints;
+  if (gauge_constant_pose_image_ids == nullptr ||
+      gauge_fixing == BundleGaugeFixing::kNone || pose_blocks.empty() ||
+      !constant_pose_image_ids.empty()) {
+    return constraints;
+  }
+
+  auto it = pose_blocks.begin();
+  gauge_constant_pose_image_ids->insert(it->first);
+  if (gauge_fixing == BundleGaugeFixing::kFirstTwoImages) {
+    ++it;
+    if (it != pose_blocks.end()) {
+      constraints.emplace(it->first, std::vector<int>{0});
+    }
+  }
+  return constraints;
 }
 
 std::vector<std::pair<ImageId, std::size_t>> SortImageScores(
@@ -436,10 +420,14 @@ LocalBundleAdjustmentSummary AdjustLocalBundle(
       constant_pose_image_ids.insert(image_id);
     }
   }
-  if (options.constant_image_ids.empty() && fixed_image_ids.empty() &&
-      !pose_blocks.empty()) {
-    constant_pose_image_ids.insert(pose_blocks.begin()->first);
-  }
+  const std::map<ImageId, std::vector<int>> constant_translation_idxs =
+      BuildGaugeTranslationConstraints(
+          options.gauge_fixing, pose_blocks, constant_pose_image_ids,
+          options.constant_image_translation_idxs,
+          &summary.gauge_constant_pose_image_ids);
+  constant_pose_image_ids.insert(summary.gauge_constant_pose_image_ids.begin(),
+                                 summary.gauge_constant_pose_image_ids.end());
+  summary.gauge_constant_translation_idxs = constant_translation_idxs;
 
   for (auto& [image_id, block] : pose_blocks) {
     problem.AddParameterBlock(
@@ -456,6 +444,14 @@ LocalBundleAdjustmentSummary AdjustLocalBundle(
       ++summary.num_constant_images;
     } else {
       ++summary.num_variable_images;
+      const auto translation_it = constant_translation_idxs.find(image_id);
+      if (translation_it != constant_translation_idxs.end() &&
+          !translation_it->second.empty()) {
+        problem.SetParameterization(
+            block.t,
+            new ceres::SubsetParameterization(3, translation_it->second));
+        ++summary.num_gauge_constant_translation_images;
+      }
     }
   }
 
@@ -474,7 +470,8 @@ LocalBundleAdjustmentSummary AdjustLocalBundle(
     problem.AddParameterBlock(params.data(),
                               static_cast<int>(params.size()));
     const std::vector<int> constant_indices =
-        ConstantCameraParameterIndices(camera, options.refine_camera_params);
+        ConstantCameraParameterIndices(camera, options.refine_camera_params,
+                                       options.refine_camera_param_names);
     if (constant_indices.size() == params.size()) {
       problem.SetParameterBlockConstant(params.data());
     } else {

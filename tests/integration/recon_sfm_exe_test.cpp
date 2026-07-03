@@ -61,7 +61,13 @@ TEST(ReconSfmExeTest, PrintsHelp) {
   EXPECT_NE(out.str().find("--ba_refine_focal_length"), std::string::npos);
   EXPECT_NE(out.str().find("--ba_refine_principal_point"), std::string::npos);
   EXPECT_NE(out.str().find("--ba_refine_extra_params"), std::string::npos);
+  EXPECT_NE(out.str().find("--ba_refine_params"), std::string::npos);
   EXPECT_NE(out.str().find("--max_registration_trials_per_image"),
+            std::string::npos);
+  EXPECT_NE(out.str().find("--max_initialization_trials"), std::string::npos);
+  EXPECT_NE(out.str().find("--registration_retry_error_multiplier"),
+            std::string::npos);
+  EXPECT_NE(out.str().find("--registration_retry_max_error"),
             std::string::npos);
   EXPECT_NE(out.str().find("cudasift"), std::string::npos);
   EXPECT_TRUE(err.str().empty());
@@ -115,6 +121,20 @@ TEST(ReconSfmExeTest, RejectsInvalidRegistrationTrialLimit) {
 
   EXPECT_NE(exit_code, 0);
   EXPECT_NE(err.str().find("--max_registration_trials_per_image"),
+            std::string::npos);
+}
+
+TEST(ReconSfmExeTest, RejectsInvalidRegistrationRetryOptions) {
+  std::ostringstream out;
+  std::ostringstream err;
+
+  const int exit_code = exe::RunReconSfm(
+      {"recon_sfm", "--image_path", "images", "--output_path", "out",
+       "--registration_retry_error_multiplier", "0.5"},
+      out, err);
+
+  EXPECT_NE(exit_code, 0);
+  EXPECT_NE(err.str().find("--registration_retry_error_multiplier"),
             std::string::npos);
 }
 
@@ -310,6 +330,7 @@ TEST(ReconSfmExeTest, WritesRegistrationDiagnosticsForMappingRounds) {
   registration.candidate_num_verified_inliers_to_registered_images = 512;
   registration.candidate_score = 128500.0;
   registration.registration_attempts_before_success = 1;
+  registration.registration_max_reprojection_error_px = 3.5;
   registration.registration.num_correspondences = 140;
   registration.registration.num_inliers = 120;
   registration.track_completion.num_completed_observations = 11;
@@ -344,6 +365,7 @@ TEST(ReconSfmExeTest, WritesRegistrationDiagnosticsForMappingRounds) {
   failure.candidate_num_registered_neighbors = 2;
   failure.candidate_num_verified_inliers_to_registered_images = 180;
   failure.candidate_score = 64200.0;
+  failure.registration_max_reprojection_error_px = 6.0;
   failure.message = "Not enough inliers";
   summary.failed_registrations.push_back(failure);
 
@@ -359,7 +381,7 @@ TEST(ReconSfmExeTest, WritesRegistrationDiagnosticsForMappingRounds) {
                 "\tcandidate_registered_neighbors"),
             std::string::npos);
   EXPECT_NE(diagnostics.find(
-                "2\t7\t128\t256\t2\t4\t512\t128500\t1\t140\t120\t11\t2"
+                "2\t7\t128\t256\t2\t4\t512\t128500\t1\t3.5\t140\t120\t11\t2"
                 "\t3\t23\t46\t5\t10\t1\t2\t2\t3\t2\t2\t6\t80\t260"
                 "\t1.25\t0.75\t3\t1"),
             std::string::npos);
@@ -370,7 +392,7 @@ TEST(ReconSfmExeTest, WritesRegistrationDiagnosticsForMappingRounds) {
                 "image_id\tattempt\tcandidate_visible_points"
                 "\tcandidate_visible_observations\tcandidate_mean_track_length"),
             std::string::npos);
-  EXPECT_NE(failures.find("9\t2\t64\t96\t1.5\t2\t180\t64200\tNot enough inliers"),
+  EXPECT_NE(failures.find("9\t2\t64\t96\t1.5\t2\t180\t64200\t6\tNot enough inliers"),
             std::string::npos);
 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <filesystem>
 #include <vector>
 
 #include "colite/core/image.h"
@@ -31,6 +32,10 @@ struct MatchingPairGeneratorOptions {
   std::size_t vocab_tree_num_images = 50;
   std::size_t vocab_tree_num_visual_words = 1024;
   std::size_t vocab_tree_max_num_features = 5000;
+  // 可选词树文件。当前支持 COLITE 文本视觉词格式：
+  // COLITE_VOCAB_TREE <version> <descriptor_dim>
+  // 后续每行一个 visual word descriptor。为空时保留轻量临时训练路径。
+  std::filesystem::path vocab_tree_path;
 };
 
 // 按输入图像顺序生成候选图像对。输出中的 ImagePair 始终有序且去重。

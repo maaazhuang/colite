@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "colite/core/version.h"
+#include "colite/exe/compare_colmap.h"
 #include "colite/exe/feature_extractor.h"
 #include "colite/exe/mapper.h"
 #include "colite/exe/recon_mvs.h"
@@ -37,6 +38,8 @@ constexpr Command kCommands[] = {
     {"vocab_tree_matcher", "Retrieve candidate pairs with visual words.",
      &RunVocabTreeMatcher},
     {"mapper", "Run incremental SfM from a file workspace.", &RunMapper},
+    {"compare_colmap", "Write fixed COLMAP text model difference reports.",
+     &RunCompareColmap},
     {"recon_sfm", "Run the compact end-to-end SfM pipeline.", &RunReconSfm},
     {"recon_mvs", "Run the compact MVS pipeline from a sparse model.",
      &RunReconMvs},

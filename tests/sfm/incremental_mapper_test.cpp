@@ -62,6 +62,15 @@ FeatureSet ProjectFeatures(const Camera& camera,
   return features;
 }
 
+FeatureSet PerturbFeatures(FeatureSet features, double amplitude_px) {
+  for (std::size_t i = 0; i < features.keypoints.size(); ++i) {
+    const double sign = (i % 2 == 0) ? 1.0 : -1.0;
+    features.keypoints[i].x += static_cast<float>(sign * amplitude_px);
+    features.keypoints[i].y += static_cast<float>(-sign * amplitude_px * 0.5);
+  }
+  return features;
+}
+
 std::vector<FeatureMatch> IdentityMatches(std::size_t begin, std::size_t end) {
   std::vector<FeatureMatch> matches;
   for (std::size_t i = begin; i < end; ++i) {
@@ -352,6 +361,79 @@ TEST(IncrementalMapperTest, DemotesFailedCandidatesAndStopsAfterTrialLimit) {
   EXPECT_EQ(summary.registrations[0].registration_attempts_before_success, 0U);
   EXPECT_TRUE(reconstruction.IsImageRegistered(4));
   EXPECT_FALSE(reconstruction.IsImageRegistered(3));
+}
+
+TEST(IncrementalMapperTest, RelaxesRegistrationThresholdsAcrossRetries) {
+  const Camera camera = MakeCamera(1);
+  const std::vector<Eigen::Vector3d> points = MakeScenePoints();
+  const Pose3 cam1_from_world = CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0));
+  const Pose3 cam2_from_world = CameraAt(Eigen::Vector3d(1.0, 0.0, 0.0));
+  const Pose3 cam3_from_world = CameraAt(Eigen::Vector3d(0.35, 0.15, 0.0));
+
+  const FeatureSet features1 = ProjectFeatures(camera, cam1_from_world, points);
+  const FeatureSet features2 = ProjectFeatures(camera, cam2_from_world, points);
+  const FeatureSet features3 =
+      PerturbFeatures(ProjectFeatures(camera, cam3_from_world, points), 0.8);
+  const std::vector<FeatureMatch> matches_existing = IdentityMatches(0, 30);
+  const std::vector<FeatureMatch> matches_all = IdentityMatches(0, points.size());
+
+  MatchGraph graph;
+  SetFeatures(&graph, 1, features1);
+  SetFeatures(&graph, 2, features2);
+  SetFeatures(&graph, 3, features3);
+  SetMatches(&graph, 1, 2, matches_existing);
+  SetMatches(&graph, 1, 3, matches_all);
+  SetMatches(&graph, 2, 3, matches_all);
+  SetVerifiedGeometry(&graph, 1, 2,
+                      EstimateGeometry(camera, features1, features2,
+                                       matches_existing));
+  SetVerifiedGeometry(&graph, 1, 3, MakeVerifiedGeometry(matches_all));
+  SetVerifiedGeometry(&graph, 2, 3, MakeVerifiedGeometry(matches_all));
+
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  reconstruction.AddImage(MakeImage(1, 1));
+  reconstruction.AddImage(MakeImage(2, 1));
+  reconstruction.AddImage(MakeImage(3, 1));
+
+  IncrementalInitializerOptions init_options;
+  init_options.min_num_inliers = 20;
+  init_options.min_num_triangulated_points = 20;
+  init_options.min_triangulation_angle_deg = 0.1;
+  init_options.max_reprojection_error_px = 1.0;
+  ASSERT_TRUE(InitializeReconstructionFromPair(graph, ImagePair::Ordered(1, 2),
+                                               init_options, &reconstruction)
+                  .success);
+
+  IncrementalMappingOptions options;
+  options.max_num_registrations = 2;
+  options.max_num_registration_trials_per_image = 2;
+  options.registration_retry_reprojection_error_multiplier = 80.0;
+  options.registration_retry_max_reprojection_error_px = 4.0;
+  options.run_global_track_completion = false;
+  options.run_global_bundle_adjustment = false;
+  options.mapper.registration.min_num_correspondences = 20;
+  options.mapper.registration.min_num_inliers = 20;
+  options.mapper.registration.max_reprojection_error_px = 0.05;
+  options.mapper.triangulation.min_triangulation_angle_deg = 0.1;
+  options.mapper.run_local_bundle_adjustment = false;
+  options.mapper.run_local_retriangulation_filter = false;
+  options.mapper.run_observation_filter = false;
+
+  const IncrementalMappingSummary summary =
+      RunIncrementalMapping(graph, options, &reconstruction);
+
+  ASSERT_EQ(summary.failed_registrations.size(), 1U);
+  EXPECT_EQ(summary.failed_registrations[0].image_id, 3U);
+  EXPECT_EQ(summary.failed_registrations[0].attempt, 1U);
+  EXPECT_DOUBLE_EQ(summary.failed_registrations[0].registration_max_reprojection_error_px,
+                   0.05);
+  ASSERT_EQ(summary.registrations.size(), 1U);
+  EXPECT_EQ(summary.registrations[0].image_id, 3U);
+  EXPECT_EQ(summary.registrations[0].registration_attempts_before_success, 1U);
+  EXPECT_DOUBLE_EQ(summary.registrations[0].registration_max_reprojection_error_px,
+                   4.0);
+  EXPECT_TRUE(reconstruction.IsImageRegistered(3));
 }
 
 TEST(IncrementalMapperTest, SelectsCandidateWithStrongerRegisteredConnectivity) {

@@ -166,6 +166,9 @@ struct PatchMatchStereoSummary {
   std::size_t num_candidate_evaluations = 0;
   std::size_t num_propagation_updates = 0;
   std::size_t num_perturbation_updates = 0;
+  std::size_t num_source_selection_tests = 0;
+  std::size_t num_source_selection_acceptances = 0;
+  std::size_t num_source_selection_rejections = 0;
   double perturbation_total_abs_depth_update = 0.0;
   double perturbation_max_abs_depth_update = 0.0;
   double perturbation_mean_abs_depth_update = 0.0;
@@ -181,6 +184,14 @@ struct PatchMatchStereoSummary {
   std::vector<double> update_ratios;
   std::vector<float> depth_radii;
   std::vector<float> normal_radii_degrees;
+  std::vector<std::size_t> iteration_pyramid_levels;
+  std::vector<std::size_t> iteration_indices;
+  std::vector<std::size_t> iteration_candidate_evaluations;
+  std::vector<std::size_t> iteration_propagation_updates;
+  std::vector<std::size_t> iteration_perturbation_updates;
+  std::vector<std::size_t> iteration_source_selection_tests;
+  std::vector<std::size_t> iteration_source_selection_acceptances;
+  std::vector<std::size_t> iteration_source_selection_rejections;
 };
 
 struct PatchMatchStereoResult {

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <iosfwd>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -22,9 +23,13 @@ struct ReconSfmCliOptions {
   std::size_t nearby_match_window = 2;
   double nearby_match_ratio = 0.9;
   std::size_t max_registration_trials_per_image = 3;
+  std::size_t max_initialization_trials = 3;
+  double registration_retry_reprojection_error_multiplier = 1.5;
+  double registration_retry_max_reprojection_error_px = 8.0;
   bool ba_refine_focal_length = false;
   bool ba_refine_principal_point = false;
   bool ba_refine_extra_params = false;
+  std::set<std::string> ba_refine_params;
 };
 
 int RunReconSfm(const std::vector<std::string>& args,

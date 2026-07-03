@@ -22,6 +22,15 @@ struct TwoViewGeometryOptions {
   // 判定几何关系有效所需的最少内点数。
   int min_num_inliers = 15;
 
+  // E 的内点数需要接近 F 的内点数，才认为标定内参在该图像对上可信。
+  double min_E_F_inlier_ratio = 0.95;
+
+  // H 的内点数接近 E/F 时，认为该图像对更可能是平面或纯旋转退化。
+  double max_H_inlier_ratio = 0.8;
+
+  // 三角化角低于该阈值时，将 H 退化从平面进一步判定为全景/纯旋转。
+  double max_panoramic_triangulation_angle_deg = 0.1;
+
   // 是否同时估计单应矩阵。单应矩阵主要用于后续平面/全景退化判断。
   bool estimate_homography = true;
 };

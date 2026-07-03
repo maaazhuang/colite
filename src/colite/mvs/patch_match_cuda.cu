@@ -75,7 +75,12 @@ struct DeviceCounters {
   unsigned long long candidate_evaluations = 0ULL;
   unsigned long long propagation_updates = 0ULL;
   unsigned long long perturbation_updates = 0ULL;
+  unsigned long long source_selection_tests = 0ULL;
+  unsigned long long source_selection_acceptances = 0ULL;
+  unsigned long long source_selection_rejections = 0ULL;
   double total_abs_depth_update = 0.0;
+  double total_normal_angle_degrees = 0.0;
+  double max_normal_angle_degrees = 0.0;
 };
 
 template <typename T>
@@ -299,6 +304,81 @@ __device__ bool IsFinitePositive(float value) {
   return isfinite(value) && value > 0.0F;
 }
 
+__device__ float3 Add3(float3 lhs, float3 rhs) {
+  return make_float3(lhs.x + rhs.x, lhs.y + rhs.y, lhs.z + rhs.z);
+}
+
+__device__ float3 Scale3(float3 value, float scale) {
+  return make_float3(value.x * scale, value.y * scale, value.z * scale);
+}
+
+__device__ float Dot3(float3 lhs, float3 rhs) {
+  return lhs.x * rhs.x + lhs.y * rhs.y + lhs.z * rhs.z;
+}
+
+__device__ float3 Cross3(float3 lhs, float3 rhs) {
+  return make_float3(lhs.y * rhs.z - lhs.z * rhs.y,
+                     lhs.z * rhs.x - lhs.x * rhs.z,
+                     lhs.x * rhs.y - lhs.y * rhs.x);
+}
+
+__device__ float3 Normalize3(float3 value, float3 fallback) {
+  const float norm = sqrtf(Dot3(value, value));
+  if (!isfinite(norm) || norm <= 1e-8F) {
+    return fallback;
+  }
+  return Scale3(value, 1.0F / norm);
+}
+
+__device__ float AngleDegreesBetween(float3 lhs, float3 rhs) {
+  const float3 lhs_n = Normalize3(lhs, make_float3(0.0F, 0.0F, 1.0F));
+  const float3 rhs_n = Normalize3(rhs, make_float3(0.0F, 0.0F, 1.0F));
+  const float cosine = Clamp(Dot3(lhs_n, rhs_n), -1.0F, 1.0F);
+  constexpr float kRadiansToDegrees = 57.29577951308232F;
+  return acosf(cosine) * kRadiansToDegrees;
+}
+
+__device__ float3 PerturbNormal(float3 normal,
+                                float radius_degrees,
+                                std::uint32_t seed) {
+  const float3 normal_n = Normalize3(normal, make_float3(0.0F, 0.0F, 1.0F));
+  if (radius_degrees <= 0.0F) {
+    return normal_n;
+  }
+  constexpr float kPi = 3.14159265358979323846F;
+  const float radius_radians = radius_degrees * kPi / 180.0F;
+  const float3 helper =
+      fabsf(normal_n.z) < 0.9F ? make_float3(0.0F, 0.0F, 1.0F)
+                               : make_float3(1.0F, 0.0F, 0.0F);
+  const float3 tangent_u =
+      Normalize3(Cross3(helper, normal_n), make_float3(1.0F, 0.0F, 0.0F));
+  const float3 tangent_v = Cross3(normal_n, tangent_u);
+  const float angle =
+      radius_radians * sqrtf(Random01(seed ^ 0xA511E9B3u));
+  const float phi = 2.0F * kPi * Random01(seed ^ 0x63D83595u);
+  const float3 tangent_direction =
+      Add3(Scale3(tangent_u, cosf(phi)), Scale3(tangent_v, sinf(phi)));
+  return Normalize3(Add3(Scale3(normal_n, cosf(angle)),
+                         Scale3(tangent_direction, sinf(angle))),
+                    normal_n);
+}
+
+__device__ void AtomicMaxDouble(double* address, double value) {
+  if (!isfinite(value)) {
+    return;
+  }
+  unsigned long long* address_as_ull =
+      reinterpret_cast<unsigned long long*>(address);
+  unsigned long long old = *address_as_ull;
+  while (value > __longlong_as_double(old)) {
+    const unsigned long long assumed = old;
+    old = atomicCAS(address_as_ull, assumed, __double_as_longlong(value));
+    if (assumed == old) {
+      break;
+    }
+  }
+}
+
 __device__ float SampleLayeredTexture(cudaTextureObject_t texture,
                                       int width,
                                       int height,
@@ -511,15 +591,25 @@ __device__ float ComputeIncidentAnglePenalty(
 __device__ bool ShouldUseSourceForPixel(cudaTextureObject_t poses_texture,
                                         int source_idx,
                                         int col,
-                                        int row) {
+                                        int row,
+                                        DeviceCounters* counters) {
+  if (counters != nullptr) {
+    atomicAdd(&counters->source_selection_tests, 1ULL);
+  }
   constexpr int kBasePoseVariant = 0;
   const float probability =
       ReadPose(poses_texture, source_idx, kBasePoseVariant,
                kPoseSelectionProbabilityOffset);
   if (!isfinite(probability) || probability <= 0.0F) {
+    if (counters != nullptr) {
+      atomicAdd(&counters->source_selection_rejections, 1ULL);
+    }
     return false;
   }
   if (probability >= 0.999F) {
+    if (counters != nullptr) {
+      atomicAdd(&counters->source_selection_acceptances, 1ULL);
+    }
     return true;
   }
   const std::uint32_t seed =
@@ -527,7 +617,13 @@ __device__ bool ShouldUseSourceForPixel(cudaTextureObject_t poses_texture,
       (static_cast<std::uint32_t>(source_idx + 1) * 2246822519u) ^
       (static_cast<std::uint32_t>(row + 1) * 3266489917u) ^
       (static_cast<std::uint32_t>(col + 1) * 668265263u);
-  return Random01(seed) <= probability;
+  const bool accepted = Random01(seed) <= probability;
+  if (counters != nullptr) {
+    atomicAdd(accepted ? &counters->source_selection_acceptances
+                       : &counters->source_selection_rejections,
+              1ULL);
+  }
+  return accepted;
 }
 
 __device__ float ComputeSourceCostForVariant(
@@ -651,8 +747,10 @@ __device__ float ComputeSourceCost(cudaTextureObject_t reference_texture,
                                    int col,
                                    int row,
                                    float depth,
-                                   float3 normal) {
-  if (!ShouldUseSourceForPixel(poses_texture, source_idx, col, row)) {
+                                   float3 normal,
+                                   DeviceCounters* counters) {
+  if (!ShouldUseSourceForPixel(poses_texture, source_idx, col, row,
+                               counters)) {
     return options.cost.invalid_cost;
   }
   float best_cost = options.cost.invalid_cost;
@@ -679,14 +777,15 @@ __device__ bool ComputeAggregatedCost(cudaTextureObject_t reference_texture,
                                       int row,
                                       float depth,
                                       float3 normal,
-                                      float* aggregated_cost) {
+                                      float* aggregated_cost,
+                                      DeviceCounters* counters) {
   float best_costs[kMaxCudaSourceImages];
   int num_valid = 0;
   for (int source_idx = 0; source_idx < options.num_sources; ++source_idx) {
     const float source_cost = ComputeSourceCost(
         reference_texture, source_images_texture, source_depth_maps_texture,
         poses_texture, source_images, options, source_idx, col, row, depth,
-        normal);
+        normal, counters);
     if (!isfinite(source_cost) || source_cost >= options.cost.invalid_cost) {
       continue;
     }
@@ -763,7 +862,7 @@ __global__ void EvaluateCostKernel(cudaTextureObject_t reference_texture,
     ComputeAggregatedCost(reference_texture, source_images_texture,
                           source_depth_maps_texture, poses_texture,
                           source_images, options, col, row, depth, normal,
-                          &cost);
+                          &cost, nullptr);
   }
   cost_map[idx] = cost;
 }
@@ -802,7 +901,7 @@ __device__ void TryUpdateFromNeighbor(cudaTextureObject_t reference_texture,
                              source_depth_maps_texture, poses_texture,
                              source_images, options, col, row,
                              candidate_depth, candidate_normal,
-                             &candidate_cost)) {
+                             &candidate_cost, counters)) {
     return;
   }
   const float current_cost = cost_map[idx];
@@ -876,6 +975,7 @@ __global__ void PerturbationKernel(cudaTextureObject_t reference_texture,
                                    DevicePatchMatchOptions options,
                                    std::uint32_t seed,
                                    float depth_radius,
+                                   float normal_radius_degrees,
                                    int num_samples,
                                    DeviceCounters* counters) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -890,9 +990,12 @@ __global__ void PerturbationKernel(cudaTextureObject_t reference_texture,
     return;
   }
   const float3 current_normal =
-      make_float3(normal_map[idx * 3 + 0], normal_map[idx * 3 + 1],
-                  normal_map[idx * 3 + 2]);
+      Normalize3(make_float3(normal_map[idx * 3 + 0],
+                             normal_map[idx * 3 + 1],
+                             normal_map[idx * 3 + 2]),
+                 make_float3(0.0F, 0.0F, 1.0F));
   float best_depth = current_depth;
+  float3 best_normal = current_normal;
   float best_cost = cost_map[idx];
   bool updated = false;
   for (int sample_idx = 0; sample_idx < num_samples; ++sample_idx) {
@@ -903,27 +1006,39 @@ __global__ void PerturbationKernel(cudaTextureObject_t reference_texture,
     const float candidate_depth =
         Clamp(current_depth + unit * depth_radius, options.depth_min,
               options.depth_max);
+    const float3 candidate_normal = PerturbNormal(
+        current_normal, normal_radius_degrees,
+        seed + static_cast<std::uint32_t>(idx) * 131u +
+            static_cast<std::uint32_t>(sample_idx) * 977u);
     atomicAdd(&counters->candidate_evaluations, 1ULL);
     float candidate_cost = options.cost.invalid_cost;
     if (!ComputeAggregatedCost(reference_texture, source_images_texture,
                                source_depth_maps_texture, poses_texture,
                                source_images, options, col, row,
-                               candidate_depth, current_normal,
-                               &candidate_cost)) {
+                               candidate_depth, candidate_normal,
+                               &candidate_cost, counters)) {
       continue;
     }
     if (candidate_cost < best_cost) {
       best_cost = candidate_cost;
       best_depth = candidate_depth;
+      best_normal = candidate_normal;
       updated = true;
     }
   }
   if (updated) {
     depth_map[idx] = best_depth;
+    normal_map[idx * 3 + 0] = best_normal.x;
+    normal_map[idx * 3 + 1] = best_normal.y;
+    normal_map[idx * 3 + 2] = best_normal.z;
     cost_map[idx] = best_cost;
     atomicAdd(&counters->perturbation_updates, 1ULL);
     atomicAdd(&counters->total_abs_depth_update,
               static_cast<double>(fabsf(best_depth - current_depth)));
+    const double normal_angle =
+        static_cast<double>(AngleDegreesBetween(current_normal, best_normal));
+    atomicAdd(&counters->total_normal_angle_degrees, normal_angle);
+    AtomicMaxDouble(&counters->max_normal_angle_degrees, normal_angle);
   }
 }
 
@@ -1320,6 +1435,11 @@ void AccumulateCudaSummary(PatchMatchStereoSummary* accumulated,
   accumulated->num_candidate_evaluations += level.num_candidate_evaluations;
   accumulated->num_propagation_updates += level.num_propagation_updates;
   accumulated->num_perturbation_updates += level.num_perturbation_updates;
+  accumulated->num_source_selection_tests += level.num_source_selection_tests;
+  accumulated->num_source_selection_acceptances +=
+      level.num_source_selection_acceptances;
+  accumulated->num_source_selection_rejections +=
+      level.num_source_selection_rejections;
   accumulated->perturbation_total_abs_depth_update +=
       level.perturbation_total_abs_depth_update;
   accumulated->perturbation_max_abs_depth_update =
@@ -1348,6 +1468,37 @@ void AccumulateCudaSummary(PatchMatchStereoSummary* accumulated,
   accumulated->normal_radii_degrees.insert(
       accumulated->normal_radii_degrees.end(),
       level.normal_radii_degrees.begin(), level.normal_radii_degrees.end());
+  accumulated->iteration_pyramid_levels.insert(
+      accumulated->iteration_pyramid_levels.end(),
+      level.iteration_pyramid_levels.begin(),
+      level.iteration_pyramid_levels.end());
+  accumulated->iteration_indices.insert(
+      accumulated->iteration_indices.end(), level.iteration_indices.begin(),
+      level.iteration_indices.end());
+  accumulated->iteration_candidate_evaluations.insert(
+      accumulated->iteration_candidate_evaluations.end(),
+      level.iteration_candidate_evaluations.begin(),
+      level.iteration_candidate_evaluations.end());
+  accumulated->iteration_propagation_updates.insert(
+      accumulated->iteration_propagation_updates.end(),
+      level.iteration_propagation_updates.begin(),
+      level.iteration_propagation_updates.end());
+  accumulated->iteration_perturbation_updates.insert(
+      accumulated->iteration_perturbation_updates.end(),
+      level.iteration_perturbation_updates.begin(),
+      level.iteration_perturbation_updates.end());
+  accumulated->iteration_source_selection_tests.insert(
+      accumulated->iteration_source_selection_tests.end(),
+      level.iteration_source_selection_tests.begin(),
+      level.iteration_source_selection_tests.end());
+  accumulated->iteration_source_selection_acceptances.insert(
+      accumulated->iteration_source_selection_acceptances.end(),
+      level.iteration_source_selection_acceptances.begin(),
+      level.iteration_source_selection_acceptances.end());
+  accumulated->iteration_source_selection_rejections.insert(
+      accumulated->iteration_source_selection_rejections.end(),
+      level.iteration_source_selection_rejections.begin(),
+      level.iteration_source_selection_rejections.end());
 }
 
 std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
@@ -1466,8 +1617,6 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
     DeviceBuffer<DeviceCounters> d_counters(1);
 
     d_source_images_info.CopyFromHost(source_images_info);
-    d_counters.CopyFromHostValue(DeviceCounters{});
-
     Eigen::Vector3f default_normal =
         request.options.initialization.default_normal.squaredNorm() > 0.0F
             ? request.options.initialization.default_normal.normalized()
@@ -1499,8 +1648,15 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
     float depth_radius = (request.depth_max - request.depth_min) *
                          request.options.initial_depth_perturbation_factor;
     float normal_radius = request.options.perturbation.normal_radius_degrees;
+    std::vector<DeviceCounters> iteration_counters;
+    std::vector<float> iteration_depth_radii;
+    std::vector<float> iteration_normal_radii;
+    iteration_counters.reserve(request.options.num_iterations);
+    iteration_depth_radii.reserve(request.options.num_iterations);
+    iteration_normal_radii.reserve(request.options.num_iterations);
     for (std::size_t iteration = 0; iteration < request.options.num_iterations;
          ++iteration) {
+      d_counters.CopyFromHostValue(DeviceCounters{});
       const auto run_direction = [&](int direction) {
         PropagationKernel<<<blocks, kThreadsPerBlock>>>(
             reference_texture.get(), source_images_texture.get(),
@@ -1527,6 +1683,8 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
 
       const float perturb_depth_radius =
           std::max(request.options.min_depth_perturbation, depth_radius);
+      const float perturb_normal_radius =
+          std::max(request.options.min_normal_radius_degrees, normal_radius);
       PerturbationKernel<<<blocks, kThreadsPerBlock>>>(
           reference_texture.get(), source_images_texture.get(),
           use_source_depth_maps ? source_depth_maps_texture.get() : 0,
@@ -1535,9 +1693,15 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
           request.options.perturbation.random_seed +
               static_cast<std::uint32_t>(iteration),
           perturb_depth_radius,
+          perturb_normal_radius,
           static_cast<int>(request.options.perturbation.num_samples_per_pixel),
           d_counters.get());
       CudaCheck(cudaGetLastError());
+
+      CudaCheck(cudaDeviceSynchronize());
+      iteration_counters.push_back(d_counters.CopyScalarToHost());
+      iteration_depth_radii.push_back(perturb_depth_radius);
+      iteration_normal_radii.push_back(perturb_normal_radius);
 
       depth_radius *= request.options.perturbation_shrink;
       normal_radius *= request.options.perturbation_shrink;
@@ -1548,7 +1712,6 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
     const std::vector<float> depth_values = d_depth_map.CopyToHost();
     const std::vector<float> normal_values = d_normal_map.CopyToHost();
     const std::vector<float> cost_values = d_cost_map.CopyToHost();
-    const DeviceCounters counters = d_counters.CopyScalarToHost();
 
     PatchMatchStereoResult result;
     result.depth_map =
@@ -1596,18 +1759,63 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
         break;
     }
     result.summary.num_perturbation_passes = request.options.num_iterations;
-    result.summary.num_candidate_evaluations =
-        static_cast<std::size_t>(counters.candidate_evaluations);
-    result.summary.num_propagation_updates =
-        static_cast<std::size_t>(counters.propagation_updates);
-    result.summary.num_perturbation_updates =
-        static_cast<std::size_t>(counters.perturbation_updates);
-    result.summary.perturbation_total_abs_depth_update =
-        counters.total_abs_depth_update;
-    if (counters.perturbation_updates > 0) {
+    for (std::size_t iteration = 0; iteration < iteration_counters.size();
+         ++iteration) {
+      const DeviceCounters& counters = iteration_counters[iteration];
+      const std::size_t candidate_evaluations =
+          static_cast<std::size_t>(counters.candidate_evaluations);
+      const std::size_t propagation_updates =
+          static_cast<std::size_t>(counters.propagation_updates);
+      const std::size_t perturbation_updates =
+          static_cast<std::size_t>(counters.perturbation_updates);
+      result.summary.num_candidate_evaluations += candidate_evaluations;
+      result.summary.num_propagation_updates += propagation_updates;
+      result.summary.num_perturbation_updates += perturbation_updates;
+      result.summary.num_source_selection_tests +=
+          static_cast<std::size_t>(counters.source_selection_tests);
+      result.summary.num_source_selection_acceptances +=
+          static_cast<std::size_t>(counters.source_selection_acceptances);
+      result.summary.num_source_selection_rejections +=
+          static_cast<std::size_t>(counters.source_selection_rejections);
+      result.summary.perturbation_total_abs_depth_update +=
+          counters.total_abs_depth_update;
+      result.summary.perturbation_total_normal_angle_degrees +=
+          counters.total_normal_angle_degrees;
+      result.summary.perturbation_max_normal_angle_degrees =
+          std::max(result.summary.perturbation_max_normal_angle_degrees,
+                   counters.max_normal_angle_degrees);
+      result.summary.iteration_pyramid_levels.push_back(0);
+      result.summary.iteration_indices.push_back(iteration);
+      result.summary.iteration_candidate_evaluations.push_back(
+          candidate_evaluations);
+      result.summary.iteration_propagation_updates.push_back(
+          propagation_updates);
+      result.summary.iteration_perturbation_updates.push_back(
+          perturbation_updates);
+      result.summary.iteration_source_selection_tests.push_back(
+          static_cast<std::size_t>(counters.source_selection_tests));
+      result.summary.iteration_source_selection_acceptances.push_back(
+          static_cast<std::size_t>(counters.source_selection_acceptances));
+      result.summary.iteration_source_selection_rejections.push_back(
+          static_cast<std::size_t>(counters.source_selection_rejections));
+      const std::size_t total_updates =
+          propagation_updates + perturbation_updates;
+      result.summary.update_ratios.push_back(
+          candidate_evaluations == 0
+              ? 0.0
+              : static_cast<double>(total_updates) /
+                    static_cast<double>(candidate_evaluations));
+      result.summary.depth_radii.push_back(iteration_depth_radii[iteration]);
+      result.summary.normal_radii_degrees.push_back(
+          iteration_normal_radii[iteration]);
+    }
+    if (result.summary.num_perturbation_updates > 0) {
       result.summary.perturbation_mean_abs_depth_update =
-          counters.total_abs_depth_update /
-          static_cast<double>(counters.perturbation_updates);
+          result.summary.perturbation_total_abs_depth_update /
+          static_cast<double>(result.summary.num_perturbation_updates);
+      result.summary.perturbation_mean_normal_angle_degrees =
+          result.summary.perturbation_total_normal_angle_degrees /
+          static_cast<double>(result.summary.num_perturbation_updates);
     }
     if (request.options.normal_refinement.enabled) {
       const PatchMatchNormalRefinementSummary refinement_summary =
@@ -1769,6 +1977,9 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereo(
       if (!level_result.has_value()) {
         return std::nullopt;
       }
+      std::fill(level_result->summary.iteration_pyramid_levels.begin(),
+                level_result->summary.iteration_pyramid_levels.end(),
+                level_idx);
       AccumulateCudaSummary(&accumulated_summary, level_result->summary);
       prior_maps.depth_map = level_result->depth_map;
       prior_maps.normal_map = level_result->normal_map;

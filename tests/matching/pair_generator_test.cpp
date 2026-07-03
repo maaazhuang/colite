@@ -1,3 +1,5 @@
+#include <filesystem>
+#include <fstream>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -105,6 +107,35 @@ TEST(MatchingPairGeneratorTest, VocabTreeRetrievesMostSimilarImages) {
   options.strategy = MatchingStrategy::kVocabTree;
   options.vocab_tree_num_images = 1;
   options.vocab_tree_num_visual_words = 2;
+
+  const std::vector<ImagePair> pairs =
+      GenerateMatchingPairs(images, graph, options);
+
+  EXPECT_EQ(MakePairsTextFriendly(pairs),
+            (std::vector<ImagePair>{{1, 2}, {3, 4}}));
+}
+
+TEST(MatchingPairGeneratorTest, VocabTreeLoadsVisualWordsFromFile) {
+  std::vector<Image> images = MakeImages(4);
+  MatchGraph graph;
+  SetFeatures(&graph, 1, MakeOneClusterFeatures(1.0F, 0.0F));
+  SetFeatures(&graph, 2, MakeOneClusterFeatures(0.95F, 0.05F));
+  SetFeatures(&graph, 3, MakeOneClusterFeatures(0.0F, 1.0F));
+  SetFeatures(&graph, 4, MakeOneClusterFeatures(0.05F, 0.95F));
+
+  const std::filesystem::path vocab_path =
+      std::filesystem::temp_directory_path() / "colite_test_vocab_tree.txt";
+  std::ofstream vocab_file(vocab_path);
+  vocab_file << "COLITE_VOCAB_TREE 1 4\n"
+             << "1 0 0 0\n"
+             << "0 1 0 0\n";
+  vocab_file.close();
+
+  MatchingPairGeneratorOptions options;
+  options.strategy = MatchingStrategy::kVocabTree;
+  options.vocab_tree_num_images = 1;
+  options.vocab_tree_num_visual_words = 1;
+  options.vocab_tree_path = vocab_path;
 
   const std::vector<ImagePair> pairs =
       GenerateMatchingPairs(images, graph, options);

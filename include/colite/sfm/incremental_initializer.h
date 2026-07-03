@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "colite/core/match_graph.h"
 #include "colite/core/reconstruction.h"
@@ -16,11 +17,16 @@ struct IncrementalInitializerOptions {
   std::size_t min_num_triangulated_points = 15;
   double min_triangulation_angle_deg = 0.5;
   double max_reprojection_error_px = 4.0;
+  // 最多尝试多少个候选初始图像对。用于跳过高分但实际无法三角化的坏 pair，
+  // 更接近 COLMAP 在多候选/多模型初始化中的保守回退行为。
+  std::size_t max_num_initialization_trials = 3;
 };
 
 struct IncrementalInitializerSummary {
   bool success = false;
   ImagePair initial_pair;
+  std::size_t num_initialization_attempts = 0;
+  std::vector<ImagePair> attempted_initial_pairs;
   std::size_t num_triangulated_points = 0;
   std::string message;
 };

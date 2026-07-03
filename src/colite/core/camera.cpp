@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace colite {
@@ -59,7 +60,7 @@ const std::vector<CameraModelSpec>& CameraModelSpecs() {
        Indices{2, 3},
        Indices{4, 5, 6, 7},
        true,
-       false},
+       true},
       {CameraModelId::kFullOpenCV,
        "FULL_OPENCV",
        Names{"fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6"},
@@ -67,7 +68,7 @@ const std::vector<CameraModelSpec>& CameraModelSpecs() {
        Indices{2, 3},
        Indices{4, 5, 6, 7, 8, 9, 10, 11},
        false,
-       false},
+       true},
       {CameraModelId::kFOV,
        "FOV",
        Names{"fx", "fy", "cx", "cy", "omega"},
@@ -75,7 +76,7 @@ const std::vector<CameraModelSpec>& CameraModelSpecs() {
        Indices{2, 3},
        Indices{4},
        false,
-       false},
+       true},
       {CameraModelId::kSimpleRadialFisheye,
        "SIMPLE_RADIAL_FISHEYE",
        Names{"f", "cx", "cy", "k1"},
@@ -83,7 +84,7 @@ const std::vector<CameraModelSpec>& CameraModelSpecs() {
        Indices{1, 2},
        Indices{3},
        true,
-       false},
+       true},
       {CameraModelId::kRadialFisheye,
        "RADIAL_FISHEYE",
        Names{"f", "cx", "cy", "k1", "k2"},
@@ -91,7 +92,7 @@ const std::vector<CameraModelSpec>& CameraModelSpecs() {
        Indices{1, 2},
        Indices{3, 4},
        true,
-       false},
+       true},
       {CameraModelId::kThinPrismFisheye,
        "THIN_PRISM_FISHEYE",
        Names{"fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3", "k4", "sx1", "sy1"},
@@ -99,7 +100,7 @@ const std::vector<CameraModelSpec>& CameraModelSpecs() {
        Indices{2, 3},
        Indices{4, 5, 6, 7, 8, 9, 10, 11},
        true,
-       false},
+       true},
       {CameraModelId::kRadTanThinPrismFisheye,
        "RAD_TAN_THIN_PRISM_FISHEYE",
        Names{"fx", "fy", "cx", "cy", "k0", "k1", "k2", "k3", "k4", "k5", "p0", "p1", "s0", "s1", "s2", "s3"},
@@ -107,7 +108,7 @@ const std::vector<CameraModelSpec>& CameraModelSpecs() {
        Indices{2, 3},
        Indices{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
        true,
-       false},
+       true},
   };
   return specs;
 }
@@ -145,6 +146,116 @@ Eigen::Vector2d DistortOpenCV(const Eigen::Vector2d& normalized,
   const double radial = 1.0 + k1 * radius2 + k2 * radius2 * radius2;
   return {x * radial + 2.0 * p1 * xy + p2 * (radius2 + 2.0 * x2),
           y * radial + p1 * (radius2 + 2.0 * y2) + 2.0 * p2 * xy};
+}
+
+Eigen::Vector2d DistortFullOpenCV(const Eigen::Vector2d& normalized,
+                                  const double* extra_params) {
+  const double u = normalized.x();
+  const double v = normalized.y();
+  const double u2 = u * u;
+  const double uv = u * v;
+  const double v2 = v * v;
+  const double r2 = u2 + v2;
+  const double r4 = r2 * r2;
+  const double r6 = r4 * r2;
+  const double radial =
+      (1.0 + extra_params[0] * r2 + extra_params[1] * r4 +
+       extra_params[4] * r6) /
+      (1.0 + extra_params[5] * r2 + extra_params[6] * r4 +
+       extra_params[7] * r6);
+  return {u * radial + 2.0 * extra_params[2] * uv +
+              extra_params[3] * (r2 + 2.0 * u2),
+          v * radial + 2.0 * extra_params[3] * uv +
+              extra_params[2] * (r2 + 2.0 * v2)};
+}
+
+Eigen::Vector2d DistortFov(const Eigen::Vector2d& normalized, double omega) {
+  constexpr double kEpsilon = 1e-4;
+  const double radius2 = normalized.squaredNorm();
+  const double omega2 = omega * omega;
+  double factor = 1.0;
+  if (omega2 < kEpsilon) {
+    factor = (omega2 * radius2) / 3.0 - omega2 / 12.0 + 1.0;
+  } else if (radius2 < kEpsilon) {
+    const double tan_half_omega = std::tan(omega / 2.0);
+    factor =
+        (-2.0 * tan_half_omega *
+         (4.0 * radius2 * tan_half_omega * tan_half_omega - 3.0)) /
+        (3.0 * omega);
+  } else {
+    const double radius = std::sqrt(radius2);
+    factor =
+        std::atan(radius * 2.0 * std::tan(omega / 2.0)) / (radius * omega);
+  }
+  return normalized * factor;
+}
+
+Eigen::Vector2d FisheyeFromNormal(const Eigen::Vector2d& normalized) {
+  const double radius = normalized.norm();
+  if (radius <= std::numeric_limits<double>::epsilon()) {
+    return normalized;
+  }
+  return normalized * (std::atan(radius) / radius);
+}
+
+Eigen::Vector2d DistortRadialFisheye(const Eigen::Vector2d& fisheye,
+                                     const double* extra_params,
+                                     std::size_t num_params) {
+  const double theta2 = fisheye.squaredNorm();
+  double theta_power = theta2;
+  double radial = 0.0;
+  for (std::size_t idx = 0; idx < num_params; ++idx) {
+    radial += extra_params[idx] * theta_power;
+    theta_power *= theta2;
+  }
+  return fisheye * (1.0 + radial);
+}
+
+Eigen::Vector2d DistortThinPrismFisheye(const Eigen::Vector2d& fisheye,
+                                        const double* extra_params) {
+  const double u = fisheye.x();
+  const double v = fisheye.y();
+  const double u2 = u * u;
+  const double uv = u * v;
+  const double v2 = v * v;
+  const double r2 = u2 + v2;
+  const double r4 = r2 * r2;
+  const double r6 = r4 * r2;
+  const double r8 = r6 * r2;
+  const double radial = extra_params[0] * r2 + extra_params[1] * r4 +
+                        extra_params[4] * r6 + extra_params[5] * r8;
+  return {u + u * radial + 2.0 * extra_params[2] * uv +
+              extra_params[3] * (r2 + 2.0 * u2) + extra_params[6] * r2,
+          v + v * radial + 2.0 * extra_params[3] * uv +
+              extra_params[2] * (r2 + 2.0 * v2) + extra_params[7] * r2};
+}
+
+Eigen::Vector2d DistortRadTanThinPrismFisheye(
+    const Eigen::Vector2d& fisheye,
+    const double* extra_params) {
+  constexpr int kNumRadial = 6;
+  const double theta2 = fisheye.squaredNorm();
+  double theta_power = 1.0;
+  double theta_radial = 1.0;
+  for (int idx = 0; idx < kNumRadial; ++idx) {
+    theta_power *= theta2;
+    theta_radial += extra_params[idx] * theta_power;
+  }
+
+  const double x = theta_radial * fisheye.x();
+  const double y = theta_radial * fisheye.y();
+  const double x2 = x * x;
+  const double y2 = y * y;
+  const double xy = x * y;
+  const double r2 = x2 + y2;
+  const double r4 = r2 * r2;
+  const double dx_tang = 2.0 * extra_params[7] * xy +
+                         extra_params[6] * (r2 + 2.0 * x2);
+  const double dy_tang = 2.0 * extra_params[6] * xy +
+                         extra_params[7] * (r2 + 2.0 * y2);
+  const double dx_tp = extra_params[8] * r2 + extra_params[9] * r4;
+  const double dy_tp = extra_params[10] * r2 + extra_params[11] * r4;
+  return {x + dx_tang + dx_tp, y + dy_tang + dy_tp};
 }
 
 template <typename DistortFunc>
@@ -297,10 +408,123 @@ std::vector<std::size_t> CameraParameterIndicesForGroups(
   return indices;
 }
 
+std::vector<std::size_t> CameraParameterIndicesForMask(
+    CameraModelId model_id,
+    const CameraParameterRefinementMask& mask) {
+  const CameraModelSpec& spec = GetCameraModelSpec(model_id);
+  std::set<std::size_t> index_set;
+  for (const std::size_t idx :
+       CameraParameterIndicesForGroups(model_id, mask.groups)) {
+    index_set.insert(idx);
+  }
+
+  for (const std::string& name : mask.parameter_names) {
+    const auto it =
+        std::find(spec.param_names.begin(), spec.param_names.end(), name);
+    if (it == spec.param_names.end()) {
+      throw std::invalid_argument("Unknown camera parameter name: " + name);
+    }
+    index_set.insert(static_cast<std::size_t>(
+        std::distance(spec.param_names.begin(), it)));
+  }
+
+  return {index_set.begin(), index_set.end()};
+}
+
 Eigen::Vector2d ApplySimpleRadialDistortion(const Eigen::Vector2d& normalized,
                                             double k1) {
   const double radius2 = normalized.squaredNorm();
   return normalized * (1.0 + k1 * radius2);
+}
+
+bool ProjectPointWithCameraParams(CameraModelId model_id,
+                                  const double* params,
+                                  const Eigen::Vector3d& point_camera,
+                                  Eigen::Vector2d* projected) {
+  if (params == nullptr || projected == nullptr || point_camera.z() <= 0.0 ||
+      !CameraModelProjectionImplemented(model_id)) {
+    return false;
+  }
+
+  const double x = point_camera.x() / point_camera.z();
+  const double y = point_camera.y() / point_camera.z();
+  const Eigen::Vector2d normalized(x, y);
+
+  if (model_id == CameraModelId::kSimplePinhole) {
+    *projected = {params[0] * x + params[1], params[0] * y + params[2]};
+    return true;
+  }
+  if (model_id == CameraModelId::kPinhole) {
+    *projected = {params[0] * x + params[2], params[1] * y + params[3]};
+    return true;
+  }
+  if (model_id == CameraModelId::kSimpleRadial) {
+    const Eigen::Vector2d distorted =
+        ApplySimpleRadialDistortion(normalized, params[3]);
+    *projected = {params[0] * distorted.x() + params[1],
+                  params[0] * distorted.y() + params[2]};
+    return true;
+  }
+  if (model_id == CameraModelId::kRadial) {
+    const Eigen::Vector2d distorted = DistortRadial(normalized, params[3],
+                                                   params[4]);
+    *projected = {params[0] * distorted.x() + params[1],
+                  params[0] * distorted.y() + params[2]};
+    return true;
+  }
+  if (model_id == CameraModelId::kOpenCV) {
+    const Eigen::Vector2d distorted =
+        DistortOpenCV(normalized, params[4], params[5], params[6], params[7]);
+    *projected = {params[0] * distorted.x() + params[2],
+                  params[1] * distorted.y() + params[3]};
+    return true;
+  }
+  if (model_id == CameraModelId::kFullOpenCV) {
+    const Eigen::Vector2d distorted = DistortFullOpenCV(normalized, &params[4]);
+    *projected = {params[0] * distorted.x() + params[2],
+                  params[1] * distorted.y() + params[3]};
+    return true;
+  }
+  if (model_id == CameraModelId::kFOV) {
+    const Eigen::Vector2d distorted = DistortFov(normalized, params[4]);
+    *projected = {params[0] * distorted.x() + params[2],
+                  params[1] * distorted.y() + params[3]};
+    return true;
+  }
+
+  const Eigen::Vector2d fisheye = FisheyeFromNormal(normalized);
+  Eigen::Vector2d distorted = fisheye;
+  if (model_id == CameraModelId::kSimpleRadialFisheye) {
+    distorted = DistortRadialFisheye(fisheye, &params[3], 1);
+    *projected = {params[0] * distorted.x() + params[1],
+                  params[0] * distorted.y() + params[2]};
+    return true;
+  }
+  if (model_id == CameraModelId::kRadialFisheye) {
+    distorted = DistortRadialFisheye(fisheye, &params[3], 2);
+    *projected = {params[0] * distorted.x() + params[1],
+                  params[0] * distorted.y() + params[2]};
+    return true;
+  }
+  if (model_id == CameraModelId::kOpenCVFisheye) {
+    distorted = DistortRadialFisheye(fisheye, &params[4], 4);
+    *projected = {params[0] * distorted.x() + params[2],
+                  params[1] * distorted.y() + params[3]};
+    return true;
+  }
+  if (model_id == CameraModelId::kThinPrismFisheye) {
+    distorted = DistortThinPrismFisheye(fisheye, &params[4]);
+    *projected = {params[0] * distorted.x() + params[2],
+                  params[1] * distorted.y() + params[3]};
+    return true;
+  }
+  if (model_id == CameraModelId::kRadTanThinPrismFisheye) {
+    distorted = DistortRadTanThinPrismFisheye(fisheye, &params[4]);
+    *projected = {params[0] * distorted.x() + params[2],
+                  params[1] * distorted.y() + params[3]};
+    return true;
+  }
+  return false;
 }
 
 Eigen::Vector2d ProjectPoint(const Camera& camera,
@@ -308,54 +532,10 @@ Eigen::Vector2d ProjectPoint(const Camera& camera,
   RequireValidParams(camera);
   RequirePositiveDepth(point_camera);
 
-  if (camera.model_id == CameraModelId::kPinhole) {
-    const double fx = camera.params[0];
-    const double fy = camera.params[1];
-    const double cx = camera.params[2];
-    const double cy = camera.params[3];
-    return {fx * point_camera.x() / point_camera.z() + cx,
-            fy * point_camera.y() / point_camera.z() + cy};
-  }
-
-  if (camera.model_id == CameraModelId::kSimplePinhole) {
-    const double f = camera.params[0];
-    const double cx = camera.params[1];
-    const double cy = camera.params[2];
-    return {f * point_camera.x() / point_camera.z() + cx,
-            f * point_camera.y() / point_camera.z() + cy};
-  }
-
-  if (camera.model_id == CameraModelId::kSimpleRadial) {
-    const double f = camera.params[0];
-    const double cx = camera.params[1];
-    const double cy = camera.params[2];
-    const double k1 = camera.params[3];
-    const Eigen::Vector2d normalized(point_camera.x() / point_camera.z(),
-                                     point_camera.y() / point_camera.z());
-    const Eigen::Vector2d distorted =
-        ApplySimpleRadialDistortion(normalized, k1);
-    return {f * distorted.x() + cx, f * distorted.y() + cy};
-  }
-
-  if (camera.model_id == CameraModelId::kRadial) {
-    const double f = camera.params[0];
-    const double cx = camera.params[1];
-    const double cy = camera.params[2];
-    const Eigen::Vector2d normalized(point_camera.x() / point_camera.z(),
-                                     point_camera.y() / point_camera.z());
-    const Eigen::Vector2d distorted =
-        DistortRadial(normalized, camera.params[3], camera.params[4]);
-    return {f * distorted.x() + cx, f * distorted.y() + cy};
-  }
-
-  if (camera.model_id == CameraModelId::kOpenCV) {
-    const Eigen::Vector2d normalized(point_camera.x() / point_camera.z(),
-                                     point_camera.y() / point_camera.z());
-    const Eigen::Vector2d distorted =
-        DistortOpenCV(normalized, camera.params[4], camera.params[5],
-                      camera.params[6], camera.params[7]);
-    return {camera.params[0] * distorted.x() + camera.params[2],
-            camera.params[1] * distorted.y() + camera.params[3]};
+  Eigen::Vector2d projected;
+  if (ProjectPointWithCameraParams(camera.model_id, camera.params.data(),
+                                   point_camera, &projected)) {
+    return projected;
   }
 
   throw std::domain_error("Projection is not implemented for this model.");

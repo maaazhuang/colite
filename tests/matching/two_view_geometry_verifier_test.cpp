@@ -1,7 +1,8 @@
 #include "colite/matching/two_view_geometry_verifier.h"
 
-#include <vector>
+#include <cmath>
 #include <stdexcept>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -24,6 +25,14 @@ Pose3 CameraAt(const Eigen::Vector3d& center_world) {
   Pose3 pose;
   pose.q_cw = Eigen::Quaterniond::Identity();
   pose.t_cw = -center_world;
+  return pose;
+}
+
+Pose3 CameraAt(const Eigen::Vector3d& center_world,
+               const Eigen::Matrix3d& cam_from_world) {
+  Pose3 pose;
+  pose.q_cw = Eigen::Quaterniond(cam_from_world).normalized();
+  pose.t_cw = -cam_from_world * center_world;
   return pose;
 }
 
@@ -81,6 +90,72 @@ TEST(TwoViewGeometryVerifierTest, RecoversCalibratedGeometryFromInlierMatches) {
   EXPECT_GT(geometry.E.norm(), 0.0);
   EXPECT_GT(geometry.F.norm(), 0.0);
   EXPECT_GT(geometry.median_triangulation_angle, 0.0);
+}
+
+TEST(TwoViewGeometryVerifierTest, ClassifiesPlanarSceneAsHomography) {
+  const Camera camera = MakeCamera();
+  const Pose3 cam1_from_world = CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0));
+  const Pose3 cam2_from_world = CameraAt(Eigen::Vector3d(0.8, 0.0, 0.0));
+
+  FeatureSet features1;
+  FeatureSet features2;
+  std::vector<FeatureMatch> matches;
+  for (int y = 0; y < 5; ++y) {
+    for (int x = 0; x < 6; ++x) {
+      const Eigen::Vector3d point_world(-1.2 + 0.45 * x, -0.7 + 0.35 * y,
+                                        4.5);
+      AppendProjectedPoint(camera, cam1_from_world, cam2_from_world,
+                           point_world, &features1, &features2, &matches);
+    }
+  }
+
+  TwoViewGeometryOptions options;
+  options.max_error_px = 1.0;
+  options.min_num_inliers = 20;
+
+  const TwoViewGeometry geometry =
+      EstimateTwoViewGeometry(camera, features1, camera, features2, matches,
+                              options);
+
+  EXPECT_EQ(geometry.type, TwoViewGeometry::Type::kPlanarHomography);
+  EXPECT_GE(geometry.inlier_matches.size(), 20U);
+  EXPECT_GT(geometry.H.norm(), 0.0);
+  EXPECT_GT(geometry.median_triangulation_angle, 0.0);
+}
+
+TEST(TwoViewGeometryVerifierTest, ClassifiesPureRotationAsPanoramic) {
+  const Camera camera = MakeCamera();
+  const Pose3 cam1_from_world = CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0));
+  const double angle_rad = 8.0 * M_PI / 180.0;
+  const Eigen::Matrix3d rotation =
+      Eigen::AngleAxisd(angle_rad, Eigen::Vector3d::UnitY()).toRotationMatrix();
+  const Pose3 cam2_from_world =
+      CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0), rotation);
+
+  FeatureSet features1;
+  FeatureSet features2;
+  std::vector<FeatureMatch> matches;
+  for (int y = 0; y < 5; ++y) {
+    for (int x = 0; x < 6; ++x) {
+      const Eigen::Vector3d point_world(-1.0 + 0.4 * x, -0.6 + 0.3 * y,
+                                        5.0 + 0.2 * x + 0.15 * y);
+      AppendProjectedPoint(camera, cam1_from_world, cam2_from_world,
+                           point_world, &features1, &features2, &matches);
+    }
+  }
+
+  TwoViewGeometryOptions options;
+  options.max_error_px = 1.0;
+  options.min_num_inliers = 20;
+
+  const TwoViewGeometry geometry =
+      EstimateTwoViewGeometry(camera, features1, camera, features2, matches,
+                              options);
+
+  EXPECT_EQ(geometry.type, TwoViewGeometry::Type::kPanoramic);
+  EXPECT_GE(geometry.inlier_matches.size(), 20U);
+  EXPECT_GT(geometry.H.norm(), 0.0);
+  EXPECT_EQ(geometry.median_triangulation_angle, 0.0);
 }
 
 TEST(TwoViewGeometryVerifierTest, ReturnsDegenerateWhenMatchesAreInsufficient) {

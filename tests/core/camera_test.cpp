@@ -1,6 +1,9 @@
 #include "colite/core/camera.h"
 
+#include <cmath>
+#include <set>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -58,11 +61,22 @@ TEST(CameraModelTest, RegistersCompleteModelFamily) {
 }
 
 TEST(CameraModelTest, TracksProjectionImplementationState) {
-  EXPECT_TRUE(CameraModelProjectionImplemented(CameraModelId::kSimplePinhole));
-  EXPECT_TRUE(CameraModelProjectionImplemented(CameraModelId::kPinhole));
-  EXPECT_TRUE(CameraModelProjectionImplemented(CameraModelId::kSimpleRadial));
-  EXPECT_TRUE(CameraModelProjectionImplemented(CameraModelId::kRadial));
-  EXPECT_TRUE(CameraModelProjectionImplemented(CameraModelId::kOpenCV));
+  for (const CameraModelId model_id :
+       {CameraModelId::kSimplePinhole,
+        CameraModelId::kPinhole,
+        CameraModelId::kSimpleRadial,
+        CameraModelId::kRadial,
+        CameraModelId::kOpenCV,
+        CameraModelId::kOpenCVFisheye,
+        CameraModelId::kFullOpenCV,
+        CameraModelId::kFOV,
+        CameraModelId::kSimpleRadialFisheye,
+        CameraModelId::kRadialFisheye,
+        CameraModelId::kThinPrismFisheye,
+        CameraModelId::kRadTanThinPrismFisheye}) {
+    EXPECT_TRUE(CameraModelProjectionImplemented(model_id))
+        << CameraModelIdToName(model_id);
+  }
 }
 
 TEST(CameraModelTest, InitializesSingleAndDoubleFocalModels) {
@@ -92,6 +106,50 @@ TEST(CameraModelTest, ExpandsParameterGroupsForDoubleFocalModel) {
 
   EXPECT_EQ(indices,
             (std::vector<std::size_t>{0, 1, 2, 3, 4, 5, 6, 7}));
+}
+
+TEST(CameraModelTest, ExpandsNamedRefineMaskForCompleteModelFamily) {
+  CameraParameterRefinementMask mask;
+  mask.groups = CameraParameterGroup::kFocalLength;
+  mask.parameter_names = {"k4", "p2"};
+
+  const std::vector<std::size_t> indices =
+      CameraParameterIndicesForMask(CameraModelId::kFullOpenCV, mask);
+
+  EXPECT_EQ(indices, (std::vector<std::size_t>{0, 1, 7, 9}));
+}
+
+TEST(CameraModelTest, ProjectsCompleteModelFamily) {
+  const Eigen::Vector3d point_camera(0.2, -0.1, 2.0);
+
+  for (const CameraModelId model_id :
+       {CameraModelId::kSimplePinhole,
+        CameraModelId::kPinhole,
+        CameraModelId::kSimpleRadial,
+        CameraModelId::kRadial,
+        CameraModelId::kOpenCV,
+        CameraModelId::kOpenCVFisheye,
+        CameraModelId::kFullOpenCV,
+        CameraModelId::kFOV,
+        CameraModelId::kSimpleRadialFisheye,
+        CameraModelId::kRadialFisheye,
+        CameraModelId::kThinPrismFisheye,
+        CameraModelId::kRadTanThinPrismFisheye}) {
+    Camera camera;
+    camera.id = 10;
+    camera.model_id = model_id;
+    camera.width = 1920;
+    camera.height = 1080;
+    camera.params = InitializeCameraParams(model_id, 1000.0, camera.width,
+                                           camera.height);
+
+    const Eigen::Vector2d pixel = ProjectPoint(camera, point_camera);
+
+    EXPECT_TRUE(std::isfinite(pixel.x())) << CameraModelIdToName(model_id);
+    EXPECT_TRUE(std::isfinite(pixel.y())) << CameraModelIdToName(model_id);
+    EXPECT_NEAR(pixel.x(), 1060.0, 1.0) << CameraModelIdToName(model_id);
+    EXPECT_NEAR(pixel.y(), 490.0, 1.0) << CameraModelIdToName(model_id);
+  }
 }
 
 TEST(CameraTest, PinholeProjectionAndUnprojectionRoundTrip) {
@@ -152,16 +210,16 @@ TEST(CameraTest, ProjectionRejectsNonPositiveDepth) {
                std::invalid_argument);
 }
 
-TEST(CameraTest, UnimplementedProjectionThrows) {
+TEST(CameraTest, InvalidModelProjectionThrows) {
   Camera camera;
   camera.id = 3;
-  camera.model_id = CameraModelId::kFOV;
+  camera.model_id = CameraModelId::kInvalid;
   camera.width = 1920;
   camera.height = 1080;
-  camera.params = InitializeCameraParams(camera.model_id, 1000.0, 1920, 1080);
+  camera.params = {};
 
   EXPECT_THROW(ProjectPoint(camera, Eigen::Vector3d(0.0, 0.0, 1.0)),
-               std::domain_error);
+               std::invalid_argument);
 }
 
 }  // namespace

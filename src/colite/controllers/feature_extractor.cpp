@@ -4,11 +4,15 @@
 #include <chrono>
 #include <exception>
 #include <fstream>
+#include <iomanip>
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <opencv2/imgcodecs.hpp>
@@ -20,6 +24,68 @@
 
 namespace colite::controllers {
 namespace {
+
+std::string ToConfigValue(double value) {
+  std::ostringstream stream;
+  stream << std::setprecision(17) << value;
+  return stream.str();
+}
+
+std::string ToConfigValue(std::filesystem::file_time_type value) {
+  return std::to_string(value.time_since_epoch().count());
+}
+
+std::vector<std::pair<std::string, std::string>> FeatureCacheEntries(
+    const FeatureExtractorControllerOptions& options,
+    const std::vector<std::filesystem::path>& image_paths) {
+  std::vector<std::pair<std::string, std::string>> entries;
+  entries.emplace_back("stage", "features");
+  entries.emplace_back("image_path", options.image_path.lexically_normal().string());
+  entries.emplace_back("focal_length", ToConfigValue(options.focal_length));
+  entries.emplace_back("max_num_features", std::to_string(options.max_num_features));
+  entries.emplace_back("backend", SiftBackendName(options.backend));
+  entries.emplace_back("num_images", std::to_string(image_paths.size()));
+  for (std::size_t i = 0; i < image_paths.size(); ++i) {
+    const std::filesystem::path& image_path = image_paths[i];
+    entries.emplace_back("image_" + std::to_string(i) + "_path",
+                         image_path.lexically_normal().string());
+    entries.emplace_back("image_" + std::to_string(i) + "_size",
+                         std::to_string(std::filesystem::file_size(image_path)));
+    entries.emplace_back(
+        "image_" + std::to_string(i) + "_mtime",
+        ToConfigValue(std::filesystem::last_write_time(image_path)));
+  }
+  return entries;
+}
+
+std::vector<std::filesystem::path> FeatureRequiredFiles(
+    std::size_t num_images) {
+  std::vector<std::filesystem::path> files = {"cameras.txt",
+                                             "images.tsv",
+                                             "features/summary.txt"};
+  for (std::size_t i = 0; i < num_images; ++i) {
+    files.emplace_back("features/" + std::to_string(i + 1) + ".bin");
+  }
+  return files;
+}
+
+std::optional<FeatureExtractorControllerSummary> ReadCachedFeatureSummary(
+    const std::filesystem::path& workspace_path,
+    const std::string& config_hash) {
+  if (!WorkspaceCacheIsValid(workspace_path, "features", config_hash)) {
+    return std::nullopt;
+  }
+  const WorkspaceCacheMetadata metadata =
+      ReadWorkspaceCacheMetadata(workspace_path, "features");
+  FeatureExtractorControllerSummary summary;
+  summary.success = true;
+  summary.cache_hit = true;
+  summary.num_images = static_cast<std::size_t>(
+      std::stoull(metadata.values.at("images")));
+  summary.elapsed_seconds =
+      std::stod(metadata.values.at("feature_extraction_seconds"));
+  return summary;
+}
 
 Camera MakeSingleCamera(const std::filesystem::path& image_path,
                         double focal_length) {
@@ -75,6 +141,12 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
       ListImageFiles(options_.image_path);
   if (image_paths.empty()) {
     throw std::runtime_error("No input images found");
+  }
+  const std::string config_hash =
+      StableConfigHash(FeatureCacheEntries(options_, image_paths));
+  if (const auto cached_summary =
+          ReadCachedFeatureSummary(options_.workspace_path, config_hash)) {
+    return *cached_summary;
   }
 
   const Camera camera = MakeSingleCamera(image_paths.front(),
@@ -155,6 +227,11 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
   summary_file << "images " << summary.num_images << "\n"
                << "feature_extraction_seconds " << summary.elapsed_seconds
                << "\n";
+  WriteWorkspaceCacheMetadata(
+      options_.workspace_path, "features", config_hash,
+      {{"images", std::to_string(summary.num_images)},
+       {"feature_extraction_seconds", ToConfigValue(summary.elapsed_seconds)}},
+      FeatureRequiredFiles(image_paths.size()));
   return summary;
 }
 

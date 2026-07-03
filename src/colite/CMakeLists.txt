@@ -42,6 +42,7 @@ add_library(colite_core
   core/version.cpp
   controllers/recon_sfm_controller.cpp
   controllers/recon_mvs_controller.cpp
+  controllers/colmap_compare_controller.cpp
   controllers/feature_extractor.cpp
   controllers/sequential_matcher.cpp
   controllers/mapper.cpp

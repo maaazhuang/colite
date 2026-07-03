@@ -6,9 +6,11 @@
 
 #include <gtest/gtest.h>
 
+#include "colite/controllers/sequential_matcher.h"
 #include "colite/core/camera.h"
 #include "colite/core/match_graph.h"
 #include "colite/exe/command.h"
+#include "colite/exe/compare_colmap.h"
 #include "colite/exe/feature_extractor.h"
 #include "colite/exe/mapper.h"
 #include "colite/exe/sequential_matcher.h"
@@ -33,6 +35,48 @@ FeatureSet MakeTinyFeatures() {
   features.descriptors(0, 0) = 1.0F;
   features.descriptors(1, 127) = 2.0F;
   return features;
+}
+
+void WriteTextFile(const std::filesystem::path& path,
+                   const std::string& contents) {
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream file(path);
+  file << contents;
+}
+
+void WriteTinyColmapModel(const std::filesystem::path& path,
+                          const bool candidate) {
+  WriteTextFile(path / "cameras.txt",
+                "# CAMERA_ID MODEL WIDTH HEIGHT PARAMS[]\n"
+                "1 PINHOLE 640 480 500 500 320 240\n");
+  if (!candidate) {
+    WriteTextFile(path / "images.txt",
+                  "# IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME\n"
+                  "# POINTS2D[] as X Y POINT3D_ID\n"
+                  "1 1 0 0 0 0 0 0 1 image1.jpg\n"
+                  "10 20 1 30 40 2\n"
+                  "2 1 0 0 0 1 0 0 1 image2.jpg\n"
+                  "15 25 1\n");
+    WriteTextFile(path / "points3D.txt",
+                  "# POINT3D_ID X Y Z R G B ERROR TRACK[]\n"
+                  "1 0 0 5 255 255 255 0.5 1 0 2 0\n"
+                  "2 1 0 5 255 255 255 0.7 1 1\n");
+    return;
+  }
+
+  WriteTextFile(path / "images.txt",
+                "# IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME\n"
+                "# POINTS2D[] as X Y POINT3D_ID\n"
+                "1 1 0 0 0 0.1 0 0 1 image1.jpg\n"
+                "10 20 1 30 40 3\n"
+                "2 1 0 0 0 1 0 0 1 image2.jpg\n"
+                "15 25 1 35 45 3\n"
+                "3 1 0 0 0 2 0 0 1 image3.jpg\n"
+                "\n");
+  WriteTextFile(path / "points3D.txt",
+                "# POINT3D_ID X Y Z R G B ERROR TRACK[]\n"
+                "1 0.1 0 5 255 255 255 0.6 1 0 2 0\n"
+                "3 2 0 5 255 255 255 0.9 1 1 2 1\n");
 }
 
 TEST(SfmWorkspaceTest, RoundTripsManifestFeaturesAndMatches) {
@@ -114,6 +158,85 @@ TEST(SfmWorkspaceTest, RoundTripsManifestFeaturesAndMatches) {
                                       "verified_matches.tsv"));
 }
 
+TEST(SfmWorkspaceTest, RoundTripsStageCacheMetadata) {
+  const std::filesystem::path workspace =
+      std::filesystem::temp_directory_path() / "colite_sfm_cache_test";
+  std::filesystem::remove_all(workspace);
+  std::filesystem::create_directories(workspace / "features");
+  {
+    std::ofstream file(workspace / "features" / "1.bin");
+    file << "feature bytes";
+  }
+
+  const std::string hash = StableConfigHash(
+      {{"stage", "features"}, {"backend", "vlsift"}, {"max_num_features", "64"}});
+  WriteWorkspaceCacheMetadata(workspace, "features", hash,
+                              {{"images", "1"},
+                               {"feature_extraction_seconds", "0.25"}},
+                              {"features/1.bin"});
+
+  const WorkspaceCacheMetadata metadata =
+      ReadWorkspaceCacheMetadata(workspace, "features");
+
+  EXPECT_EQ(metadata.stage, "features");
+  EXPECT_EQ(metadata.config_hash, hash);
+  EXPECT_EQ(metadata.values.at("images"), "1");
+  EXPECT_TRUE(WorkspaceCacheIsValid(workspace, "features", hash));
+  EXPECT_FALSE(WorkspaceCacheIsValid(workspace, "features", hash + "x"));
+
+  std::filesystem::remove(workspace / "features" / "1.bin");
+  EXPECT_FALSE(WorkspaceCacheIsValid(workspace, "features", hash));
+}
+
+TEST(SfmWorkspaceTest, SequentialMatcherReusesRawAndGeometryCaches) {
+  const std::filesystem::path workspace =
+      std::filesystem::temp_directory_path() / "colite_match_cache_test";
+  std::filesystem::remove_all(workspace);
+
+  Camera camera;
+  camera.id = 1;
+  camera.model_id = CameraModelId::kPinhole;
+  camera.width = 640;
+  camera.height = 480;
+  camera.params = {500.0, 500.0, 320.0, 240.0};
+
+  Image image1;
+  image1.id = 1;
+  image1.camera_id = 1;
+  image1.name = "image1.jpg";
+  image1.file_path = "/tmp/image1.jpg";
+
+  Image image2 = image1;
+  image2.id = 2;
+  image2.name = "image2.jpg";
+  image2.file_path = "/tmp/image2.jpg";
+
+  WriteWorkspaceCameras(workspace, {camera});
+  WriteWorkspaceImages(workspace, {image1, image2});
+  WriteWorkspaceFeatureSet(workspace, 1, MakeTinyFeatures());
+  WriteWorkspaceFeatureSet(workspace, 2, MakeTinyFeatures());
+
+  controllers::SequentialMatcherControllerOptions options;
+  options.workspace_path = workspace;
+  options.matching_strategy = MatchingStrategy::kExhaustive;
+  options.matcher_backend = DescriptorMatcherBackend::kBruteForce;
+  options.max_ratio = 1.0;
+
+  const controllers::SequentialMatcherControllerSummary first =
+      controllers::SequentialMatcherController(options).Run();
+  const controllers::SequentialMatcherControllerSummary second =
+      controllers::SequentialMatcherController(options).Run();
+
+  EXPECT_TRUE(first.success);
+  EXPECT_FALSE(first.raw_match_cache_hit);
+  EXPECT_FALSE(first.geometry_cache_hit);
+  EXPECT_TRUE(second.success);
+  EXPECT_TRUE(second.raw_match_cache_hit);
+  EXPECT_TRUE(second.geometry_cache_hit);
+  EXPECT_EQ(second.num_pairs, first.num_pairs);
+  EXPECT_EQ(second.num_verified_inliers, first.num_verified_inliers);
+}
+
 TEST(SfmCommandExeTest, PrintsHelpForStageCommands) {
   std::ostringstream out;
   std::ostringstream err;
@@ -146,6 +269,7 @@ TEST(ColiteCommandExeTest, PrintsTopLevelHelp) {
   EXPECT_NE(out.str().find("feature_extractor"), std::string::npos);
   EXPECT_NE(out.str().find("exhaustive_matcher"), std::string::npos);
   EXPECT_NE(out.str().find("vocab_tree_matcher"), std::string::npos);
+  EXPECT_NE(out.str().find("compare_colmap"), std::string::npos);
   EXPECT_NE(out.str().find("recon_sfm"), std::string::npos);
   EXPECT_TRUE(err.str().empty());
 }
@@ -176,6 +300,7 @@ TEST(ColiteCommandExeTest, DispatchesExhaustiveSpatialAndVocabTreeMatcherHelp) {
             0);
   EXPECT_NE(out.str().find("colite vocab_tree_matcher"), std::string::npos);
   EXPECT_NE(out.str().find("--vocab_tree_num_images"), std::string::npos);
+  EXPECT_NE(out.str().find("--vocab_tree_path"), std::string::npos);
   EXPECT_TRUE(err.str().empty());
 }
 
@@ -186,6 +311,63 @@ TEST(ColiteCommandExeTest, DispatchesSubcommandHelp) {
   EXPECT_EQ(exe::RunColite({"colite", "recon_sfm", "--help"}, out, err), 0);
   EXPECT_NE(out.str().find("colite recon_sfm"), std::string::npos);
   EXPECT_NE(out.str().find("--image_path"), std::string::npos);
+  EXPECT_TRUE(err.str().empty());
+}
+
+TEST(ColiteCompareExeTest, WritesFixedColmapDifferenceReports) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() / "colite_compare_colmap_test";
+  const std::filesystem::path reference = root / "reference";
+  const std::filesystem::path candidate = root / "candidate";
+  const std::filesystem::path output = root / "report";
+  std::filesystem::remove_all(root);
+  WriteTinyColmapModel(reference, false);
+  WriteTinyColmapModel(candidate, true);
+
+  std::ostringstream out;
+  std::ostringstream err;
+  EXPECT_EQ(exe::RunCompareColmap({"compare_colmap",
+                                   "--reference_path",
+                                   reference.string(),
+                                   "--candidate_path",
+                                   candidate.string(),
+                                   "--output_path",
+                                   output.string()},
+                                  out,
+                                  err),
+            0)
+      << err.str();
+
+  EXPECT_NE(out.str().find("Common images: 2"), std::string::npos);
+  EXPECT_NE(out.str().find("Common points by id: 1"), std::string::npos);
+  const std::string image_diff = ReadTextFile(output / "image_diff.tsv");
+  const std::string pair_diff = ReadTextFile(output / "pair_diff.tsv");
+  const std::string point_diff = ReadTextFile(output / "point_diff.tsv");
+  const std::string pose_diff = ReadTextFile(output / "pose_diff.tsv");
+  const std::string summary = ReadTextFile(output / "summary.txt");
+
+  EXPECT_NE(image_diff.find("image_name\tstatus\tref_image_id"),
+            std::string::npos);
+  EXPECT_NE(image_diff.find("image3.jpg\tcandidate_only"), std::string::npos);
+  EXPECT_NE(pair_diff.find("image1.jpg\timage2.jpg\t1\t2\t1"),
+            std::string::npos);
+  EXPECT_NE(point_diff.find("1\tcommon\t0.1"), std::string::npos);
+  EXPECT_NE(point_diff.find("2\treference_only"), std::string::npos);
+  EXPECT_NE(point_diff.find("3\tcandidate_only"), std::string::npos);
+  EXPECT_NE(pose_diff.find("image1.jpg\t1\t1\t0\t0.1\t0.1"),
+            std::string::npos);
+  EXPECT_NE(summary.find("common_pairs 1"), std::string::npos);
+  EXPECT_NE(summary.find("candidate_only_images 1"), std::string::npos);
+}
+
+TEST(ColiteCommandExeTest, DispatchesCompareColmapHelp) {
+  std::ostringstream out;
+  std::ostringstream err;
+
+  EXPECT_EQ(exe::RunColite({"colite", "compare_colmap", "--help"}, out, err),
+            0);
+  EXPECT_NE(out.str().find("colite compare_colmap"), std::string::npos);
+  EXPECT_NE(out.str().find("--reference_path"), std::string::npos);
   EXPECT_TRUE(err.str().empty());
 }
 

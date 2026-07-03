@@ -193,5 +193,93 @@ TEST(GlobalBundleAdjusterTest, RefinesOnlyRequestedCameraParameterGroups) {
   EXPECT_DOUBLE_EQ(refined_camera.params[3], fixed_cy);
 }
 
+TEST(GlobalBundleAdjusterTest, AppliesTwoImageGaugeWhenNoConstantsAreGiven) {
+  const Camera camera = MakeCamera();
+  const std::vector<Eigen::Vector3d> true_points = MakeScenePoints();
+  const std::vector<Pose3> true_poses = {
+      CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0)),
+      CameraAt(Eigen::Vector3d(1.0, 0.0, 0.0)),
+      CameraAt(Eigen::Vector3d(0.35, 0.15, 0.0))};
+
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+
+  for (std::size_t i = 0; i < true_poses.size(); ++i) {
+    Image image =
+        MakeRegisteredImage(static_cast<ImageId>(i + 1), true_poses[i]);
+    AddImageObservations(camera, true_poses[i], &image, true_points);
+    reconstruction.AddImage(image);
+  }
+  for (std::size_t i = 0; i < true_points.size(); ++i) {
+    Track track;
+    for (ImageId image_id = 1; image_id <= 3; ++image_id) {
+      track.AddElement(image_id, static_cast<Point2DIdx>(i));
+    }
+    reconstruction.AddPoint3D(true_points[i], track);
+  }
+
+  GlobalBundleAdjustmentOptions options;
+  options.max_num_iterations = 1;
+
+  const GlobalBundleAdjustmentSummary summary =
+      AdjustGlobalBundle(options, &reconstruction);
+
+  EXPECT_TRUE(summary.success);
+  EXPECT_EQ(summary.gauge_constant_pose_image_ids, (std::set<ImageId>{1}));
+  ASSERT_EQ(summary.gauge_constant_translation_idxs.size(), 1U);
+  EXPECT_EQ(summary.gauge_constant_translation_idxs.at(2),
+            (std::vector<int>{0}));
+  EXPECT_EQ(summary.num_gauge_constant_translation_images, 1U);
+}
+
+TEST(GlobalBundleAdjusterTest, RefinesNamedCameraParameterMask) {
+  Camera true_camera = MakeCamera();
+  true_camera.model_id = CameraModelId::kSimpleRadial;
+  true_camera.params = {700.0, 500.0, 400.0, 0.04};
+
+  const std::vector<Eigen::Vector3d> true_points = MakeScenePoints();
+  const std::vector<Pose3> true_poses = {
+      CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0)),
+      CameraAt(Eigen::Vector3d(1.0, 0.0, 0.0)),
+      CameraAt(Eigen::Vector3d(0.35, 0.15, 0.0))};
+
+  Reconstruction reconstruction;
+  Camera estimated_camera = true_camera;
+  estimated_camera.params = {700.0, 500.0, 400.0, 0.0};
+  reconstruction.AddCamera(estimated_camera);
+
+  for (std::size_t i = 0; i < true_poses.size(); ++i) {
+    Image image =
+        MakeRegisteredImage(static_cast<ImageId>(i + 1), true_poses[i]);
+    AddImageObservations(true_camera, true_poses[i], &image, true_points);
+    reconstruction.AddImage(image);
+  }
+  for (std::size_t i = 0; i < true_points.size(); ++i) {
+    Track track;
+    for (ImageId image_id = 1; image_id <= 3; ++image_id) {
+      track.AddElement(image_id, static_cast<Point2DIdx>(i));
+    }
+    reconstruction.AddPoint3D(true_points[i], track);
+  }
+
+  GlobalBundleAdjustmentOptions options;
+  options.max_num_iterations = 80;
+  options.loss_scale = 0.0;
+  options.refine_poses = false;
+  options.refine_points = false;
+  options.refine_camera_param_names = {"k1"};
+
+  const GlobalBundleAdjustmentSummary summary =
+      AdjustGlobalBundle(options, &reconstruction);
+
+  const Camera& refined_camera = reconstruction.GetCamera(1);
+  EXPECT_TRUE(summary.success);
+  EXPECT_EQ(summary.num_variable_cameras, 1U);
+  EXPECT_NEAR(refined_camera.params[0], 700.0, 1e-12);
+  EXPECT_NEAR(refined_camera.params[1], 500.0, 1e-12);
+  EXPECT_NEAR(refined_camera.params[2], 400.0, 1e-12);
+  EXPECT_LT(std::abs(refined_camera.params[3] - true_camera.params[3]), 0.01);
+}
+
 }  // namespace
 }  // namespace colite

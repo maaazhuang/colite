@@ -1,4 +1,5 @@
 #include "colite/mvs/patch_match.h"
+#include "colite/mvs/patch_match_cuda.h"
 
 #include <cmath>
 #include <filesystem>
@@ -853,6 +854,102 @@ TEST(PatchMatchBackendTest, CudaBackendRunsPyramidStereoWhenCompiled) {
   EXPECT_GT(result.cost_map.ValidPixelCount(), 0U);
   EXPECT_EQ(result.summary.num_iterations, 2U);
   EXPECT_GT(result.summary.num_candidate_evaluations, 0U);
+}
+
+TEST(PatchMatchBackendTest, CudaBackendReportsNormalPerturbationUpdates) {
+  if (!IsCudaPatchMatchCompiled()) {
+    GTEST_SKIP() << "CUDA PatchMatch backend is not compiled in this build.";
+  }
+  ASSERT_TRUE(IsCudaPatchMatchAvailable())
+      << CudaPatchMatchUnavailableReason();
+
+  const MvsImage reference = MakeGradientImage(9, 9);
+  const PatchMatchView reference_view = MakeView(1);
+  const PatchMatchView source_view = MakeView(2, -0.25);
+
+  PatchMatchMaps initial_maps;
+  initial_maps.depth_map = DenseDepthMap(9, 9, 2.0F, 6.0F);
+  initial_maps.depth_map.Fill(4.0F);
+  initial_maps.normal_map = NormalMap(9, 9);
+  initial_maps.normal_map.Fill(NormalFromDegrees(20.0F));
+
+  std::vector<PatchMatchView> source_views{source_view};
+  std::vector<MvsImage> source_images{reference};
+  PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kCuda;
+  options.num_iterations = 1;
+  options.cost.window_radius = 1;
+  options.initial_depth_perturbation_factor = 0.0F;
+  options.min_depth_perturbation = 0.0F;
+  options.perturbation.random_seed = 5;
+  options.perturbation.normal_radius_degrees = 25.0F;
+  options.perturbation.num_samples_per_pixel = 8;
+  options.min_normal_radius_degrees = 25.0F;
+
+  CudaPatchMatchRequest request;
+  request.reference_view = &reference_view;
+  request.source_views = &source_views;
+  request.reference_image = &reference;
+  request.source_images = &source_images;
+  request.initial_maps = &initial_maps;
+  request.depth_min = 2.0F;
+  request.depth_max = 6.0F;
+  request.options = options;
+
+  std::string unavailable_reason;
+  std::optional<PatchMatchStereoResult> result =
+      RunCudaPatchMatchStereo(request, &unavailable_reason);
+  ASSERT_TRUE(result.has_value()) << unavailable_reason;
+  EXPECT_GT(result->summary.num_perturbation_updates, 0U);
+  EXPECT_GT(result->summary.perturbation_total_normal_angle_degrees, 0.0);
+  EXPECT_GT(result->summary.perturbation_mean_normal_angle_degrees, 0.0);
+}
+
+TEST(PatchMatchBackendTest, CudaBackendReportsIterationAndSelectionDiagnostics) {
+  if (!IsCudaPatchMatchCompiled()) {
+    GTEST_SKIP() << "CUDA PatchMatch backend is not compiled in this build.";
+  }
+  ASSERT_TRUE(IsCudaPatchMatchAvailable())
+      << CudaPatchMatchUnavailableReason();
+
+  const MvsImage reference = MakeGradientImage(8, 8);
+  PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kCuda;
+  options.num_iterations = 2;
+  options.pyramid_levels = 2;
+  options.cost.window_radius = 1;
+  options.perturbation.num_samples_per_pixel = 1;
+
+  const PatchMatchStereoResult result =
+      RunPatchMatchStereoForImage(MakeView(1), {MakeView(2), MakeView(3)},
+                                  reference, {reference, reference}, 2.0F,
+                                  6.0F, options);
+
+  ASSERT_EQ(result.summary.iteration_pyramid_levels.size(), 4U);
+  EXPECT_EQ(result.summary.iteration_indices.size(), 4U);
+  EXPECT_EQ(result.summary.iteration_candidate_evaluations.size(), 4U);
+  EXPECT_EQ(result.summary.iteration_propagation_updates.size(), 4U);
+  EXPECT_EQ(result.summary.iteration_perturbation_updates.size(), 4U);
+  EXPECT_EQ(result.summary.iteration_source_selection_tests.size(), 4U);
+  EXPECT_EQ(result.summary.iteration_source_selection_acceptances.size(), 4U);
+  EXPECT_EQ(result.summary.iteration_source_selection_rejections.size(), 4U);
+  EXPECT_EQ(result.summary.iteration_pyramid_levels.front(), 0U);
+  EXPECT_EQ(result.summary.iteration_pyramid_levels.back(), 1U);
+  EXPECT_EQ(result.summary.iteration_indices[0], 0U);
+  EXPECT_EQ(result.summary.iteration_indices[1], 1U);
+  EXPECT_EQ(result.summary.iteration_indices[2], 0U);
+  EXPECT_EQ(result.summary.iteration_indices[3], 1U);
+  EXPECT_GT(result.summary.num_source_selection_tests, 0U);
+  EXPECT_EQ(result.summary.num_source_selection_tests,
+            result.summary.num_source_selection_acceptances +
+                result.summary.num_source_selection_rejections);
+  for (std::size_t i = 0; i < result.summary.iteration_pyramid_levels.size();
+       ++i) {
+    EXPECT_GT(result.summary.iteration_candidate_evaluations[i], 0U);
+    EXPECT_EQ(result.summary.iteration_source_selection_tests[i],
+              result.summary.iteration_source_selection_acceptances[i] +
+                  result.summary.iteration_source_selection_rejections[i]);
+  }
 }
 
 TEST(CpuPatchMatchStereoTest,

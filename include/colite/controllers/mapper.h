@@ -11,6 +11,7 @@ struct MapperControllerOptions {
 
 struct MapperControllerSummary {
   bool success = false;
+  bool cache_hit = false;
   std::size_t num_registered_images = 0;
   std::size_t num_points3d = 0;
 };

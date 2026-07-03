@@ -1291,6 +1291,161 @@ ctest --test-dir build-wsl -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|Rec
 100% tests passed, 0 tests failed out of 26
 ```
 
+### Milestone 25: CUDA sweep variants, source selection, angle weighting, and pyramid execution
+
+Goal: continue the CUDA PatchMatch COLMAP-ization by filling in the next
+geometry/cost organization pieces and removing the single-scale CUDA boundary.
+
+Implemented:
+
+- Pose texture now stores 47 parameters per source and uses 3 layered sweep
+  variants:
+  - base projection pose,
+  - negative patch sweep rotation,
+  - positive patch sweep rotation.
+- Each pose texture entry now includes:
+  - source geometry weight,
+  - deterministic source selection probability,
+  - patch sweep rotation `cos/sin`.
+- CUDA cost evaluation now computes the best cost across rotated patch sweep
+  variants for each source view.
+- Multi-source aggregation now applies:
+  - source-level deterministic selection probability,
+  - source geometry weighting,
+  - candidate incident-angle penalty based on the hypothesis normal and source
+    camera center.
+- CUDA PatchMatch now supports multi-scale pyramid execution:
+  - each pyramid level builds resized reference/source images,
+  - camera intrinsics are scaled per level,
+  - source depth maps are resized when geometric consistency is enabled,
+  - the previous coarse level depth/normal maps are upsampled as the next
+    level's initial hypotheses.
+- CUDA single-scale results now run the existing normal-map refinement pass
+  when `normal_refinement.enabled` is set, preserving `recon_mvs` summary
+  diagnostics under the default `auto` backend.
+
+Still not complete:
+
+- The rotated sweep implementation is a compact patch-coordinate rotation, not
+  the full COLMAP selection-probability and sweep scheduler stack.
+- Selection probability is source-level and deterministic per pixel/source; it
+  is not yet a learned or dense probability map.
+- Angle weighting is conservative and currently uses source geometry plus
+  incident-angle penalty. Full view-angle / normal-angle filtering remains
+  downstream in fusion and future CUDA filtering work.
+- The pyramid currently transfers coarse maps through host memory between
+  levels. This is simpler and testable, but not yet an optimized all-GPU cache.
+
+Verification:
+
+```text
+CUDA build:
+cmake --build build-wsl-cuda-mvs-tests --target colite_core_tests -j2
+completed successfully
+
+CUDA pyramid test:
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest.CudaBackendRunsPyramidStereoWhenCompiled' --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+CUDA MVS regression:
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+100% tests passed, 0 tests failed out of 27
+```
+
+CPU regression note:
+
+```text
+The CPU build regression command was not run in this turn because WSL command
+execution was rejected by the environment usage limit after CUDA verification.
+```
+
+### Milestone 26: CUDA normal perturbation and normal-angle diagnostics
+
+Goal: close the remaining gap in the CUDA random perturbation pass by sampling
+normal hypotheses on the GPU instead of perturbing depth only.
+
+Implemented:
+
+- Added device-side vector helpers for normalized `float3` arithmetic.
+- Added CUDA normal cone sampling around the current hypothesis normal.
+- `PerturbationKernel` now evaluates candidate `(depth, normal)` hypotheses.
+- Accepted perturbation updates now write both depth and normal maps.
+- CUDA perturbation counters now record:
+  - total normal-angle update,
+  - max normal-angle update,
+  - mean normal-angle update.
+- Added a CUDA regression test that starts from explicit initial maps with
+  zero depth perturbation radius, forcing the perturbation pass to improve via
+  normal hypotheses.
+
+Verification:
+
+```text
+CUDA normal perturbation test:
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest.CudaBackendReportsNormalPerturbationUpdates' --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+CUDA MVS regression:
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+100% tests passed, 0 tests failed out of 28
+
+CPU MVS regression:
+ctest --test-dir build-wsl -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+100% tests passed, 0 tests failed out of 28
+```
+
+### Milestone 27: CUDA per-iteration diagnostics and source selection statistics
+
+Goal: make CUDA PatchMatch tuning less opaque by reporting per-level,
+per-iteration counters and source selection probability statistics.
+
+Implemented:
+
+- `PatchMatchStereoSummary` now records CUDA source-selection totals:
+  - source selection tests,
+  - source selection acceptances,
+  - source selection rejections.
+- Added per-iteration diagnostic vectors:
+  - pyramid level index,
+  - iteration index,
+  - candidate evaluations,
+  - propagation updates,
+  - perturbation updates,
+  - source selection tests / acceptances / rejections.
+- CUDA cost aggregation now counts source-selection decisions at the point
+  where each source is actually considered for a candidate hypothesis.
+- CUDA single-scale execution now resets/copies counters per iteration and
+  fills update ratio, depth radius, normal radius, and the new diagnostic
+  vectors.
+- CUDA pyramid execution rewrites the per-level iteration diagnostics with the
+  real coarse-to-fine level index before accumulating summaries.
+- `stereo/patch_match.tsv` now writes the aggregate source selection counters
+  and per-iteration diagnostic vectors as comma-separated values.
+
+Verification:
+
+```text
+CUDA core/recon_mvs build:
+cmake --build build-wsl-cuda-mvs-tests --target colite_core colite_recon_mvs_exe -j2
+completed successfully
+
+CPU core/recon_mvs build:
+cmake --build build-wsl --target colite_core colite_recon_mvs_exe -j2
+completed successfully
+
+PatchMatch test object build:
+cmake --build build-wsl-cuda-mvs-tests --target tests/CMakeFiles/colite_core_tests.dir/mvs/patch_match_test.cpp.o -j2
+completed successfully
+```
+
+Full test note:
+
+```text
+The full colite_core_tests target is currently blocked by unrelated SfM test
+compile errors in incremental_mapper_test.cpp against IncrementalMappingOptions.
+The CUDA diagnostics implementation and recon_mvs target compile successfully.
+```
+
 ### Milestone 23: CUDA layered texture image cache
 
 Goal: move the first CUDA backend closer to COLMAP's image access structure by

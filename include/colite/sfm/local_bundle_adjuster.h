@@ -1,11 +1,14 @@
 #pragma once
 
 #include <cstddef>
+#include <map>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "colite/core/camera.h"
 #include "colite/core/reconstruction.h"
+#include "colite/sfm/global_bundle_adjuster.h"
 
 namespace colite {
 
@@ -20,6 +23,9 @@ struct LocalBundleAdjustmentOptions {
   bool refine_poses = true;
   bool refine_points = true;
   CameraParameterGroup refine_camera_params = CameraParameterGroup::kNone;
+  std::set<std::string> refine_camera_param_names;
+  std::map<ImageId, std::vector<int>> constant_image_translation_idxs;
+  BundleGaugeFixing gauge_fixing = BundleGaugeFixing::kFirstTwoImages;
 
   // 用于固定 gauge 的图像。若为空，局部窗口中 ID 最小的图像会被固定。
   std::set<ImageId> constant_image_ids;
@@ -35,9 +41,12 @@ struct LocalBundleAdjustmentSummary {
   std::size_t num_variable_images = 0;
   std::size_t num_variable_points = 0;
   std::size_t num_variable_cameras = 0;
+  std::size_t num_gauge_constant_translation_images = 0;
   std::size_t num_residuals = 0;
   double initial_mean_reprojection_error = -1.0;
   double final_mean_reprojection_error = -1.0;
+  std::set<ImageId> gauge_constant_pose_image_ids;
+  std::map<ImageId, std::vector<int>> gauge_constant_translation_idxs;
   std::string message;
 };
 

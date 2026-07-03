@@ -350,6 +350,15 @@ TEST(ReconMvsExeTest, RunsPatchMatchStereoWhenRequested) {
                 .find("perturbation_geometric_candidate_rejections"),
             std::string::npos);
   EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("source_selection_tests"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("iteration_candidate_evaluations"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("iteration_source_selection_acceptances"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
                 .find("normal_refined_pixels"),
             std::string::npos);
   EXPECT_NE(ReadTextFile(output_path / "summary.txt")

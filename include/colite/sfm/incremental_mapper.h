@@ -44,6 +44,8 @@ struct IncrementalMapperSummary {
   double candidate_score = 0.0;
   // 成功注册前该图像已经失败过的次数，用于诊断失败重试调度是否稳定。
   std::size_t registration_attempts_before_success = 0;
+  // 本次 PnP 注册实际使用的重投影误差阈值。失败重试时该值可能被动态放宽。
+  double registration_max_reprojection_error_px = 0.0;
   ImageRegistrationSummary registration;
   IncrementalTriangulatorSummary track_completion;
   IncrementalTriangulatorSummary triangulation;
@@ -62,6 +64,10 @@ struct IncrementalMappingOptions {
   std::size_t max_num_registrations = 1000;
   // 单张图像最多尝试注册次数。失败图像会被降级重试，超过上限后跳过，避免调度被坏候选阻塞。
   std::size_t max_num_registration_trials_per_image = 3;
+  // 失败重试时按尝试次数动态放宽 PnP RANSAC 重投影阈值：
+  // effective = min(max_px, base_px * multiplier ^ previous_failures)。
+  double registration_retry_reprojection_error_multiplier = 1.5;
+  double registration_retry_max_reprojection_error_px = 8.0;
   bool run_global_track_completion = true;
   bool run_global_bundle_adjustment = true;
   bool run_global_observation_filter = true;
@@ -77,6 +83,7 @@ struct ImageRegistrationFailureSummary {
   std::size_t candidate_num_registered_neighbors = 0;
   std::size_t candidate_num_verified_inliers_to_registered_images = 0;
   double candidate_score = 0.0;
+  double registration_max_reprojection_error_px = 0.0;
   std::string message;
 };
 

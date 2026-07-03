@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iomanip>
 #include <ios>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -63,6 +64,17 @@ void ReadBinary(std::ifstream* file, T* value) {
   }
 }
 
+std::filesystem::path NormalizeRequiredFile(
+    const std::filesystem::path& path) {
+  return path.lexically_normal();
+}
+
+std::string ToHex(std::uint64_t value) {
+  std::ostringstream stream;
+  stream << std::hex << std::setw(16) << std::setfill('0') << value;
+  return stream.str();
+}
+
 }  // namespace
 
 std::filesystem::path WorkspaceFeaturesPath(
@@ -78,6 +90,110 @@ std::filesystem::path WorkspaceMatchesPath(
 std::filesystem::path WorkspaceSparsePath(
     const std::filesystem::path& workspace_path) {
   return workspace_path / "sparse";
+}
+
+std::filesystem::path WorkspaceCacheMetadataPath(
+    const std::filesystem::path& workspace_path,
+    const std::string& stage) {
+  return workspace_path / "cache" / (stage + ".txt");
+}
+
+std::string StableConfigHash(
+    const std::vector<std::pair<std::string, std::string>>& entries) {
+  std::uint64_t hash = 1469598103934665603ULL;
+  const auto mix = [&](const char ch) {
+    hash ^= static_cast<unsigned char>(ch);
+    hash *= 1099511628211ULL;
+  };
+
+  for (const auto& [key, value] : entries) {
+    for (const char ch : key) {
+      mix(ch);
+    }
+    mix('=');
+    for (const char ch : value) {
+      mix(ch);
+    }
+    mix('\n');
+  }
+  return ToHex(hash);
+}
+
+void WriteWorkspaceCacheMetadata(
+    const std::filesystem::path& workspace_path,
+    const std::string& stage,
+    const std::string& config_hash,
+    const std::map<std::string, std::string>& values,
+    const std::vector<std::filesystem::path>& required_files) {
+  std::filesystem::create_directories(
+      WorkspaceCacheMetadataPath(workspace_path, stage).parent_path());
+  std::ofstream file(WorkspaceCacheMetadataPath(workspace_path, stage));
+  file << "stage\t" << stage << "\n"
+       << "config_hash\t" << config_hash << "\n";
+  for (const std::filesystem::path& required_file : required_files) {
+    file << "required_file\t"
+         << NormalizeRequiredFile(required_file).generic_string() << "\n";
+  }
+  for (const auto& [key, value] : values) {
+    file << "value\t" << key << "\t" << value << "\n";
+  }
+}
+
+WorkspaceCacheMetadata ReadWorkspaceCacheMetadata(
+    const std::filesystem::path& workspace_path,
+    const std::string& stage) {
+  const std::filesystem::path path =
+      WorkspaceCacheMetadataPath(workspace_path, stage);
+  WorkspaceCacheMetadata metadata;
+  std::ifstream file(path);
+  if (!file) {
+    return metadata;
+  }
+
+  std::string line;
+  while (std::getline(file, line)) {
+    if (line.empty() || line.front() == '#') {
+      continue;
+    }
+    std::istringstream stream(line);
+    std::string kind;
+    std::getline(stream, kind, '\t');
+    if (kind == "stage") {
+      std::getline(stream, metadata.stage);
+    } else if (kind == "config_hash") {
+      std::getline(stream, metadata.config_hash);
+    } else if (kind == "required_file") {
+      std::string required_file;
+      std::getline(stream, required_file);
+      metadata.required_files.emplace_back(required_file);
+    } else if (kind == "value") {
+      std::string key;
+      std::string value;
+      std::getline(stream, key, '\t');
+      std::getline(stream, value);
+      metadata.values.emplace(std::move(key), std::move(value));
+    } else {
+      throw std::runtime_error("Invalid workspace cache metadata entry: " +
+                               line);
+    }
+  }
+  return metadata;
+}
+
+bool WorkspaceCacheIsValid(const std::filesystem::path& workspace_path,
+                           const std::string& stage,
+                           const std::string& config_hash) {
+  const WorkspaceCacheMetadata metadata =
+      ReadWorkspaceCacheMetadata(workspace_path, stage);
+  if (metadata.stage != stage || metadata.config_hash != config_hash) {
+    return false;
+  }
+  for (const std::filesystem::path& required_file : metadata.required_files) {
+    if (!std::filesystem::exists(workspace_path / required_file)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void WriteWorkspaceCameras(const std::filesystem::path& workspace_path,

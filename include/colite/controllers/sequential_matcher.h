@@ -17,6 +17,7 @@ struct SequentialMatcherControllerOptions {
   std::size_t vocab_tree_num_images = 50;
   std::size_t vocab_tree_num_visual_words = 1024;
   std::size_t vocab_tree_max_num_features = 5000;
+  std::filesystem::path vocab_tree_path;
   DescriptorMatcherBackend matcher_backend = DescriptorMatcherBackend::kFlann;
   double max_ratio = 0.8;
   bool mutual_check = true;
@@ -24,6 +25,8 @@ struct SequentialMatcherControllerOptions {
 
 struct SequentialMatcherControllerSummary {
   bool success = false;
+  bool raw_match_cache_hit = false;
+  bool geometry_cache_hit = false;
   std::size_t num_images = 0;
   std::size_t num_pairs = 0;
   std::size_t num_verified_pairs = 0;

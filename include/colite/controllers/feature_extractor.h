@@ -18,6 +18,7 @@ struct FeatureExtractorControllerOptions {
 
 struct FeatureExtractorControllerSummary {
   bool success = false;
+  bool cache_hit = false;
   std::size_t num_images = 0;
   double elapsed_seconds = 0.0;
 };

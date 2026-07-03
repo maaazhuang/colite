@@ -1,6 +1,7 @@
 #include "colite/sfm/incremental_mapper.h"
 
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <optional>
 #include <set>
@@ -198,6 +199,7 @@ void CopyCandidateStatsToSummary(const ImageCandidate& candidate,
 ImageRegistrationFailureSummary MakeFailureSummary(
     const ImageCandidate& candidate,
     std::size_t attempt,
+    double registration_max_reprojection_error_px,
     const std::string& message) {
   ImageRegistrationFailureSummary failure;
   failure.image_id = candidate.image_id;
@@ -211,8 +213,32 @@ ImageRegistrationFailureSummary MakeFailureSummary(
   failure.candidate_num_verified_inliers_to_registered_images =
       candidate.num_verified_inliers_to_registered_images;
   failure.candidate_score = candidate.score;
+  failure.registration_max_reprojection_error_px =
+      registration_max_reprojection_error_px;
   failure.message = message;
   return failure;
+}
+
+ImageRegistrarOptions RegistrationOptionsForAttempt(
+    const ImageRegistrarOptions& base_options,
+    std::size_t num_previous_failures,
+    const IncrementalMappingOptions& mapping_options) {
+  ImageRegistrarOptions options = base_options;
+  if (num_previous_failures == 0) {
+    return options;
+  }
+
+  const double multiplier = std::max(
+      1.0, mapping_options.registration_retry_reprojection_error_multiplier);
+  const double max_error = std::max(
+      base_options.max_reprojection_error_px,
+      mapping_options.registration_retry_max_reprojection_error_px);
+  options.max_reprojection_error_px =
+      std::min(max_error, base_options.max_reprojection_error_px *
+                              std::pow(multiplier,
+                                       static_cast<double>(
+                                           num_previous_failures)));
+  return options;
 }
 
 std::set<Point3DId> CollectPoint3DIds(const Reconstruction& reconstruction) {
@@ -346,6 +372,8 @@ IncrementalMapperSummary RegisterNextImage(
     summary.message = "Image is missing in reconstruction";
     return summary;
   }
+  summary.registration_max_reprojection_error_px =
+      options.registration.max_reprojection_error_px;
 
   // 1. 通过已注册图像上的 2D-3D 关联估计新图像位姿。
   summary.registration =
@@ -493,14 +521,22 @@ IncrementalMappingSummary RunIncrementalMapping(
       break;
     }
 
+    bool attempted_any_image = false;
     bool registered_any_image = false;
     for (const ImageCandidate& candidate : candidates) {
+      attempted_any_image = true;
+      IncrementalMapperOptions attempt_options = options.mapper;
+      attempt_options.registration = RegistrationOptionsForAttempt(
+          options.mapper.registration, candidate.num_registration_attempts,
+          options);
       IncrementalMapperSummary registration = RegisterNextImage(
-          graph, candidate.image_id, options.mapper, reconstruction);
+          graph, candidate.image_id, attempt_options, reconstruction);
       if (!registration.success) {
         const std::size_t attempt = ++registration_trials[candidate.image_id];
         summary.failed_registrations.push_back(MakeFailureSummary(
-            candidate, attempt, registration.message));
+            candidate, attempt,
+            attempt_options.registration.max_reprojection_error_px,
+            registration.message));
         continue;
       }
 
@@ -511,7 +547,7 @@ IncrementalMappingSummary RunIncrementalMapping(
       break;
     }
 
-    if (!registered_any_image) {
+    if (!registered_any_image && !attempted_any_image) {
       break;
     }
   }

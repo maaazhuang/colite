@@ -59,6 +59,7 @@ int RunMapper(const std::vector<std::string>& args,
     }
     const auto summary = controllers::MapperController(options).Run();
     out << "Registered images: " << summary.num_registered_images << "\n"
+        << "Sparse cache hit: " << (summary.cache_hit ? 1 : 0) << "\n"
         << "Points3D: " << summary.num_points3d << "\n";
     return summary.success ? EXIT_SUCCESS : EXIT_FAILURE;
   } catch (const std::exception& exception) {
