@@ -18,5 +18,8 @@ int RunSpatialMatcher(const std::vector<std::string>& args,
 int RunVocabTreeMatcher(const std::vector<std::string>& args,
                         std::ostream& out,
                         std::ostream& err);
+int RunVocabTreeBuilder(const std::vector<std::string>& args,
+                        std::ostream& out,
+                        std::ostream& err);
 
 }  // namespace colite::exe

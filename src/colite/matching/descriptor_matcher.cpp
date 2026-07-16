@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -23,6 +25,7 @@ using DescriptorByteMatrix =
     Eigen::Matrix<std::uint8_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 using DistanceMatrix =
     Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+using FlannIndex = flann::Index<flann::L2<std::uint8_t>>;
 
 std::uint8_t ClampToByte(const float value) {
   if (!std::isfinite(value) || value <= 0.0F) {
@@ -186,7 +189,9 @@ std::vector<int> BestMatchesBruteForce(
 std::vector<int> BestMatchesFlann(
     const DescriptorByteMatrix& query_descriptors,
     const DescriptorByteMatrix& train_descriptors,
-    const DescriptorMatchingOptions& options) {
+    const DescriptorMatchingOptions& options,
+    FlannIndex* prepared_index = nullptr,
+    std::mutex* prepared_index_mutex = nullptr) {
   std::vector<int> best(static_cast<std::size_t>(query_descriptors.rows()), -1);
   if (query_descriptors.size() == 0 || train_descriptors.size() == 0) {
     return best;
@@ -201,9 +206,13 @@ std::vector<int> BestMatchesFlann(
       const_cast<std::uint8_t*>(train_descriptors.data()),
       static_cast<std::size_t>(train_descriptors.rows()),
       static_cast<std::size_t>(train_descriptors.cols()));
-  flann::Index<flann::L2<std::uint8_t>> index(
-      train_matrix, flann::KDTreeIndexParams(kFlannNumTrees));
-  index.buildIndex();
+  std::unique_ptr<FlannIndex> owned_index;
+  if (prepared_index == nullptr) {
+    owned_index = std::make_unique<FlannIndex>(
+        train_matrix, flann::KDTreeIndexParams(kFlannNumTrees));
+    owned_index->buildIndex();
+    prepared_index = owned_index.get();
+  }
 
   flann::Matrix<std::uint8_t> query_matrix(
       const_cast<std::uint8_t*>(query_descriptors.data()),
@@ -224,11 +233,19 @@ std::vector<int> BestMatchesFlann(
       static_cast<std::size_t>(query_descriptors.rows()),
       static_cast<std::size_t>(neighbor_count));
 
-  index.knnSearch(query_matrix,
-                  indices_matrix,
-                  l2_dist_matrix,
-                  neighbor_count,
-                  flann::SearchParams(kFlannNumLeavesToVisit));
+  const auto search = [&]() {
+    prepared_index->knnSearch(query_matrix,
+                              indices_matrix,
+                              l2_dist_matrix,
+                              neighbor_count,
+                              flann::SearchParams(kFlannNumLeavesToVisit));
+  };
+  if (prepared_index_mutex != nullptr) {
+    const std::lock_guard<std::mutex> lock(*prepared_index_mutex);
+    search();
+  } else {
+    search();
+  }
 
   for (int row = 0; row < query_descriptors.rows(); ++row) {
     for (int col = 0; col < neighbor_count; ++col) {
@@ -257,6 +274,89 @@ std::vector<int> BestMatches(const DescriptorByteMatrix& query_descriptors,
 }
 
 }  // namespace
+
+struct PreparedFeatureMatcher::Impl {
+  explicit Impl(const FeatureSet& features,
+                const DescriptorMatcherBackend matcher_backend)
+      : descriptors(QuantizeDescriptors(features.descriptors)),
+        backend(matcher_backend) {
+    if (backend == DescriptorMatcherBackend::kFlann &&
+        descriptors.size() != 0) {
+      flann::Matrix<std::uint8_t> matrix(
+          descriptors.data(), static_cast<std::size_t>(descriptors.rows()),
+          static_cast<std::size_t>(descriptors.cols()));
+      index = std::make_unique<FlannIndex>(
+          matrix, flann::KDTreeIndexParams(kFlannNumTrees));
+      index->buildIndex();
+    }
+  }
+
+  DescriptorByteMatrix descriptors;
+  DescriptorMatcherBackend backend;
+  std::unique_ptr<FlannIndex> index;
+  mutable std::mutex index_mutex;
+};
+
+PreparedFeatureMatcher::PreparedFeatureMatcher(
+    const FeatureSet& features,
+    const DescriptorMatcherBackend backend)
+    : impl_(std::make_unique<Impl>(features, backend)) {}
+
+PreparedFeatureMatcher::~PreparedFeatureMatcher() = default;
+PreparedFeatureMatcher::PreparedFeatureMatcher(
+    PreparedFeatureMatcher&&) noexcept = default;
+PreparedFeatureMatcher& PreparedFeatureMatcher::operator=(
+    PreparedFeatureMatcher&&) noexcept = default;
+
+std::vector<FeatureMatch> MatchPreparedFeatureSets(
+    const PreparedFeatureMatcher& features1,
+    const PreparedFeatureMatcher& features2,
+    const DescriptorMatchingOptions& options) {
+  if (features1.impl_->backend != options.backend ||
+      features2.impl_->backend != options.backend) {
+    throw std::invalid_argument(
+        "Prepared matcher backend does not match matching options.");
+  }
+  if (options.max_ratio <= 0.0 || options.max_distance <= 0.0) {
+    throw std::invalid_argument("Matching thresholds must be positive.");
+  }
+  const auto& descriptors1 = features1.impl_->descriptors;
+  const auto& descriptors2 = features2.impl_->descriptors;
+  if (descriptors1.cols() != descriptors2.cols() &&
+      descriptors1.size() != 0 && descriptors2.size() != 0) {
+    throw std::invalid_argument("Descriptor dimensions do not match.");
+  }
+  if (descriptors1.size() == 0 || descriptors2.size() == 0) {
+    return {};
+  }
+
+  const auto best_matches = [&](const PreparedFeatureMatcher::Impl& query,
+                                const PreparedFeatureMatcher::Impl& train) {
+    if (options.backend == DescriptorMatcherBackend::kBruteForce) {
+      return BestMatchesBruteForce(query.descriptors, train.descriptors,
+                                   options);
+    }
+    return BestMatchesFlann(query.descriptors, train.descriptors, options,
+                            train.index.get(), &train.index_mutex);
+  };
+  const std::vector<int> forward =
+      best_matches(*features1.impl_, *features2.impl_);
+  std::vector<int> backward;
+  if (options.mutual_check) {
+    backward = best_matches(*features2.impl_, *features1.impl_);
+  }
+  std::vector<FeatureMatch> matches;
+  for (int idx1 = 0; idx1 < static_cast<int>(forward.size()); ++idx1) {
+    const int idx2 = forward[static_cast<std::size_t>(idx1)];
+    if (idx2 >= 0 &&
+        (!options.mutual_check ||
+         backward[static_cast<std::size_t>(idx2)] == idx1)) {
+      matches.push_back({static_cast<Point2DIdx>(idx1),
+                         static_cast<Point2DIdx>(idx2)});
+    }
+  }
+  return matches;
+}
 
 std::vector<FeatureMatch> MatchFeatureSets(
     const FeatureSet& features1,

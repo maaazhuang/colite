@@ -21,11 +21,16 @@ target_link_libraries(colite_recon_sfm_exe
 
 add_library(colite_recon_mvs_exe
   recon_mvs.cpp
+  mvs_tools.cpp
+  mvs_stages.cpp
+  stage.cpp
+  recon_auto.cpp
 )
 
 target_link_libraries(colite_recon_mvs_exe
   PUBLIC
     colite_core
+    colite_recon_sfm_exe
 )
 
 add_library(colite_command_exe
@@ -57,6 +62,9 @@ target_link_libraries(spatial_matcher PRIVATE colite_sfm_command_exe)
 add_executable(vocab_tree_matcher vocab_tree_matcher_main.cpp)
 target_link_libraries(vocab_tree_matcher PRIVATE colite_sfm_command_exe)
 
+add_executable(vocab_tree_builder vocab_tree_builder_main.cpp)
+target_link_libraries(vocab_tree_builder PRIVATE colite_sfm_command_exe)
+
 add_executable(mapper mapper_main.cpp)
 target_link_libraries(mapper PRIVATE colite_sfm_command_exe)
 
@@ -76,6 +84,7 @@ if(MSVC)
   target_compile_options(sequential_matcher PRIVATE /W4)
   target_compile_options(spatial_matcher PRIVATE /W4)
   target_compile_options(vocab_tree_matcher PRIVATE /W4)
+  target_compile_options(vocab_tree_builder PRIVATE /W4)
   target_compile_options(mapper PRIVATE /W4)
   target_compile_options(compare_colmap PRIVATE /W4)
   target_compile_options(recon_sfm PRIVATE /W4)
@@ -87,6 +96,7 @@ else()
   target_compile_options(sequential_matcher PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(spatial_matcher PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(vocab_tree_matcher PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(vocab_tree_builder PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(mapper PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(compare_colmap PRIVATE -Wall -Wextra -Wpedantic)
   target_compile_options(recon_sfm PRIVATE -Wall -Wextra -Wpedantic)

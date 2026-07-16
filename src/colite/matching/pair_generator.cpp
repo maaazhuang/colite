@@ -1,4 +1,5 @@
 #include "colite/matching/pair_generator.h"
+#include "colite/matching/vocabulary_tree.h"
 
 #include <algorithm>
 #include <cmath>
@@ -150,7 +151,7 @@ std::vector<DescriptorSample> CollectDescriptorSamples(
   return samples;
 }
 
-std::vector<DescriptorVector> TrainVisualWords(
+[[maybe_unused]] std::vector<DescriptorVector> TrainVisualWords(
     const std::vector<DescriptorSample>& samples,
     const std::size_t num_visual_words) {
   if (samples.empty()) {
@@ -200,7 +201,7 @@ std::vector<DescriptorVector> TrainVisualWords(
   return words;
 }
 
-std::vector<DescriptorVector> LoadVisualWordsFromTextFile(
+[[maybe_unused]] std::vector<DescriptorVector> LoadVisualWordsFromTextFile(
     const std::filesystem::path& path) {
   std::ifstream file(path);
   if (!file.is_open()) {
@@ -243,7 +244,7 @@ std::vector<DescriptorVector> LoadVisualWordsFromTextFile(
   return words;
 }
 
-std::size_t AssignVisualWord(const DescriptorVector& descriptor,
+[[maybe_unused]] std::size_t AssignVisualWord(const DescriptorVector& descriptor,
                              const std::vector<DescriptorVector>& words) {
   std::size_t best_word = 0;
   double best_distance = std::numeric_limits<double>::max();
@@ -262,10 +263,25 @@ std::vector<ImagePair> GenerateVocabTreePairs(
     const MatchGraph& graph,
     const std::size_t num_images,
     const std::size_t num_visual_words,
+    const std::size_t branching,
+    const int num_iterations,
     const std::size_t max_num_features_per_image,
-    const std::filesystem::path& vocab_tree_path) {
+    const std::size_t sequential_overlap,
+    const std::filesystem::path& vocab_tree_path,
+    MatchingPairGeneratorSummary* summary) {
   if (num_images == 0) {
     throw std::invalid_argument("vocab_tree num_images must be positive");
+  }
+  VocabularyTree tree;
+  if (vocab_tree_path.empty()) {
+    VocabularyTreeBuildOptions build_options;
+    build_options.num_visual_words = num_visual_words;
+    build_options.branching = branching;
+    build_options.num_iterations = num_iterations;
+    build_options.max_num_features_per_image = max_num_features_per_image;
+    tree = BuildVocabularyTree(images, graph, build_options);
+  } else {
+    tree = VocabularyTree::Read(vocab_tree_path);
   }
   const std::vector<DescriptorSample> samples =
       CollectDescriptorSamples(images, graph, max_num_features_per_image);
@@ -273,14 +289,10 @@ std::vector<ImagePair> GenerateVocabTreePairs(
     throw std::invalid_argument(
         "vocab tree matching requires workspace features");
   }
-  const std::vector<DescriptorVector> words =
-      vocab_tree_path.empty()
-          ? TrainVisualWords(samples, num_visual_words)
-          : LoadVisualWordsFromTextFile(vocab_tree_path);
 
   std::map<ImageId, std::map<std::size_t, double>> histograms;
   for (const DescriptorSample& sample : samples) {
-    ++histograms[sample.image_id][AssignVisualWord(sample.values, words)];
+    ++histograms[sample.image_id][tree.Assign(sample.values)];
   }
 
   std::map<std::size_t, std::size_t> document_frequency;
@@ -356,7 +368,77 @@ std::vector<ImagePair> GenerateVocabTreePairs(
       AddPair(image.id, scored_images[i].second, &pairs);
     }
   }
+  const std::set<ImagePair> retrieval_pairs = pairs;
+  if (summary != nullptr) {
+    summary->num_retrieval_pairs = retrieval_pairs.size();
+  }
+  if (sequential_overlap > 0) {
+    const std::vector<ImagePair> guard_pairs =
+        GenerateSequentialPairs(images, sequential_overlap);
+    std::size_t recalled = 0;
+    for (const ImagePair& pair : guard_pairs) {
+      if (retrieval_pairs.count(pair) > 0) {
+        ++recalled;
+      }
+      pairs.insert(pair);
+    }
+    if (summary != nullptr) {
+      summary->num_sequential_guard_pairs = guard_pairs.size();
+      summary->num_sequential_pairs_added = guard_pairs.size() - recalled;
+      summary->sequential_pair_recall =
+          guard_pairs.empty()
+              ? 1.0
+              : static_cast<double>(recalled) / guard_pairs.size();
+    }
+  }
   return ToVector(pairs);
+}
+
+void ComputeGraphSummary(const std::vector<Image>& images,
+                         const std::vector<ImagePair>& pairs,
+                         MatchingPairGeneratorSummary* summary) {
+  if (summary == nullptr) {
+    return;
+  }
+  std::map<ImageId, std::vector<ImageId>> adjacency;
+  for (const Image& image : images) {
+    adjacency[image.id];
+  }
+  for (const ImagePair& pair : pairs) {
+    adjacency[pair.image_id1].push_back(pair.image_id2);
+    adjacency[pair.image_id2].push_back(pair.image_id1);
+  }
+  if (adjacency.empty()) {
+    return;
+  }
+  summary->min_degree = std::numeric_limits<std::size_t>::max();
+  std::size_t degree_sum = 0;
+  for (const auto& [image_id, neighbors] : adjacency) {
+    (void)image_id;
+    summary->min_degree = std::min(summary->min_degree, neighbors.size());
+    summary->max_degree = std::max(summary->max_degree, neighbors.size());
+    degree_sum += neighbors.size();
+  }
+  summary->mean_degree = static_cast<double>(degree_sum) / adjacency.size();
+
+  std::set<ImageId> visited;
+  for (const auto& [root, neighbors] : adjacency) {
+    (void)neighbors;
+    if (!visited.insert(root).second) {
+      continue;
+    }
+    ++summary->num_connected_components;
+    std::vector<ImageId> stack{root};
+    while (!stack.empty()) {
+      const ImageId image_id = stack.back();
+      stack.pop_back();
+      for (const ImageId neighbor : adjacency.at(image_id)) {
+        if (visited.insert(neighbor).second) {
+          stack.push_back(neighbor);
+        }
+      }
+    }
+  }
 }
 
 }  // namespace
@@ -382,14 +464,22 @@ std::vector<ImagePair> GenerateMatchingPairs(
 std::vector<ImagePair> GenerateMatchingPairs(
     const std::vector<Image>& images,
     const MatchGraph& graph,
-    const MatchingPairGeneratorOptions& options) {
+    const MatchingPairGeneratorOptions& options,
+    MatchingPairGeneratorSummary* summary) {
+  std::vector<ImagePair> pairs;
   if (options.strategy == MatchingStrategy::kVocabTree) {
-    return GenerateVocabTreePairs(images, graph, options.vocab_tree_num_images,
-                                  options.vocab_tree_num_visual_words,
-                                  options.vocab_tree_max_num_features,
-                                  options.vocab_tree_path);
+    pairs = GenerateVocabTreePairs(
+        images, graph, options.vocab_tree_num_images,
+        options.vocab_tree_num_visual_words, options.vocab_tree_branching,
+        options.vocab_tree_num_iterations,
+        options.vocab_tree_max_num_features,
+        options.vocab_tree_sequential_overlap, options.vocab_tree_path,
+        summary);
+  } else {
+    pairs = GenerateMatchingPairs(images, options);
   }
-  return GenerateMatchingPairs(images, options);
+  ComputeGraphSummary(images, pairs, summary);
+  return pairs;
 }
 
 }  // namespace colite

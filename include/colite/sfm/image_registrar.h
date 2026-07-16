@@ -13,15 +13,17 @@ namespace colite {
 struct ImageRegistrarOptions {
   std::size_t min_num_correspondences = 15;
   std::size_t min_num_inliers = 12;
-  int max_num_iterations = 100;
+  int min_num_iterations = 100;
+  int max_num_iterations = 10000;
   double max_reprojection_error_px = 4.0;
-  double confidence = 0.999;
+  double confidence = 0.99999;
 };
 
 struct ImageRegistrationSummary {
   bool success = false;
   ImageId image_id = kInvalidImageId;
   std::size_t num_correspondences = 0;
+  std::size_t num_ransac_inliers = 0;
   std::size_t num_inliers = 0;
   std::string message;
 };

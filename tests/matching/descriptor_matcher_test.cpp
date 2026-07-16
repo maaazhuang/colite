@@ -84,6 +84,19 @@ TEST(DescriptorMatcherTest, FlannMatchesSamePairsAsBruteForceBranch) {
   EXPECT_EQ(ToPairs(flann_matches), ToPairs(bf_matches));
 }
 
+TEST(DescriptorMatcherTest, PreparedFlannMatchesOneShotMatcher) {
+  FeatureSet features1;
+  FeatureSet features2;
+  features1.descriptors = MakeBlockDescriptors({0, 1, 2});
+  features2.descriptors = MakeBlockDescriptors({0, 1, 2, 3});
+  DescriptorMatchingOptions options;
+  options.backend = DescriptorMatcherBackend::kFlann;
+  const PreparedFeatureMatcher prepared1(features1, options.backend);
+  const PreparedFeatureMatcher prepared2(features2, options.backend);
+  EXPECT_EQ(ToPairs(MatchPreparedFeatureSets(prepared1, prepared2, options)),
+            ToPairs(MatchFeatureSets(features1, features2, options)));
+}
+
 TEST(DescriptorMatcherTest, RejectsAmbiguousMatchByRatio) {
   const DescriptorMatrix descriptors1 = MakeBlockDescriptors({0});
   const DescriptorMatrix descriptors2 = MakeBlockDescriptors({0, 0});

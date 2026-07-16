@@ -2,8 +2,10 @@ add_executable(colite_core_tests
   core/camera_test.cpp
   core/geometry_test.cpp
   core/match_graph_test.cpp
+  core/parallel_test.cpp
   core/reconstruction_test.cpp
   features/sift_extractor_test.cpp
+  features/sift_cpu_cuda_overlap_test.cpp
   features/sift_reference_consistency_test.cpp
   integration/recon_mvs_exe_test.cpp
   integration/recon_sfm_exe_test.cpp
@@ -18,7 +20,10 @@ add_executable(colite_core_tests
   mvs/dense_cloud_test.cpp
   mvs/dense_map_test.cpp
   mvs/image_workspace_test.cpp
+  mvs/image_undistorter_test.cpp
   mvs/mvs_pipeline_test.cpp
+  mvs/meshing_test.cpp
+  mvs/mesh_texturer_test.cpp
   mvs/patch_match_test.cpp
   sfm/global_bundle_adjuster_test.cpp
   sfm/image_registrar_test.cpp

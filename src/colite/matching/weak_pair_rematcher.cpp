@@ -9,7 +9,7 @@ namespace {
 
 bool IsNearbyPair(const ImagePair& pair, std::size_t nearby_image_window) {
   if (nearby_image_window == 0) {
-    return true;
+    return false;
   }
   const ImageId diff = pair.image_id1 > pair.image_id2
                            ? pair.image_id1 - pair.image_id2
@@ -69,6 +69,10 @@ WeakPairRematchingSummary RematchWeakImagePairs(
     }
 
     const std::size_t old_num_inliers = old_geometry->inlier_matches.size();
+    const std::vector<FeatureMatch>* old_matches =
+        FindMatches(*graph, pair.image_id1, pair.image_id2);
+    const std::size_t old_num_matches =
+        old_matches == nullptr ? 0 : old_matches->size();
     const std::vector<FeatureMatch> relaxed_matches =
         MatchFeatureSets(*features1, *features2, options.relaxed_matching);
     ++summary.num_rematched_pairs;
@@ -84,9 +88,19 @@ WeakPairRematchingSummary RematchWeakImagePairs(
     const TwoViewGeometry new_geometry = EstimateTwoViewGeometry(
         *camera1, *features1, *camera2, *features2, guided_matches,
         options.verification);
+    const double old_inlier_ratio =
+        old_num_matches == 0
+            ? 0.0
+            : static_cast<double>(old_num_inliers) / old_num_matches;
+    const double new_inlier_ratio =
+        guided_matches.empty()
+            ? 0.0
+            : static_cast<double>(new_geometry.inlier_matches.size()) /
+                  guided_matches.size();
     if (!IsUsableGeometry(new_geometry) ||
         new_geometry.inlier_matches.size() <
-            old_num_inliers + options.min_inlier_gain) {
+            old_num_inliers + options.min_inlier_gain ||
+        new_inlier_ratio + 1e-12 < old_inlier_ratio) {
       continue;
     }
 

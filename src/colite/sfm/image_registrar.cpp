@@ -13,10 +13,19 @@
 
 #include "colite/core/geometry.h"
 
+#ifdef COLITE_HAS_POSELIB
+#include <PoseLib/solvers/p3p.h>
+#endif
+
 namespace colite {
 namespace {
 
 constexpr std::size_t kMinDltPnPPoints = 6;
+#ifdef COLITE_HAS_POSELIB
+constexpr std::size_t kMinPnPPoints = 3;
+#else
+constexpr std::size_t kMinPnPPoints = kMinDltPnPPoints;
+#endif
 constexpr double kMinProjectionScale = 1e-12;
 
 struct PnPCorrespondence {
@@ -256,49 +265,132 @@ std::vector<std::size_t> InliersForPose(
 struct PnPRansacResult {
   Pose3 pose;
   std::vector<std::size_t> inlier_indices;
+  std::size_t num_inliers_before_final_refinement = 0;
 };
+
+std::vector<Pose3> EstimateMinimalPoses(
+    const Camera& camera,
+    const std::vector<PnPCorrespondence>& correspondences,
+    const std::vector<std::size_t>& indices) {
+  std::vector<Pose3> poses;
+#ifdef COLITE_HAS_POSELIB
+  if (indices.size() != 3) {
+    return poses;
+  }
+  std::vector<Eigen::Vector3d> rays;
+  std::vector<Eigen::Vector3d> points3d;
+  rays.reserve(3);
+  points3d.reserve(3);
+  for (const std::size_t idx : indices) {
+    rays.push_back(
+        NormalizedImagePoint(camera, correspondences[idx].xy)
+            .homogeneous()
+            .normalized());
+    points3d.push_back(correspondences[idx].xyz);
+  }
+  std::vector<poselib::CameraPose> solutions;
+  poselib::p3p(rays, points3d, &solutions);
+  poses.reserve(solutions.size());
+  for (const poselib::CameraPose& solution : solutions) {
+    const Eigen::Matrix<double, 3, 4> matrix = solution.Rt();
+    Pose3 pose;
+    pose.q_cw = Eigen::Quaterniond(matrix.leftCols<3>()).normalized();
+    pose.t_cw = matrix.col(3);
+    poses.push_back(pose);
+  }
+#else
+  const std::optional<Pose3> pose =
+      EstimatePoseDlt(camera, correspondences, indices);
+  if (pose) {
+    poses.push_back(*pose);
+  }
+#endif
+  return poses;
+}
 
 PnPRansacResult EstimatePoseRansac(
     const Camera& camera,
     const std::vector<PnPCorrespondence>& correspondences,
     const ImageRegistrarOptions& options) {
   PnPRansacResult best;
-  if (correspondences.size() < kMinDltPnPPoints) {
+  if (correspondences.size() < kMinPnPPoints) {
     return best;
   }
 
   std::mt19937 rng(0);
-  const int iterations = std::max(1, options.max_num_iterations);
-  for (int iteration = 0; iteration < iterations; ++iteration) {
+  const int min_iterations = std::max(1, options.min_num_iterations);
+  const int max_iterations =
+      std::max(min_iterations, options.max_num_iterations);
+  int required_iterations = max_iterations;
+  for (int iteration = 0; iteration < required_iterations; ++iteration) {
     const std::vector<std::size_t> sample =
-        correspondences.size() == kMinDltPnPPoints
+        correspondences.size() == kMinPnPPoints
             ? AllIndices(correspondences.size())
             : SampleUniqueIndices(&rng, correspondences.size(),
-                                  kMinDltPnPPoints);
-    const std::optional<Pose3> pose =
-        EstimatePoseDlt(camera, correspondences, sample);
-    if (!pose) {
-      continue;
-    }
+                                  kMinPnPPoints);
+    for (const Pose3& pose :
+         EstimateMinimalPoses(camera, correspondences, sample)) {
+      std::vector<std::size_t> inliers = InliersForPose(
+          camera, correspondences, pose, options.max_reprojection_error_px);
+      if (inliers.size() > best.inlier_indices.size()) {
+        best.pose = pose;
+        best.inlier_indices = std::move(inliers);
 
-    std::vector<std::size_t> inliers = InliersForPose(
-        camera, correspondences, *pose, options.max_reprojection_error_px);
-    if (inliers.size() > best.inlier_indices.size()) {
-      best.pose = *pose;
-      best.inlier_indices = std::move(inliers);
-      if (best.inlier_indices.size() == correspondences.size()) {
-        break;
+        // Local optimization uses all current inliers. The Eigen DLT solver
+        // is non-minimal here and keeps builds without PoseLib functional.
+        if (best.inlier_indices.size() >= kMinDltPnPPoints) {
+          const std::optional<Pose3> local =
+              EstimatePoseDlt(camera, correspondences, best.inlier_indices);
+          if (local) {
+            std::vector<std::size_t> local_inliers = InliersForPose(
+                camera, correspondences, *local,
+                options.max_reprojection_error_px);
+            if (local_inliers.size() >= best.inlier_indices.size()) {
+              best.pose = *local;
+              best.inlier_indices = std::move(local_inliers);
+            }
+          }
+        }
+
+        if (best.inlier_indices.size() == correspondences.size()) {
+          best.num_inliers_before_final_refinement =
+              best.inlier_indices.size();
+          return best;
+        }
+        const double ratio =
+            static_cast<double>(best.inlier_indices.size()) /
+            correspondences.size();
+        const double sample_success =
+            std::pow(ratio, static_cast<double>(kMinPnPPoints));
+        if (sample_success > 0.0 && sample_success < 1.0) {
+          const double confidence =
+              std::clamp(options.confidence, 0.0, 1.0 - 1e-12);
+          const double estimate = std::log(1.0 - confidence) /
+                                  std::log(1.0 - sample_success);
+          if (std::isfinite(estimate)) {
+            required_iterations = std::clamp(
+                static_cast<int>(std::ceil(estimate)), min_iterations,
+                max_iterations);
+            required_iterations =
+                std::max(required_iterations, iteration + 1);
+          }
+        }
       }
     }
   }
 
+  best.num_inliers_before_final_refinement = best.inlier_indices.size();
   if (best.inlier_indices.size() >= kMinDltPnPPoints) {
     const std::optional<Pose3> refined =
         EstimatePoseDlt(camera, correspondences, best.inlier_indices);
     if (refined) {
-      best.pose = *refined;
-      best.inlier_indices = InliersForPose(camera, correspondences, best.pose,
-                                           options.max_reprojection_error_px);
+      std::vector<std::size_t> refined_inliers =
+          InliersForPose(camera, correspondences, *refined,
+                         options.max_reprojection_error_px);
+      if (refined_inliers.size() >= best.inlier_indices.size()) {
+        best.pose = *refined;
+        best.inlier_indices = std::move(refined_inliers);
+      }
     }
   }
 
@@ -366,6 +458,7 @@ ImageRegistrationSummary RegisterImageWithExistingPoints(
   const Camera& camera = reconstruction->GetCamera(image.camera_id);
   const PnPRansacResult result =
       EstimatePoseRansac(camera, correspondences, options);
+  summary.num_ransac_inliers = result.num_inliers_before_final_refinement;
   summary.num_inliers = result.inlier_indices.size();
   if (summary.num_inliers < options.min_num_inliers) {
     summary.message = "PnP RANSAC failed or found too few inliers";

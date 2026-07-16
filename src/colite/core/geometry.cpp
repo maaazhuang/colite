@@ -5,6 +5,8 @@
 
 #include <Eigen/SVD>
 
+#include "colite/core/reconstruction.h"
+
 namespace colite {
 namespace {
 
@@ -57,6 +59,36 @@ std::optional<double> ReprojectionError(
   return (*projected - observed_pixel).norm();
 }
 
+std::optional<double> Point3DTrackReprojectionError(
+    const Reconstruction& reconstruction,
+    const Point3D& point3d) {
+  double squared_error_sum = 0.0;
+  std::size_t num_observations = 0;
+  for (const TrackElement& element : point3d.track.elements) {
+    if (!reconstruction.ExistsImage(element.image_id)) {
+      continue;
+    }
+    const Image& image = reconstruction.GetImage(element.image_id);
+    if (!image.HasPose() || !reconstruction.ExistsCamera(image.camera_id) ||
+        element.point2d_idx >= image.points2d.size()) {
+      continue;
+    }
+    const std::optional<double> error = ReprojectionError(
+        reconstruction.GetCamera(image.camera_id), *image.cam_from_world,
+        point3d.xyz, image.points2d[element.point2d_idx].xy);
+    if (!error || !std::isfinite(*error)) {
+      continue;
+    }
+    squared_error_sum += *error * *error;
+    ++num_observations;
+  }
+  if (num_observations == 0) {
+    return std::nullopt;
+  }
+  return std::sqrt(squared_error_sum /
+                   static_cast<double>(num_observations));
+}
+
 std::optional<Eigen::Vector3d> TriangulatePoint(
     const Camera& camera1,
     const Pose3& cam1_from_world,
@@ -104,4 +136,3 @@ double TriangulationAngleDegrees(const Pose3& cam1_from_world,
 }
 
 }  // namespace colite
-

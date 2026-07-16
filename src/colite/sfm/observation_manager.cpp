@@ -79,15 +79,8 @@ bool ObservationManager::MergePoints(Point3DId target_point3d_id,
     return false;
   }
 
-  const Point3D& target_point3d =
-      reconstruction_->GetPoint3D(target_point3d_id);
-  const Point3D& source_point3d =
-      reconstruction_->GetPoint3D(source_point3d_id);
-  if (TrackHasImageConflict(target_point3d.track, source_point3d.track)) {
-    return false;
-  }
-
-  const Track source_track = source_point3d.track;
+  const Track source_track =
+      reconstruction_->GetPoint3D(source_point3d_id).track;
   if (!reconstruction_->DeletePoint3D(source_point3d_id)) {
     return false;
   }
@@ -95,6 +88,10 @@ bool ObservationManager::MergePoints(Point3DId target_point3d_id,
   Point3D& merged_point3d = reconstruction_->GetPoint3D(target_point3d_id);
   merged_point3d.xyz = merged_xyz;
   for (const TrackElement& element : source_track.elements) {
+    // COLMAP concatenates both tracks. Multiple distinct features from the
+    // same image are retained and later BA/filtering decides whether they are
+    // geometrically consistent; rejecting the whole merge here leaves many
+    // duplicate short tracks.
     AddObservation(target_point3d_id, element.image_id, element.point2d_idx);
   }
   return true;
@@ -112,18 +109,6 @@ bool ObservationManager::HasValidObservation(ImageId image_id,
   }
   const Image& image = reconstruction_->GetImage(image_id);
   return point2d_idx < image.points2d.size();
-}
-
-bool ObservationManager::TrackHasImageConflict(const Track& track1,
-                                               const Track& track2) const {
-  for (const TrackElement& element1 : track1.elements) {
-    for (const TrackElement& element2 : track2.elements) {
-      if (element1.image_id == element2.image_id) {
-        return true;
-      }
-    }
-  }
-  return false;
 }
 
 }  // namespace colite

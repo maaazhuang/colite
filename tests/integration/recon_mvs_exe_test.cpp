@@ -1,4 +1,5 @@
 #include "colite/exe/recon_mvs.h"
+#include "colite/exe/mvs_stages.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -75,11 +76,16 @@ TEST(ReconMvsExeTest, PrintsHelp) {
             std::string::npos);
   EXPECT_NE(out.str().find("--patch_match_propagation_schedule"),
             std::string::npos);
+  EXPECT_NE(out.str().find("default checkerboard"), std::string::npos);
   EXPECT_NE(out.str().find("--patch_match_backend"), std::string::npos);
   EXPECT_NE(out.str().find("--patch_match_gpu_index"), std::string::npos);
   EXPECT_NE(out.str().find("--patch_match_pyramid_levels"),
             std::string::npos);
   EXPECT_NE(out.str().find("--patch_match_perturbation_samples"),
+            std::string::npos);
+  EXPECT_NE(out.str().find("--patch_match_directional_hmm"),
+            std::string::npos);
+  EXPECT_NE(out.str().find("--patch_match_source_samples"),
             std::string::npos);
   EXPECT_NE(out.str().find("--refine_normals_from_depth"),
             std::string::npos);
@@ -97,6 +103,11 @@ TEST(ReconMvsExeTest, PrintsHelp) {
   EXPECT_NE(out.str().find("--num_threads"), std::string::npos);
   EXPECT_NE(out.str().find("--filter_dense_cloud"), std::string::npos);
   EXPECT_NE(out.str().find("--mesh_dense_cloud"), std::string::npos);
+  EXPECT_NE(out.str().find("--poisson_mesher"), std::string::npos);
+  EXPECT_NE(out.str().find("--delaunay_mesher"), std::string::npos);
+  EXPECT_NE(out.str().find("--mesh_simplifier"), std::string::npos);
+  EXPECT_NE(out.str().find("--mesh_texturer"), std::string::npos);
+  EXPECT_NE(out.str().find("--image_undistorter"), std::string::npos);
   EXPECT_NE(out.str().find("--fusion_source_pixel_search_radius"),
             std::string::npos);
   EXPECT_TRUE(err.str().empty());
@@ -361,8 +372,151 @@ TEST(ReconMvsExeTest, RunsPatchMatchStereoWhenRequested) {
   EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
                 .find("normal_refined_pixels"),
             std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_total_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_wrapper_total_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_request_validation_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_pyramid_resize_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_single_scale_dispatch_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_result_materialization_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_output_to_vector_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_dense_map_fill_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_normal_refinement_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_valid_cost_count_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_host_initial_normal_upload_normalizations"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_host_output_normalizations"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_device_count_queries"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_device_count_cache_hits"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_evaluate_cost_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_workspace_texture_reuses"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_workspace_buffer_reuses"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_iteration_counter_readbacks"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_output_map_readbacks"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_async_host_uploads"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_async_texture_uploads"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_async_output_readbacks"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_pinned_host_upload_bytes"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_pinned_texture_upload_bytes"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_pinned_host_staging_bytes"),
+            std::string::npos);
+  EXPECT_TRUE(std::filesystem::exists(output_path / "stereo" /
+                                      "patch_match_initial.tsv"));
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match_initial.tsv")
+                .find("cuda_wrapper_total_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match_initial.tsv")
+                .find("cuda_host_pack_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match_initial.tsv")
+                .find("cuda_host_output_normalizations"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match_initial.tsv")
+                .find("cuda_result_materialization_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match_initial.tsv")
+                .find("cuda_output_to_vector_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match_initial.tsv")
+                .find("cuda_dense_map_fill_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match_initial.tsv")
+                .find("cuda_normal_refinement_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match_initial.tsv")
+                .find("cuda_valid_cost_count_time_ms"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match_initial.tsv")
+                .find("cuda_device_count_queries"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match_initial.tsv")
+                .find("cuda_device_count_cache_hits"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_workspace_pool_size"),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
+                .find("cuda_workspace_pool_slot"),
+            std::string::npos);
   EXPECT_NE(ReadTextFile(output_path / "summary.txt")
                 .find("normal_refined_pixels "),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "summary.txt")
+                .find("patch_match_refinement_wall_time_ms "),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "summary.txt")
+                .find("patch_match_refinement_sum_cuda_time_ms "),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "summary.txt")
+                .find("patch_match_refinement_overlap_saved_time_ms "),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "summary.txt")
+                .find("patch_match_refinement_overlap_ratio "),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "summary.txt")
+                .find("patch_match_initial_deferred_photometric_stats_images "),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "summary.txt")
+                .find("cuda_warmup_time_ms "),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "summary.txt")
+                .find("patch_match_initial_source_setup_sum_time_ms "),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "summary.txt")
+                .find("patch_match_initial_stereo_run_sum_time_ms "),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "summary.txt")
+                .find("patch_match_initial_stereo_wrapper_overhead_sum_time_ms "),
+            std::string::npos);
+  EXPECT_NE(ReadTextFile(output_path / "summary.txt")
+                .find("patch_match_initial_postprocess_sum_time_ms "),
             std::string::npos);
 }
 
@@ -398,11 +552,25 @@ TEST(ReconMvsExeTest, RunsPatchMatchStereoWithTwoThreadsWhenRequested) {
 
   EXPECT_EQ(exit_code, 0) << err.str();
   EXPECT_NE(out.str().find("PatchMatch images: 2"), std::string::npos);
+  const std::string summary = ReadTextFile(output_path / "summary.txt");
+  EXPECT_NE(summary.find("patch_match_initial_wall_time_ms "),
+            std::string::npos);
+  EXPECT_NE(summary.find("patch_match_initial_sum_cuda_time_ms "),
+            std::string::npos);
+  EXPECT_NE(summary.find("patch_match_initial_overlap_saved_time_ms "),
+            std::string::npos);
+  EXPECT_NE(summary.find("patch_match_initial_overlap_ratio "),
+            std::string::npos);
   EXPECT_TRUE(std::filesystem::exists(output_path / "stereo" /
                                       "patch_match.tsv"));
   EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
-                .find("image_id\trequested_backend\tactual_backend"
-                      "\tpyramid_levels\titerations\tvalid_cost_pixels"),
+            .find("image_id\trequested_backend\tactual_backend"
+                  "\tpyramid_levels\titerations\tbilateral_ncc"
+                  "\tsigma_spatial"
+                  "\tsigma_color\tdynamic_source_selection\tncc_sigma"
+                  "\tprevious_selection_probability_weight"
+                  "\tmin_selection_probability"
+                  "\tmax_selection_probability\tvalid_cost_pixels"),
             std::string::npos);
 }
 
@@ -497,6 +665,9 @@ TEST(ReconMvsExeTest, WritesBinaryDenseMapsWhenRequested) {
   EXPECT_TRUE(std::filesystem::exists(output_path / "stereo" /
                                       "consistency_graphs" /
                                       "image1.jpg.bin"));
+  EXPECT_TRUE(std::filesystem::exists(output_path / "stereo" /
+                                      "consistency_graphs_colmap" /
+                                      "image1.jpg.bin"));
   EXPECT_TRUE(std::filesystem::exists(output_path / "stereo" / "cost_maps" /
                                       "image1.jpg.txt"));
 }
@@ -558,6 +729,8 @@ TEST(ReconMvsExeTest, WritesStereoFusionPlyWhenRequested) {
   const std::filesystem::path ply_path =
       output_path / "dense" / "fused.ply";
   ASSERT_TRUE(std::filesystem::exists(ply_path));
+  EXPECT_TRUE(std::filesystem::exists(output_path / "dense" /
+                                      "points_visibility.bin"));
   const std::string ply = ReadTextFile(ply_path);
   EXPECT_NE(ply.find("element vertex "), std::string::npos);
   EXPECT_NE(ply.find("property float nx"), std::string::npos);
@@ -617,6 +790,106 @@ TEST(ReconMvsExeTest, WritesStereoFusionPlyWhenRequested) {
             std::string::npos);
   EXPECT_NE(error_distribution.find("view_angle_degrees\tpercentile\tp95"),
             std::string::npos);
+}
+
+TEST(ReconMvsExeTest, StandaloneFusionReusesPersistedPatchMatchMaps) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() /
+      "colite_recon_mvs_standalone_fusion_test";
+  const std::filesystem::path model_path = root / "model";
+  const std::filesystem::path image_path = root / "images";
+  const std::filesystem::path output_path = root / "mvs";
+  std::filesystem::remove_all(root);
+  WriteSmallColmapTextModel(model_path);
+  WriteSmallImages(image_path);
+
+  std::ostringstream patch_out;
+  std::ostringstream err;
+  ASSERT_EQ(RunPatchMatchStereo(
+                {"patch_match_stereo", "--model_path", model_path.string(),
+                 "--image_path", image_path.string(), "--output_path",
+                 output_path.string(), "--patch_match_iterations", "1",
+                 "--patch_match_window_radius", "1"},
+                patch_out, err),
+            0)
+      << err.str();
+  const auto depth_path = output_path / "stereo" / "depth_maps" /
+                          "image1.jpg.txt";
+  ASSERT_TRUE(std::filesystem::exists(depth_path));
+  const auto depth_time = std::filesystem::last_write_time(depth_path);
+
+  std::ostringstream fusion_out;
+  err.str("");
+  err.clear();
+  EXPECT_EQ(RunStereoFusion(
+                {"stereo_fusion", "--model_path", model_path.string(),
+                 "--image_path", image_path.string(), "--output_path",
+                 output_path.string(), "--fusion_min_num_observations", "1"},
+                fusion_out, err),
+            0)
+      << err.str();
+  EXPECT_EQ(std::filesystem::last_write_time(depth_path), depth_time);
+  EXPECT_TRUE(std::filesystem::exists(output_path / "dense" / "fused.ply"));
+  EXPECT_TRUE(std::filesystem::exists(
+      output_path / ".colite" / "stages" / "patch_match_stereo.json"));
+  EXPECT_TRUE(std::filesystem::exists(
+      output_path / ".colite" / "stages" / "stereo_fusion.json"));
+
+  std::ostringstream resume_out;
+  err.str("");
+  err.clear();
+  EXPECT_EQ(RunStereoFusion(
+                {"stereo_fusion", "--model_path", model_path.string(),
+                 "--image_path", image_path.string(), "--output_path",
+                 output_path.string(), "--fusion_min_num_observations", "1",
+                 "--resume"},
+                resume_out, err),
+            0)
+      << err.str();
+  EXPECT_NE(resume_out.str().find("SKIP stereo_fusion"), std::string::npos);
+}
+
+TEST(ReconMvsExeTest, WritesUndistortedWorkspaceWhenRequested) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() /
+      "colite_recon_mvs_undistorter_test";
+  const std::filesystem::path model_path = root / "model";
+  const std::filesystem::path image_path = root / "images";
+  const std::filesystem::path output_path = root / "mvs";
+  std::filesystem::remove_all(root);
+  WriteSmallColmapTextModel(model_path);
+  WriteSmallImages(image_path);
+
+  std::ostringstream out;
+  std::ostringstream err;
+  const int exit_code = RunReconMvs(
+      {"recon_mvs", "--model_path", model_path.string(), "--image_path",
+       image_path.string(), "--output_path", output_path.string(),
+       "--image_undistorter", "--undistort_max_image_size", "64",
+       "--initialize_patch_match"},
+      out, err);
+
+  EXPECT_EQ(exit_code, 0) << err.str();
+  EXPECT_TRUE(std::filesystem::exists(output_path / "undistorted" / "images" /
+                                      "image1.jpg"));
+  EXPECT_TRUE(std::filesystem::exists(output_path / "undistorted" / "images" /
+                                      "image2.jpg"));
+  EXPECT_TRUE(std::filesystem::exists(output_path / "undistorted" / "sparse" /
+                                      "cameras.txt"));
+  EXPECT_TRUE(std::filesystem::exists(output_path / "undistorted" / "sparse" /
+                                      "images.txt"));
+  EXPECT_TRUE(std::filesystem::exists(output_path / "undistorted" / "sparse" /
+                                      "points3D.txt"));
+  EXPECT_NE(ReadTextFile(output_path / "undistorted" / "sparse" /
+                         "cameras.txt")
+                .find("PINHOLE 64 51"),
+            std::string::npos);
+  EXPECT_NE(out.str().find("Undistorted images: 2"), std::string::npos);
+  EXPECT_NE(out.str().find("Initialized PatchMatch images: 2"),
+            std::string::npos);
+  EXPECT_TRUE(std::filesystem::exists(output_path / "stereo" / "depth_maps" /
+                                      "image1.jpg.init.txt"));
+  std::filesystem::remove_all(root);
 }
 
 TEST(ReconMvsExeTest, WritesCleanDenseCloudAndMeshWhenRequested) {

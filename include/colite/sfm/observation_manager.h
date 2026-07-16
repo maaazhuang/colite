@@ -28,8 +28,6 @@ class ObservationManager {
  private:
   bool HasReconstruction() const;
   bool HasValidObservation(ImageId image_id, Point2DIdx point2d_idx) const;
-  bool TrackHasImageConflict(const Track& track1, const Track& track2) const;
-
   Reconstruction* reconstruction_ = nullptr;
 };
 

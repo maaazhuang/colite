@@ -10,7 +10,9 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <memory>
 
+#include "colite/core/parallel.h"
 #include "colite/io/sfm_workspace.h"
 #include "colite/matching/two_view_geometry_batch.h"
 
@@ -100,8 +102,14 @@ std::vector<std::pair<std::string, std::string>> RawMatchCacheEntries(
            std::to_string(options.vocab_tree_num_images)},
           {"vocab_tree_num_visual_words",
            std::to_string(options.vocab_tree_num_visual_words)},
+          {"vocab_tree_branching",
+           std::to_string(options.vocab_tree_branching)},
+          {"vocab_tree_num_iterations",
+           std::to_string(options.vocab_tree_num_iterations)},
           {"vocab_tree_max_num_features",
            std::to_string(options.vocab_tree_max_num_features)},
+          {"vocab_tree_sequential_overlap",
+           std::to_string(options.vocab_tree_sequential_overlap)},
           {"vocab_tree_path", options.vocab_tree_path.lexically_normal().string()},
           {"matcher_backend", MatcherBackendName(options.matcher_backend)},
           {"max_ratio", ToConfigValue(options.max_ratio)},
@@ -112,7 +120,11 @@ std::vector<std::pair<std::string, std::string>> GeometryCacheEntries(
     const std::string& raw_match_hash) {
   return {{"stage", "geometry"},
           {"raw_match_hash", raw_match_hash},
-          {"keep_degenerate", "1"}};
+          {"keep_degenerate", "1"},
+          {"algorithm_version", "five_point_adaptive_lo_ransac_v3"},
+          {"min_num_iterations", "100"},
+          {"max_num_iterations", "10000"},
+          {"confidence", "0.999"}};
 }
 
 std::optional<std::size_t> ReadCacheSizeValue(
@@ -170,8 +182,12 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
   pair_options.vocab_tree_num_images = options_.vocab_tree_num_images;
   pair_options.vocab_tree_num_visual_words =
       options_.vocab_tree_num_visual_words;
+  pair_options.vocab_tree_branching = options_.vocab_tree_branching;
+  pair_options.vocab_tree_num_iterations = options_.vocab_tree_num_iterations;
   pair_options.vocab_tree_max_num_features =
       options_.vocab_tree_max_num_features;
+  pair_options.vocab_tree_sequential_overlap =
+      options_.vocab_tree_sequential_overlap;
   pair_options.vocab_tree_path = options_.vocab_tree_path;
 
   if (const auto cached_num_pairs = ReadCacheSizeValue(
@@ -179,24 +195,88 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
     ReadWorkspaceMatches(options_.workspace_path, &graph);
     summary.num_pairs = *cached_num_pairs;
     summary.raw_match_cache_hit = true;
+    const WorkspaceCacheMetadata metadata =
+        ReadWorkspaceCacheMetadata(options_.workspace_path, "matches");
+    const auto read_size = [&](const std::string& key) {
+      const auto it = metadata.values.find(key);
+      return it == metadata.values.end()
+                 ? std::size_t{0}
+                 : static_cast<std::size_t>(std::stoull(it->second));
+    };
+    summary.pair_generation.num_retrieval_pairs =
+        read_size("retrieval_pairs");
+    summary.pair_generation.num_sequential_guard_pairs =
+        read_size("sequential_guard_pairs");
+    summary.pair_generation.num_sequential_pairs_added =
+        read_size("sequential_pairs_added");
+    summary.pair_generation.num_connected_components =
+        read_size("connected_components");
+    summary.pair_generation.min_degree = read_size("min_degree");
+    summary.pair_generation.max_degree = read_size("max_degree");
+    if (const auto it = metadata.values.find("sequential_pair_recall");
+        it != metadata.values.end()) {
+      summary.pair_generation.sequential_pair_recall = std::stod(it->second);
+    }
+    if (const auto it = metadata.values.find("mean_degree");
+        it != metadata.values.end()) {
+      summary.pair_generation.mean_degree = std::stod(it->second);
+    }
   } else {
     const std::vector<ImagePair> pairs =
-        GenerateMatchingPairs(images, graph, pair_options);
+        GenerateMatchingPairs(images, graph, pair_options,
+                              &summary.pair_generation);
 
-    for (const ImagePair& pair : pairs) {
-      const FeatureSet* features1 = FindFeatures(graph, pair.image_id1);
-      const FeatureSet* features2 = FindFeatures(graph, pair.image_id2);
-      if (features1 == nullptr || features2 == nullptr) {
-        throw std::runtime_error("Workspace features are incomplete");
-      }
-      SetMatches(&graph, pair.image_id1, pair.image_id2,
-                 MatchFeatureSets(*features1, *features2, matching_options));
-      ++summary.num_pairs;
+    std::map<ImageId, std::size_t> prepared_indices;
+    std::vector<std::unique_ptr<PreparedFeatureMatcher>> prepared(images.size());
+    for (std::size_t image_idx = 0; image_idx < images.size(); ++image_idx) {
+      prepared_indices.emplace(images[image_idx].id, image_idx);
     }
+    parallel::parallel_for_(
+        parallel::Range(0, static_cast<int>(images.size())),
+        [&](const parallel::Range& range) {
+          for (int image_idx = range.start; image_idx < range.end; ++image_idx) {
+            const FeatureSet* features =
+                FindFeatures(graph, images[static_cast<std::size_t>(image_idx)].id);
+            if (features == nullptr) {
+              throw std::runtime_error("Workspace features are incomplete");
+            }
+            prepared[static_cast<std::size_t>(image_idx)] =
+                std::make_unique<PreparedFeatureMatcher>(
+                    *features, matching_options.backend);
+          }
+        });
+
+    std::vector<std::vector<FeatureMatch>> pair_matches(pairs.size());
+    parallel::parallel_for_(
+        parallel::Range(0, static_cast<int>(pairs.size())),
+        [&](const parallel::Range& range) {
+          for (int pair_idx = range.start; pair_idx < range.end; ++pair_idx) {
+            const ImagePair& pair = pairs[static_cast<std::size_t>(pair_idx)];
+            pair_matches[static_cast<std::size_t>(pair_idx)] =
+                MatchPreparedFeatureSets(
+                    *prepared.at(prepared_indices.at(pair.image_id1)),
+                    *prepared.at(prepared_indices.at(pair.image_id2)),
+                    matching_options);
+          }
+        });
+    for (std::size_t pair_idx = 0; pair_idx < pairs.size(); ++pair_idx) {
+      const ImagePair& pair = pairs[pair_idx];
+      SetMatches(&graph, pair.image_id1, pair.image_id2,
+                 pair_matches[pair_idx]);
+    }
+    summary.num_pairs = pairs.size();
     WriteWorkspaceMatches(options_.workspace_path, graph);
     WriteWorkspaceCacheMetadata(options_.workspace_path, "matches",
                                 raw_match_hash,
-                                {{"pairs", std::to_string(summary.num_pairs)}},
+                                {{"pairs", std::to_string(summary.num_pairs)},
+                                 {"retrieval_pairs", std::to_string(summary.pair_generation.num_retrieval_pairs)},
+                                 {"sequential_guard_pairs", std::to_string(summary.pair_generation.num_sequential_guard_pairs)},
+                                 {"sequential_pairs_added", std::to_string(summary.pair_generation.num_sequential_pairs_added)},
+                                 {"sequential_pair_recall", ToConfigValue(summary.pair_generation.sequential_pair_recall)},
+                                 {"connected_components", std::to_string(summary.pair_generation.num_connected_components)},
+                                 {"min_degree", std::to_string(summary.pair_generation.min_degree)},
+                                 {"max_degree", std::to_string(summary.pair_generation.max_degree)},
+                                 {"mean_degree", ToConfigValue(summary.pair_generation.mean_degree)}},
                                 {"matches/raw_matches.tsv"});
   }
 
@@ -249,6 +329,19 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
   summary_file << "pairs " << summary.num_pairs << "\n"
                << "verified_pairs " << summary.num_verified_pairs << "\n"
                << "verified_inliers " << summary.num_verified_inliers
+               << "\nretrieval_pairs "
+               << summary.pair_generation.num_retrieval_pairs
+               << "\nsequential_guard_pairs "
+               << summary.pair_generation.num_sequential_guard_pairs
+               << "\nsequential_pairs_added "
+               << summary.pair_generation.num_sequential_pairs_added
+               << "\nsequential_pair_recall "
+               << summary.pair_generation.sequential_pair_recall
+               << "\nconnected_components "
+               << summary.pair_generation.num_connected_components
+               << "\nmin_degree " << summary.pair_generation.min_degree
+               << "\nmax_degree " << summary.pair_generation.max_degree
+               << "\nmean_degree " << summary.pair_generation.mean_degree
                << "\n";
 
   summary.success = true;

@@ -161,7 +161,7 @@ TEST(IncrementalMapperTest,
   mapper_options.registration.min_num_inliers = 20;
   mapper_options.registration.max_reprojection_error_px = 3.0;
   mapper_options.triangulation.min_triangulation_angle_deg = 0.1;
-  mapper_options.triangulation.create_max_reprojection_error_px = 2.0;
+  mapper_options.triangulation.create_max_angle_error_deg = 2.0;
   mapper_options.local_bundle_adjustment.max_num_iterations = 50;
   mapper_options.local_bundle_adjustment.loss_scale = 1.0;
   mapper_options.local_bundle_adjustment.constant_image_ids.insert(1);
@@ -242,7 +242,7 @@ TEST(IncrementalMapperTest, RunsCompleteIncrementalMappingLoop) {
   options.mapper.registration.min_num_inliers = 20;
   options.mapper.registration.max_reprojection_error_px = 3.0;
   options.mapper.triangulation.min_triangulation_angle_deg = 0.1;
-  options.mapper.triangulation.create_max_reprojection_error_px = 2.0;
+  options.mapper.triangulation.create_max_angle_error_deg = 2.0;
   options.mapper.local_bundle_adjustment.max_num_iterations = 50;
   options.mapper.local_bundle_adjustment.loss_scale = 1.0;
   options.max_num_registrations = 4;
@@ -344,7 +344,7 @@ TEST(IncrementalMapperTest, DemotesFailedCandidatesAndStopsAfterTrialLimit) {
   options.mapper.registration.min_num_inliers = 20;
   options.mapper.registration.max_reprojection_error_px = 0.25;
   options.mapper.triangulation.min_triangulation_angle_deg = 0.1;
-  options.mapper.triangulation.create_max_reprojection_error_px = 2.0;
+  options.mapper.triangulation.create_max_angle_error_deg = 2.0;
   options.mapper.run_local_bundle_adjustment = false;
   options.mapper.run_local_retriangulation_filter = false;
   options.mapper.run_observation_filter = false;
@@ -538,8 +538,9 @@ TEST(IncrementalMapperTest, RetriangulatesRegisteredNeighborhoodPairs) {
   reconstruction.AddImage(image3);
 
   IncrementalTriangulatorOptions options;
+  options.ignore_two_view_tracks = false;
   options.min_triangulation_angle_deg = 0.1;
-  options.create_max_reprojection_error_px = 1.0;
+  options.create_max_angle_error_deg = 1.0;
 
   const IncrementalTriangulatorSummary summary =
       RetriangulateLocalNeighborhood(graph, 3, options, nullptr,
@@ -580,7 +581,7 @@ TEST(IncrementalMapperTest, RetriangulationSkipsLowAnglePairLayer) {
   IncrementalTriangulatorOptions options;
   options.min_triangulation_angle_deg = 0.0;
   options.min_pair_median_triangulation_angle_deg = 1.0;
-  options.create_max_reprojection_error_px = 1.0;
+  options.create_max_angle_error_deg = 1.0;
 
   const IncrementalTriangulatorSummary summary =
       RetriangulateLocalNeighborhood(graph, 1, options, nullptr,
@@ -617,8 +618,9 @@ TEST(IncrementalMapperTest, RetriangulationFiltersNewLowAnglePoints) {
   SetVerifiedGeometry(&graph, 1, 2, MakeVerifiedGeometry({{0, 0}}));
 
   IncrementalTriangulatorOptions triangulation_options;
+  triangulation_options.ignore_two_view_tracks = false;
   triangulation_options.min_triangulation_angle_deg = 0.0;
-  triangulation_options.create_max_reprojection_error_px = 1.0;
+  triangulation_options.create_max_angle_error_deg = 1.0;
 
   ObservationFilterOptions filter_options;
   filter_options.max_reprojection_error_px = 1.0;

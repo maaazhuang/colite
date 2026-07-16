@@ -14,6 +14,10 @@
 
 #include "colite/core/geometry.h"
 
+#ifdef COLITE_HAS_POSELIB
+#include <PoseLib/solvers/relpose_5pt.h>
+#endif
+
 namespace colite {
 namespace {
 
@@ -259,7 +263,9 @@ double HomographyTransferError(const Eigen::Matrix3d& homography,
 template <typename Estimator, typename Residual>
 MatrixRansacResult RunMatrixRansac(const std::size_t num_points,
                                    const std::size_t sample_size,
+                                   const int min_num_iterations,
                                    const int max_num_iterations,
+                                   const double confidence,
                                    const double max_error,
                                    Estimator estimator,
                                    Residual residual) {
@@ -269,23 +275,44 @@ MatrixRansacResult RunMatrixRansac(const std::size_t num_points,
   }
 
   std::mt19937 rng(0);
-  const int iterations = std::max(1, max_num_iterations);
-  for (int iteration = 0; iteration < iterations; ++iteration) {
+  const int min_iterations = std::max(1, min_num_iterations);
+  const int max_iterations = std::max(min_iterations, max_num_iterations);
+  int required_iterations = max_iterations;
+  auto score_model = [&](const Eigen::Matrix3d& model) {
+    std::vector<std::size_t> inliers;
+    inliers.reserve(num_points);
+    for (std::size_t idx = 0; idx < num_points; ++idx) {
+      const double error = residual(model, idx);
+      if (std::isfinite(error) && error <= max_error) {
+        inliers.push_back(idx);
+      }
+    }
+    return inliers;
+  };
+
+  for (int iteration = 0; iteration < required_iterations; ++iteration) {
     const std::vector<std::size_t> sample =
         num_points == sample_size ? AllIndices(num_points)
                                   : SampleUniqueIndices(&rng, num_points,
                                                         sample_size);
-    const std::optional<Eigen::Matrix3d> model = estimator(sample);
+    std::optional<Eigen::Matrix3d> model = estimator(sample);
     if (!model) {
       continue;
     }
 
-    std::vector<std::size_t> inliers;
-    inliers.reserve(num_points);
-    for (std::size_t idx = 0; idx < num_points; ++idx) {
-      const double error = residual(*model, idx);
-      if (std::isfinite(error) && error <= max_error) {
-        inliers.push_back(idx);
+    std::vector<std::size_t> inliers = score_model(*model);
+
+    // One local-optimization step substantially stabilizes the eight-point
+    // and homography minimal hypotheses without coupling this module to
+    // OpenCV calib3d.
+    if (inliers.size() >= sample_size) {
+      const std::optional<Eigen::Matrix3d> local_model = estimator(inliers);
+      if (local_model) {
+        std::vector<std::size_t> local_inliers = score_model(*local_model);
+        if (local_inliers.size() >= inliers.size()) {
+          model = local_model;
+          inliers = std::move(local_inliers);
+        }
       }
     }
 
@@ -295,6 +322,22 @@ MatrixRansacResult RunMatrixRansac(const std::size_t num_points,
       if (best.inlier_indices.size() == num_points) {
         break;
       }
+      const double inlier_ratio =
+          static_cast<double>(best.inlier_indices.size()) / num_points;
+      const double all_inlier_probability =
+          std::pow(inlier_ratio, static_cast<double>(sample_size));
+      if (all_inlier_probability > 0.0 && all_inlier_probability < 1.0) {
+        const double safe_confidence = std::clamp(confidence, 0.0, 1.0 - 1e-12);
+        const double estimate =
+            std::log(1.0 - safe_confidence) /
+            std::log(1.0 - all_inlier_probability);
+        if (std::isfinite(estimate)) {
+          required_iterations = std::clamp(
+              static_cast<int>(std::ceil(estimate)), min_iterations,
+              max_iterations);
+          required_iterations = std::max(required_iterations, iteration + 1);
+        }
+      }
     }
   }
 
@@ -302,11 +345,114 @@ MatrixRansacResult RunMatrixRansac(const std::size_t num_points,
     const std::optional<Eigen::Matrix3d> refined =
         estimator(best.inlier_indices);
     if (refined) {
-      best.model = *refined;
+      std::vector<std::size_t> refined_inliers = score_model(*refined);
+      if (refined_inliers.size() >= best.inlier_indices.size()) {
+        best.model = *refined;
+        best.inlier_indices = std::move(refined_inliers);
+      }
     }
   }
 
   return best;
+}
+
+MatrixRansacResult RunEssentialRansac(
+    const std::vector<Eigen::Vector2d>& points1,
+    const std::vector<Eigen::Vector2d>& points2,
+    const TwoViewGeometryOptions& options,
+    const double max_error) {
+#ifndef COLITE_HAS_POSELIB
+  return RunMatrixRansac(
+      points1.size(), 8, options.min_num_iterations,
+      options.max_num_iterations, options.confidence, max_error,
+      [&](const std::vector<std::size_t>& sample) {
+        return EstimateEssentialMatrix(points1, points2, sample);
+      },
+      [&](const Eigen::Matrix3d& model, const std::size_t idx) {
+        return SampsonError(model, points1[idx], points2[idx]);
+      });
+#else
+  constexpr std::size_t kSampleSize = 5;
+  MatrixRansacResult best;
+  if (points1.size() < kSampleSize || points1.size() != points2.size()) {
+    return best;
+  }
+  auto score_model = [&](const Eigen::Matrix3d& model) {
+    std::vector<std::size_t> inliers;
+    inliers.reserve(points1.size());
+    for (std::size_t idx = 0; idx < points1.size(); ++idx) {
+      const double error = SampsonError(model, points1[idx], points2[idx]);
+      if (std::isfinite(error) && error <= max_error) {
+        inliers.push_back(idx);
+      }
+    }
+    return inliers;
+  };
+
+  std::mt19937 rng(0);
+  const int min_iterations = std::max(1, options.min_num_iterations);
+  const int max_iterations =
+      std::max(min_iterations, options.max_num_iterations);
+  int required_iterations = max_iterations;
+  for (int iteration = 0; iteration < required_iterations; ++iteration) {
+    const std::vector<std::size_t> sample =
+        SampleUniqueIndices(&rng, points1.size(), kSampleSize);
+    std::vector<Eigen::Vector3d> rays1;
+    std::vector<Eigen::Vector3d> rays2;
+    rays1.reserve(kSampleSize);
+    rays2.reserve(kSampleSize);
+    for (const std::size_t idx : sample) {
+      rays1.push_back(points1[idx].homogeneous().normalized());
+      rays2.push_back(points2[idx].homogeneous().normalized());
+    }
+    std::vector<Eigen::Matrix3d> models;
+    poselib::relpose_5pt(rays1, rays2, &models);
+    for (Eigen::Matrix3d model : models) {
+      const double norm = model.norm();
+      if (!(norm > 0.0) || !std::isfinite(norm)) {
+        continue;
+      }
+      model /= norm;
+      std::vector<std::size_t> inliers = score_model(model);
+      if (inliers.size() >= 8) {
+        const std::optional<Eigen::Matrix3d> local =
+            EstimateEssentialMatrix(points1, points2, inliers);
+        if (local) {
+          std::vector<std::size_t> local_inliers = score_model(*local);
+          if (local_inliers.size() >= inliers.size()) {
+            model = *local;
+            inliers = std::move(local_inliers);
+          }
+        }
+      }
+      if (inliers.size() <= best.inlier_indices.size()) {
+        continue;
+      }
+      best.model = model;
+      best.inlier_indices = std::move(inliers);
+      if (best.inlier_indices.size() == points1.size()) {
+        return best;
+      }
+      const double ratio =
+          static_cast<double>(best.inlier_indices.size()) / points1.size();
+      const double sample_success = std::pow(ratio, 5.0);
+      if (sample_success > 0.0 && sample_success < 1.0) {
+        const double confidence =
+            std::clamp(options.confidence, 0.0, 1.0 - 1e-12);
+        const double estimate = std::log(1.0 - confidence) /
+                                std::log(1.0 - sample_success);
+        if (std::isfinite(estimate)) {
+          required_iterations = std::clamp(
+              static_cast<int>(std::ceil(estimate)), min_iterations,
+              max_iterations);
+          required_iterations =
+              std::max(required_iterations, iteration + 1);
+        }
+      }
+    }
+  }
+  return best;
+#endif
 }
 
 std::vector<FeatureMatch> MatchesFromInlierIndices(
@@ -549,7 +695,8 @@ TwoViewGeometry EstimateTwoViewGeometry(
   }
 
   const MatrixRansacResult fundamental = RunMatrixRansac(
-      points.matches.size(), 8, options.max_num_iterations,
+      points.matches.size(), 8, options.min_num_iterations,
+      options.max_num_iterations, options.confidence,
       options.max_error_px,
       [&](const std::vector<std::size_t>& sample) {
         return EstimateFundamentalMatrix(points.pixels1, points.pixels2,
@@ -565,7 +712,8 @@ TwoViewGeometry EstimateTwoViewGeometry(
   MatrixRansacResult homography;
   if (options.estimate_homography) {
     homography = RunMatrixRansac(
-        points.matches.size(), 4, options.max_num_iterations,
+        points.matches.size(), 4, options.min_num_iterations,
+        options.max_num_iterations, options.confidence,
         options.max_error_px,
         [&](const std::vector<std::size_t>& sample) {
           return EstimateHomographyMatrix(points.pixels1, points.pixels2,
@@ -582,17 +730,8 @@ TwoViewGeometry EstimateTwoViewGeometry(
 
   const double normalized_threshold =
       NormalizedRansacThreshold(camera1, camera2, options.max_error_px);
-  const MatrixRansacResult essential = RunMatrixRansac(
-      points.matches.size(), 8, options.max_num_iterations,
-      normalized_threshold,
-      [&](const std::vector<std::size_t>& sample) {
-        return EstimateEssentialMatrix(points.normalized1, points.normalized2,
-                                       sample);
-      },
-      [&](const Eigen::Matrix3d& model, const std::size_t idx) {
-        return SampsonError(model, points.normalized1[idx],
-                            points.normalized2[idx]);
-      });
+  const MatrixRansacResult essential = RunEssentialRansac(
+      points.normalized1, points.normalized2, options, normalized_threshold);
 
   const bool essential_valid = HasEnoughInliers(essential, options);
   const bool fundamental_valid = HasEnoughInliers(fundamental, options);

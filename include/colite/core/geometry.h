@@ -9,6 +9,9 @@
 
 namespace colite {
 
+class Reconstruction;
+struct Point3D;
+
 // 将像素坐标转换为相机坐标系中的单位视线方向。
 // 该函数会经过相机模型去畸变；未实现反投影的模型会抛出异常。
 Eigen::Vector3d PixelToBearing(const Camera& camera,
@@ -29,6 +32,13 @@ std::optional<double> ReprojectionError(
     const Eigen::Vector3d& point_world,
     const Eigen::Vector2d& observed_pixel);
 
+// COLMAP text models store the root mean squared reprojection error of all
+// valid observations in a track. Returns nullopt when the track has no valid
+// posed observation.
+std::optional<double> Point3DTrackReprojectionError(
+    const Reconstruction& reconstruction,
+    const Point3D& point3d);
+
 // 根据两张图像的位姿和像素观测进行线性三角化。
 // 输入位姿均采用 world -> camera 约定，输出点位于世界坐标系。
 // 退化或数值不稳定时返回 std::nullopt。
@@ -48,4 +58,3 @@ double TriangulationAngleDegrees(const Pose3& cam1_from_world,
                                  const Eigen::Vector3d& bearing2);
 
 }  // namespace colite
-

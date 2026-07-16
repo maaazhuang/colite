@@ -269,8 +269,17 @@ TEST(ColiteCommandExeTest, PrintsTopLevelHelp) {
   EXPECT_NE(out.str().find("feature_extractor"), std::string::npos);
   EXPECT_NE(out.str().find("exhaustive_matcher"), std::string::npos);
   EXPECT_NE(out.str().find("vocab_tree_matcher"), std::string::npos);
+  EXPECT_NE(out.str().find("vocab_tree_builder"), std::string::npos);
   EXPECT_NE(out.str().find("compare_colmap"), std::string::npos);
   EXPECT_NE(out.str().find("recon_sfm"), std::string::npos);
+  EXPECT_NE(out.str().find("recon_auto"), std::string::npos);
+  EXPECT_NE(out.str().find("image_undistorter"), std::string::npos);
+  EXPECT_NE(out.str().find("patch_match_stereo"), std::string::npos);
+  EXPECT_NE(out.str().find("stereo_fusion"), std::string::npos);
+  EXPECT_NE(out.str().find("poisson_mesher"), std::string::npos);
+  EXPECT_NE(out.str().find("delaunay_mesher"), std::string::npos);
+  EXPECT_NE(out.str().find("mesh_simplifier"), std::string::npos);
+  EXPECT_NE(out.str().find("mesh_texturer"), std::string::npos);
   EXPECT_TRUE(err.str().empty());
 }
 
@@ -302,6 +311,15 @@ TEST(ColiteCommandExeTest, DispatchesExhaustiveSpatialAndVocabTreeMatcherHelp) {
   EXPECT_NE(out.str().find("--vocab_tree_num_images"), std::string::npos);
   EXPECT_NE(out.str().find("--vocab_tree_path"), std::string::npos);
   EXPECT_TRUE(err.str().empty());
+
+  out.str("");
+  out.clear();
+  EXPECT_EQ(exe::RunColite({"colite", "vocab_tree_builder", "--help"}, out,
+                           err),
+            0);
+  EXPECT_NE(out.str().find("--output_path"), std::string::npos);
+  EXPECT_NE(out.str().find("--branching"), std::string::npos);
+  EXPECT_TRUE(err.str().empty());
 }
 
 TEST(ColiteCommandExeTest, DispatchesSubcommandHelp) {
@@ -312,6 +330,151 @@ TEST(ColiteCommandExeTest, DispatchesSubcommandHelp) {
   EXPECT_NE(out.str().find("colite recon_sfm"), std::string::npos);
   EXPECT_NE(out.str().find("--image_path"), std::string::npos);
   EXPECT_TRUE(err.str().empty());
+}
+
+TEST(ColiteCommandExeTest, DispatchesStandaloneMvsToolHelp) {
+  for (const std::string& command : {"poisson_mesher", "delaunay_mesher",
+                                     "mesh_simplifier", "mesh_texturer"}) {
+    std::ostringstream out;
+    std::ostringstream err;
+    EXPECT_EQ(exe::RunColite({"colite", command, "--help"}, out, err), 0)
+        << command << ": " << err.str();
+    EXPECT_NE(out.str().find("--input_path"), std::string::npos) << command;
+    EXPECT_NE(out.str().find("--output_path"), std::string::npos) << command;
+    EXPECT_TRUE(err.str().empty()) << command;
+  }
+}
+
+TEST(ColiteCommandExeTest, DispatchesStagedPipelineHelp) {
+  for (const std::string& command : {"recon_auto", "image_undistorter",
+                                     "patch_match_stereo", "stereo_fusion"}) {
+    std::ostringstream out;
+    std::ostringstream err;
+    EXPECT_EQ(exe::RunColite({"colite", command, "--help"}, out, err), 0)
+        << command << ": " << err.str();
+    EXPECT_NE(out.str().find("Usage:"), std::string::npos) << command;
+    EXPECT_TRUE(err.str().empty()) << command;
+  }
+}
+
+TEST(ColiteCommandExeTest, ReconAutoDryRunPrintsAllStageBoundaries) {
+  std::ostringstream out;
+  std::ostringstream err;
+  EXPECT_EQ(exe::RunColite({"colite", "recon_auto", "--image_path", "images",
+                            "--output_path", "result", "--dry_run"},
+                           out, err),
+            0)
+      << err.str();
+  EXPECT_NE(out.str().find("PLAN recon_sfm"), std::string::npos);
+  EXPECT_NE(out.str().find("PLAN image_undistorter"), std::string::npos);
+  EXPECT_NE(out.str().find("PLAN patch_match_stereo"), std::string::npos);
+  EXPECT_NE(out.str().find("PLAN stereo_fusion"), std::string::npos);
+  EXPECT_NE(out.str().find("PLAN poisson_mesher"), std::string::npos);
+  EXPECT_NE(out.str().find("PLAN mesh_simplifier"), std::string::npos);
+  EXPECT_NE(out.str().find("PLAN mesh_texturer"), std::string::npos);
+}
+
+TEST(ColiteCommandExeTest, SurfaceCommandsSupportDryRunStageContract) {
+  struct Case {
+    std::string command;
+    std::vector<std::string> arguments;
+    std::string stage;
+  };
+  const std::vector<Case> cases = {
+      {"poisson_mesher",
+       {"--input_path", "fused.ply", "--output_path", "mesh.ply"},
+       "poisson_mesher"},
+      {"delaunay_mesher",
+       {"--input_path", "dense", "--output_path", "mesh.ply"},
+       "delaunay_mesher"},
+      {"mesh_simplifier",
+       {"--input_path", "mesh.ply", "--output_path", "simple.ply"},
+       "mesh_simplifier"},
+      {"mesh_texturer",
+       {"--input_path", "mesh.ply", "--output_path", "textured",
+        "--model_path", "sparse", "--image_path", "images",
+        "--MeshTextureMapping.visibility_resolution", "512",
+        "--MeshTextureMapping.occlusion_relative_tolerance", "0.02"},
+       "mesh_texturer"}};
+  for (const Case& test_case : cases) {
+    std::vector<std::string> command{"colite", test_case.command};
+    command.insert(command.end(), test_case.arguments.begin(),
+                   test_case.arguments.end());
+    command.push_back("--dry_run");
+    std::ostringstream out;
+    std::ostringstream err;
+    EXPECT_EQ(exe::RunColite(command, out, err), 0)
+        << test_case.command << ": " << err.str();
+    EXPECT_NE(out.str().find("PLAN " + test_case.stage), std::string::npos)
+        << test_case.command;
+  }
+}
+
+TEST(ColiteCommandExeTest, MeshSimplifierWritesAndResumesStageManifest) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    "colite_mesh_simplifier_stage_test";
+  std::filesystem::remove_all(root);
+  const auto input = root / "input.ply";
+  const auto output = root / "output.ply";
+  WriteTextFile(input,
+                "ply\nformat ascii 1.0\n"
+                "element vertex 4\nproperty float x\nproperty float y\n"
+                "property float z\nelement face 2\n"
+                "property list uchar int vertex_indices\nend_header\n"
+                "0 0 0\n1 0 0\n1 1 0\n0 1 0\n"
+                "3 0 1 2\n3 0 2 3\n");
+  std::ostringstream out;
+  std::ostringstream err;
+  EXPECT_EQ(exe::RunColite(
+                {"colite", "mesh_simplifier", "--input_path", input.string(),
+                 "--output_path", output.string(),
+                 "--MeshSimplification.target_ratio", "0.75"},
+                out, err),
+            0)
+      << err.str();
+  EXPECT_TRUE(std::filesystem::exists(output));
+  EXPECT_TRUE(std::filesystem::exists(
+      root / ".colite" / "stages" / "mesh_simplifier.json"));
+
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
+  EXPECT_EQ(exe::RunColite(
+                {"colite", "mesh_simplifier", "--input_path", input.string(),
+                 "--output_path", output.string(),
+                 "--MeshSimplification.target_ratio", "0.75", "--resume"},
+                out, err),
+            0)
+      << err.str();
+  EXPECT_NE(out.str().find("SKIP mesh_simplifier"), std::string::npos);
+  std::filesystem::remove_all(root);
+}
+
+TEST(ColiteCommandExeTest, ReconAutoCanSelectDelaunayOrStopAtFusion) {
+  std::ostringstream delaunay_out;
+  std::ostringstream err;
+  EXPECT_EQ(exe::RunColite(
+                {"colite", "recon_auto", "--image_path", "images",
+                 "--output_path", "result", "--mesher", "delaunay",
+                 "--dry_run"},
+                delaunay_out, err),
+            0)
+      << err.str();
+  EXPECT_NE(delaunay_out.str().find("PLAN delaunay_mesher"),
+            std::string::npos);
+
+  std::ostringstream fusion_out;
+  err.str("");
+  err.clear();
+  EXPECT_EQ(exe::RunColite(
+                {"colite", "recon_auto", "--image_path", "images",
+                 "--output_path", "result", "--stop_after", "fusion",
+                 "--dry_run"},
+                fusion_out, err),
+            0)
+      << err.str();
+  EXPECT_EQ(fusion_out.str().find("PLAN poisson_mesher"), std::string::npos);
 }
 
 TEST(ColiteCompareExeTest, WritesFixedColmapDifferenceReports) {

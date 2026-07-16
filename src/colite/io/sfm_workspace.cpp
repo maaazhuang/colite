@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "colite/core/geometry.h"
+
 namespace colite {
 namespace {
 
@@ -536,10 +538,12 @@ void WriteWorkspaceSparseReconstruction(
   std::ofstream points_file(sparse_path / "points3D.txt");
   points_file << "# POINT3D_ID X Y Z R G B ERROR TRACK[]\n";
   for (const auto& [point3d_id, point3d] : reconstruction.Points3D()) {
+    const double track_error =
+        Point3DTrackReprojectionError(reconstruction, point3d).value_or(-1.0);
     points_file << point3d_id << " " << std::setprecision(17)
                 << point3d.xyz.x() << " " << point3d.xyz.y() << " "
                 << point3d.xyz.z() << " 255 255 255 "
-                << point3d.reprojection_error;
+                << track_error;
     for (const TrackElement& element : point3d.track.elements) {
       points_file << " " << element.image_id << " " << element.point2d_idx;
     }

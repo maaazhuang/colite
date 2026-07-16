@@ -21,6 +21,7 @@
 #include <opencv2/imgcodecs.hpp>
 
 #include "colite/core/camera.h"
+#include "colite/core/parallel.h"
 #include "colite/core/geometry.h"
 #include "colite/core/match_graph.h"
 #include "colite/core/reconstruction.h"
@@ -141,26 +142,39 @@ void MatchAllImagePairs(
   relaxed_nearby_options.max_ratio = nearby_options.max_ratio;
   relaxed_nearby_options.mutual_check = true;
 
+  std::vector<std::pair<std::size_t, std::size_t>> pair_indices;
   for (std::size_t i = 0; i < image_ids.size(); ++i) {
     for (std::size_t j = i + 1; j < image_ids.size(); ++j) {
-      const ImageId image_id1 = image_ids[i];
-      const ImageId image_id2 = image_ids[j];
-      const FeatureSet* features1 = FindFeatures(*graph, image_id1);
-      const FeatureSet* features2 = FindFeatures(*graph, image_id2);
-      if (features1 == nullptr || features2 == nullptr) {
-        continue;
-      }
-
-      // 近邻图像通常承担增量建图主链路。这里对相邻/近邻 pair 放宽
-      // ratio，但仍保持互检，让几何验证获得更多候选而不过度引入单向歧义匹配。
-      const bool use_nearby_relaxation =
-          nearby_options.image_index_window > 0 &&
-          j - i <= nearby_options.image_index_window;
-      const DescriptorMatchingOptions& pair_options =
-          use_nearby_relaxation ? relaxed_nearby_options : base_options;
-      SetMatches(graph, image_id1, image_id2,
-                 MatchFeatureSets(*features1, *features2, pair_options));
+      pair_indices.emplace_back(i, j);
     }
+  }
+
+  std::vector<std::vector<FeatureMatch>> pair_matches(pair_indices.size());
+  parallel::parallel_for_(
+      parallel::Range(0, static_cast<int>(pair_indices.size())),
+      [&](const parallel::Range& range) {
+        for (int pair_idx = range.start; pair_idx < range.end; ++pair_idx) {
+          const auto [i, j] = pair_indices[static_cast<std::size_t>(pair_idx)];
+          const FeatureSet* features1 = FindFeatures(*graph, image_ids[i]);
+          const FeatureSet* features2 = FindFeatures(*graph, image_ids[j]);
+          if (features1 == nullptr || features2 == nullptr) {
+            continue;
+          }
+          const bool use_nearby_relaxation =
+              nearby_options.image_index_window > 0 &&
+              j - i <= nearby_options.image_index_window;
+          const DescriptorMatchingOptions& pair_options =
+              use_nearby_relaxation ? relaxed_nearby_options : base_options;
+          pair_matches[static_cast<std::size_t>(pair_idx)] =
+              MatchFeatureSets(*features1, *features2, pair_options);
+        }
+      });
+
+  // MatchGraph uses ordered maps. Publish the read-only parallel results in a
+  // deterministic serial pass instead of locking the map per image pair.
+  for (std::size_t pair_idx = 0; pair_idx < pair_indices.size(); ++pair_idx) {
+    const auto [i, j] = pair_indices[pair_idx];
+    SetMatches(graph, image_ids[i], image_ids[j], pair_matches[pair_idx]);
   }
 }
 
@@ -290,10 +304,12 @@ void WriteColmapTextModel(const std::filesystem::path& output_path,
               << "# Number of points: " << reconstruction.Points3D().size()
               << "\n";
   for (const auto& [point3d_id, point3d] : reconstruction.Points3D()) {
+    const double track_error =
+        Point3DTrackReprojectionError(reconstruction, point3d).value_or(-1.0);
     points_file << point3d_id << " " << std::setprecision(17)
                 << point3d.xyz.x() << " " << point3d.xyz.y() << " "
                 << point3d.xyz.z() << " 255 255 255 "
-                << point3d.reprojection_error;
+                << track_error;
     for (const TrackElement& element : point3d.track.elements) {
       points_file << " " << element.image_id << " " << element.point2d_idx;
     }
@@ -349,7 +365,8 @@ void WriteRegistrationDiagnostics(
          "\tcandidate_verified_inliers_to_registered"
          "\tcandidate_score\tregistration_attempts_before_success"
          "\tregistration_max_reprojection_error_px"
-         "\tregistration_correspondences\tregistration_inliers"
+         "\tregistration_correspondences\tregistration_ransac_inliers"
+         "\tregistration_inliers"
          "\tcompleted_observations\ttrack_merged_points"
          "\ttrack_merged_observations"
          "\ttriangulated_points\ttriangulated_observations"
@@ -379,6 +396,7 @@ void WriteRegistrationDiagnostics(
         << registration.registration_attempts_before_success << "\t"
         << registration.registration_max_reprojection_error_px << "\t"
         << registration.registration.num_correspondences << "\t"
+        << registration.registration.num_ransac_inliers << "\t"
         << registration.registration.num_inliers << "\t"
         << registration.track_completion.num_completed_observations << "\t"
         << registration.track_completion.num_merged_points << "\t"
@@ -410,6 +428,8 @@ void WriteRegistrationDiagnostics(
          "\tcandidate_registered_neighbors"
          "\tcandidate_verified_inliers_to_registered"
          "\tcandidate_score\tregistration_max_reprojection_error_px"
+         "\tregistration_correspondences\tregistration_ransac_inliers"
+         "\tregistration_inliers"
          "\tmessage\n";
   for (const ImageRegistrationFailureSummary& failure :
        summary.failed_registrations) {
@@ -422,6 +442,9 @@ void WriteRegistrationDiagnostics(
                   << failure.candidate_num_verified_inliers_to_registered_images
                   << "\t" << failure.candidate_score << "\t"
                   << failure.registration_max_reprojection_error_px << "\t"
+                  << failure.registration_num_correspondences << "\t"
+                  << failure.registration_num_ransac_inliers << "\t"
+                  << failure.registration_num_inliers << "\t"
                   << failure.message << "\n";
   }
 }
@@ -485,10 +508,20 @@ std::vector<FeatureSet> ExtractFeaturesForImages(
   }
 
   int num_threads = EffectiveFeatureExtractionThreads(requested_num_threads);
-  // 当前 CudaSift 后端包含全局 CUDA 状态，GPU 模式先保持串行更稳定。
-  if (sift_options.backend == SiftBackend::kCudaSift) {
+  const SiftBackend resolved_backend = ResolveSiftBackend(sift_options.backend);
+#if defined(COLITE_ENABLE_SIFT_PARALLEL)
+  // CPU 优化实现已在尺度层、行带和描述子阶段并行，外层单图调度避免嵌套并行。
+  parallel::setNumThreads(resolved_backend == SiftBackend::kCudaSift ||
+                                  resolved_backend == SiftBackend::kCudaVlSift
+                              ? 1
+                              : num_threads);
+  num_threads = 1;
+#else
+  if (resolved_backend == SiftBackend::kCudaSift ||
+      resolved_backend == SiftBackend::kCudaVlSift) {
     num_threads = 1;
   }
+#endif
   const std::size_t num_workers =
       std::min<std::size_t>(image_paths.size(),
                             static_cast<std::size_t>(std::max(1, num_threads)));
@@ -608,7 +641,9 @@ int ReconSfmController::Run(std::ostream& out) const {
   weak_pair_options.guided_matching.max_sampson_error_px =
       geometry_options.geometry_options.max_error_px;
   weak_pair_options.verification = geometry_options.geometry_options;
-  RematchWeakImagePairs(cameras_by_image, weak_pair_options, &graph);
+  if (options.nearby_match_window > 0) {
+    RematchWeakImagePairs(cameras_by_image, weak_pair_options, &graph);
+  }
 
   IncrementalMappingOptions mapping_options;
   // 局部 re-triangulation 比首次建点更积极，因此单独增加一层角度分层：

@@ -8,23 +8,13 @@ set(COLITE_CUDA_MVS_SOURCES
 if(COLITE_ENABLE_CUDA_SIFT)
   set(COLITE_CUDA_SIFT_SOURCES
     features/backends/cuda_sift_extractor.cu
-  )
-
-  add_library(colite_cudasift_backend STATIC
-    features/backends/cudasift/thirdparty/cudaImage.cu
-    features/backends/cudasift/thirdparty/cudaSiftH.cu
-  )
-  target_include_directories(colite_cudasift_backend
-    PUBLIC
-      ${CMAKE_CURRENT_SOURCE_DIR}/features/backends/cudasift/thirdparty
-  )
-  target_compile_options(colite_cudasift_backend
-    PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
-  )
-  set_target_properties(colite_cudasift_backend PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-    POSITION_INDEPENDENT_CODE ON
+    features/backends/cuda_sift/cuda_sift.cu
+    features/backends/cuda_sift/cuda_sift_initial.cu
+    features/backends/cuda_sift/cuda_sift_pyramid.cu
+    features/backends/cuda_sift/cuda_sift_extrema.cu
+    features/backends/cuda_sift/cuda_sift_limit.cu
+    features/backends/cuda_sift/cuda_sift_orientation.cu
+    features/backends/cuda_sift/cuda_sift_descriptor.cu
   )
 endif()
 
@@ -39,6 +29,7 @@ add_library(colite_core
   core/geometry.cpp
   core/match_graph.cpp
   core/reconstruction.cpp
+  core/parallel.cpp
   core/version.cpp
   controllers/recon_sfm_controller.cpp
   controllers/recon_mvs_controller.cpp
@@ -55,13 +46,18 @@ add_library(colite_core
   matching/descriptor_matcher.cpp
   matching/guided_matching.cpp
   matching/pair_generator.cpp
+  matching/vocabulary_tree.cpp
   matching/two_view_geometry_batch.cpp
   matching/two_view_geometry_verifier.cpp
   matching/weak_pair_rematcher.cpp
   mvs/dense_cloud.cpp
   mvs/dense_map.cpp
   mvs/image_workspace.cpp
+  mvs/image_undistorter.cpp
   mvs/mvs_pipeline.cpp
+  mvs/meshing.cpp
+  mvs/mesh_simplifier.cpp
+  mvs/mesh_texturer.cpp
   mvs/patch_match.cpp
   ${COLITE_CUDA_MVS_SOURCES}
   sfm/global_bundle_adjuster.cpp
@@ -80,12 +76,31 @@ target_include_directories(colite_core
     ${OpenCV_INCLUDE_DIRS}
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/features
+    ${CMAKE_CURRENT_SOURCE_DIR}/features/backends
 )
 
 target_compile_definitions(colite_core
   PUBLIC
     COLITE_VERSION_STRING="${PROJECT_VERSION}"
 )
+
+set_source_files_properties(features/backends/sift_vlfeat.c PROPERTIES
+  LANGUAGE CXX
+)
+
+if(COLITE_ENABLE_SIFT_PARALLEL)
+  target_compile_definitions(colite_core PRIVATE
+    COLITE_ENABLE_SIFT_PARALLEL=1
+    COLITE_VLFEAT_ENABLE_PARALLEL=1
+  )
+endif()
+
+if(COLITE_ENABLE_AVX2)
+  target_compile_definitions(colite_core PRIVATE
+    COLITE_ENABLE_AVX2=1
+    COLITE_VLFEAT_ENABLE_AVX2=1
+  )
+endif()
 
 target_link_libraries(colite_core
   PUBLIC
@@ -97,9 +112,25 @@ target_link_libraries(colite_core
     ${OpenCV_LIBS}
 )
 
+if(PoseLib_FOUND)
+  target_link_libraries(colite_core PRIVATE PoseLib::PoseLib)
+  target_compile_definitions(colite_core PRIVATE COLITE_HAS_POSELIB=1)
+endif()
+
+if(COLITE_ENABLE_POISSON_MESHING)
+  target_link_libraries(colite_core PRIVATE colite_poisson_recon)
+  target_compile_definitions(colite_core PUBLIC COLITE_ENABLE_POISSON_MESHING)
+endif()
+
+if(COLITE_ENABLE_DELAUNAY_MESHING AND CGAL_FOUND)
+  target_link_libraries(colite_core PRIVATE CGAL::CGAL)
+  target_compile_definitions(colite_core PUBLIC COLITE_ENABLE_DELAUNAY_MESHING)
+endif()
+
 if(COLITE_ENABLE_CUDA_SIFT)
-  target_link_libraries(colite_core PUBLIC colite_cudasift_backend)
+  target_link_libraries(colite_core PUBLIC CUDA::cudart)
   target_compile_definitions(colite_core PUBLIC COLITE_ENABLE_CUDA_SIFT)
+  set_target_properties(colite_core PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 endif()
 
 if(COLITE_ENABLE_CUDA_MVS)
@@ -121,10 +152,32 @@ else()
 endif()
 
 set_source_files_properties(
-  features/backends/sift_opencv.cpp
-  features/backends/sift_vlfeat.c
   features/backends/cuda_sift_extractor_stub.cpp
   mvs/patch_match_cuda_stub.cpp
   PROPERTIES
     COMPILE_OPTIONS "-Wno-pedantic;-Wno-unused-function"
 )
+
+if(MSVC)
+  set(COLITE_OPENCV_SIFT_OPTIONS /utf-8)
+  set(COLITE_VLFEAT_SIFT_OPTIONS /utf-8)
+  if(COLITE_ENABLE_AVX2)
+    list(APPEND COLITE_OPENCV_SIFT_OPTIONS /arch:AVX2)
+    list(APPEND COLITE_VLFEAT_SIFT_OPTIONS /arch:AVX2)
+  endif()
+else()
+  set(COLITE_OPENCV_SIFT_OPTIONS
+    -Wno-pedantic -Wno-unused-function -fno-tree-vectorize)
+  set(COLITE_VLFEAT_SIFT_OPTIONS -Wno-pedantic -Wno-unused-function)
+  if(COLITE_ENABLE_AVX2)
+    list(APPEND COLITE_OPENCV_SIFT_OPTIONS -mavx2 -mfma)
+    list(APPEND COLITE_VLFEAT_SIFT_OPTIONS -mavx2 -mfma)
+  endif()
+endif()
+
+# AVX2 只作用于不跨库边界传递 Eigen 类型的 SIFT 内核，避免调用方和
+# colite_core 采用不同 Eigen 对齐 ABI（会导致 aligned pointer 被错误 free）。
+set_source_files_properties(features/backends/sift_opencv.cpp PROPERTIES
+  COMPILE_OPTIONS "${COLITE_OPENCV_SIFT_OPTIONS}")
+set_source_files_properties(features/backends/sift_vlfeat.c PROPERTIES
+  COMPILE_OPTIONS "${COLITE_VLFEAT_SIFT_OPTIONS}")

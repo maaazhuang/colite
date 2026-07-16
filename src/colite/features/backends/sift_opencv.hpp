@@ -22,6 +22,17 @@ struct KeyPoint {
         : x(_x), y(_y), size(_size), angle(_angle), response(_resp), octave(_oct) {}
 };
 
+struct SiftProfile {
+    bool valid = false;
+    double initialImageMs = 0.0;
+    double gaussianPyramidMs = 0.0;
+    double dogPyramidMs = 0.0;
+    double extremaMs = 0.0;
+    double postprocessMs = 0.0;
+    double descriptorMs = 0.0;
+    double totalMs = 0.0;
+};
+
 /* SIFT implementation matching OpenCV's SIFT_Impl */
 class Sift {
 public:
@@ -29,7 +40,9 @@ public:
     static Sift create(int nfeatures = 0, int nOctaveLayers = 3,
                        double contrastThreshold = 0.04,
                        double edgeThreshold = 10.0,
-                       double sigma = 1.6);
+                       double sigma = 1.6,
+                       bool enablePreciseUpscale = false,
+                       bool useAvx2 = false);
 
     /* Detect keypoints and compute descriptors.
        image: grayscale float array [0, 255] of size width*height
@@ -53,6 +66,11 @@ public:
     double getEdgeThreshold() const { return edgeThreshold; }
     void setSigma(double s)         { sigma = s; }
     double getSigma() const         { return sigma; }
+    void setEnablePreciseUpscale(bool enabled) { enablePreciseUpscale = enabled; }
+    bool getEnablePreciseUpscale() const { return enablePreciseUpscale; }
+    void setUseAvx2(bool enabled) { useAvx2 = enabled; }
+    bool getUseAvx2() const { return useAvx2; }
+    SiftProfile getLastProfile() const { return lastProfile; }
 
 private:
     Sift() = default;
@@ -62,6 +80,9 @@ private:
     double contrastThreshold = 0.04;
     double edgeThreshold = 10.0;
     double sigma = 1.6;
+    bool enablePreciseUpscale = false;
+    bool useAvx2 = false;
+    SiftProfile lastProfile;
 };
 
 }  // namespace backends

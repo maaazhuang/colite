@@ -200,6 +200,7 @@ ImageRegistrationFailureSummary MakeFailureSummary(
     const ImageCandidate& candidate,
     std::size_t attempt,
     double registration_max_reprojection_error_px,
+    const ImageRegistrationSummary& registration,
     const std::string& message) {
   ImageRegistrationFailureSummary failure;
   failure.image_id = candidate.image_id;
@@ -215,6 +216,11 @@ ImageRegistrationFailureSummary MakeFailureSummary(
   failure.candidate_score = candidate.score;
   failure.registration_max_reprojection_error_px =
       registration_max_reprojection_error_px;
+  failure.registration_num_correspondences =
+      registration.num_correspondences;
+  failure.registration_num_ransac_inliers =
+      registration.num_ransac_inliers;
+  failure.registration_num_inliers = registration.num_inliers;
   failure.message = message;
   return failure;
 }
@@ -536,6 +542,7 @@ IncrementalMappingSummary RunIncrementalMapping(
         summary.failed_registrations.push_back(MakeFailureSummary(
             candidate, attempt,
             attempt_options.registration.max_reprojection_error_px,
+            registration.registration,
             registration.message));
         continue;
       }
@@ -554,19 +561,8 @@ IncrementalMappingSummary RunIncrementalMapping(
 
   if (options.run_global_track_completion &&
       reconstruction->RegisteredImageIds().size() >= 2) {
-    summary.global_track_completion.message =
-        "Global track completion finished";
-    const std::vector<ImageId> registered_image_ids(
-        reconstruction->RegisteredImageIds().begin(),
-        reconstruction->RegisteredImageIds().end());
-    for (const ImageId image_id : registered_image_ids) {
-      const IncrementalTriangulatorSummary completion =
-          CompleteTracksForRegisteredImage(graph, image_id,
-                                           options.mapper.triangulation,
-                                           reconstruction);
-      summary.global_track_completion.num_completed_observations +=
-          completion.num_completed_observations;
-    }
+    summary.global_track_completion = CompleteAndMergeAllTracks(
+        graph, options.mapper.triangulation, reconstruction);
   }
 
   if (options.run_global_bundle_adjustment &&
@@ -580,6 +576,18 @@ IncrementalMappingSummary RunIncrementalMapping(
       summary.num_points3d = reconstruction->Points3D().size();
       summary.message = summary.global_bundle_adjustment.message;
       return summary;
+    }
+
+    if (options.run_global_track_completion) {
+      const IncrementalTriangulatorSummary post_ba_tracks =
+          CompleteAndMergeAllTracks(graph, options.mapper.triangulation,
+                                    reconstruction);
+      summary.global_track_completion.num_completed_observations +=
+          post_ba_tracks.num_completed_observations;
+      summary.global_track_completion.num_merged_points +=
+          post_ba_tracks.num_merged_points;
+      summary.global_track_completion.num_merged_observations +=
+          post_ba_tracks.num_merged_observations;
     }
 
     if (options.run_global_observation_filter) {

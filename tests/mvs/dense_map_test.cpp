@@ -47,6 +47,18 @@ TEST(DenseDepthMapTest, RecomputesRangeFromPositiveFiniteDepths) {
   EXPECT_EQ(depth_map.ValidPixelCount(), 2U);
 }
 
+TEST(DenseDepthMapTest, MutableDataUpdatesDepthValues) {
+  DenseDepthMap depth_map(2, 2);
+
+  std::vector<float>& data = depth_map.MutableData();
+  ASSERT_EQ(data.size(), 4U);
+  data[3] = 7.5F;
+
+  EXPECT_TRUE(depth_map.IsValid(1, 1));
+  EXPECT_FLOAT_EQ(depth_map.Get(1, 1), 7.5F);
+  EXPECT_EQ(depth_map.ValidPixelCount(), 1U);
+}
+
 TEST(NormalMapTest, StoresNormalizedNormalsAndValidity) {
   NormalMap normal_map(2, 2);
 
@@ -64,6 +76,18 @@ TEST(NormalMapTest, StoresNormalizedNormalsAndValidity) {
                std::out_of_range);
 }
 
+TEST(NormalMapTest, MutableDataUpdatesNormalValues) {
+  NormalMap normal_map(2, 2);
+
+  std::vector<Eigen::Vector3f>& data = normal_map.MutableData();
+  ASSERT_EQ(data.size(), 4U);
+  data[2] = Eigen::Vector3f(0.0F, 0.0F, -1.0F);
+
+  EXPECT_TRUE(normal_map.IsValid(1, 0));
+  EXPECT_FLOAT_EQ(normal_map.Get(1, 0).z(), -1.0F);
+  EXPECT_EQ(normal_map.ValidPixelCount(), 1U);
+}
+
 TEST(DenseCostMapTest, StoresZeroAsValidCostAndInfinityAsInvalid) {
   DenseCostMap cost_map(3, 2);
 
@@ -77,6 +101,18 @@ TEST(DenseCostMapTest, StoresZeroAsValidCostAndInfinityAsInvalid) {
   EXPECT_FLOAT_EQ(cost_map.Get(1, 2), 0.0F);
   EXPECT_EQ(cost_map.ValidPixelCount(), 1U);
   EXPECT_THROW(cost_map.Get(2, 0), std::out_of_range);
+}
+
+TEST(DenseCostMapTest, MutableDataUpdatesCostValues) {
+  DenseCostMap cost_map(2, 2);
+
+  std::vector<float>& data = cost_map.MutableData();
+  ASSERT_EQ(data.size(), 4U);
+  data[1] = 0.125F;
+
+  EXPECT_TRUE(cost_map.IsValid(0, 1));
+  EXPECT_FLOAT_EQ(cost_map.Get(0, 1), 0.125F);
+  EXPECT_EQ(cost_map.ValidPixelCount(), 1U);
 }
 
 TEST(DenseMapIoTest, RoundTripsDepthAndNormalMapsAsDebugText) {
@@ -157,6 +193,12 @@ TEST(DenseMapIoTest, WritesCostMapAsDebugText) {
   EXPECT_NE(text.find("COLITE_DENSE_COST_MAP_TEXT"), std::string::npos);
   EXPECT_NE(text.find("2 1"), std::string::npos);
   EXPECT_NE(text.find("0.25"), std::string::npos);
+
+  const DenseCostMap loaded = ReadDenseCostMapText(root / "cost.txt");
+  EXPECT_EQ(loaded.Width(), 2U);
+  EXPECT_EQ(loaded.Height(), 1U);
+  EXPECT_FLOAT_EQ(loaded.Get(0, 0), 0.25F);
+  EXPECT_FALSE(loaded.IsValid(0, 1));
 }
 
 }  // namespace

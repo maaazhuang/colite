@@ -15,17 +15,23 @@ namespace colite {
 // SIFT 特征提取后端。OpenCV 官方 SIFT 直接调用路径已移除；
 // CvSift / VlSift / CudaSift 都是项目内接入的实现。
 enum class SiftBackend {
+  kAuto,
   kVlSift,
   kCvSift,
+  // 优化 CUDA 引擎的 OpenCV 语义模式；保留 kCudaSift 名称兼容旧 API。
   kCudaSift,
+  // 优化 CUDA 引擎的 VLFeat 语义模式。
+  kCudaVlSift,
 };
 
 const char* SiftBackendName(SiftBackend backend);
 SiftBackend SiftBackendFromName(std::string_view name);
+// 将 auto 解析为当前主机实际使用的后端；有可用 CUDA 设备时优先 CUDA OpenCV。
+SiftBackend ResolveSiftBackend(SiftBackend requested);
 
 // SIFT 特征提取配置。
 struct SiftExtractionOptions {
-  SiftBackend backend = SiftBackend::kCvSift;
+  SiftBackend backend = SiftBackend::kAuto;
   // 最终输出的特征数量上限。CudaSift 内部会使用更大的候选池，再按响应裁剪。
   int max_num_features = 8192;
   int num_octave_layers = 3;

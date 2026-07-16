@@ -97,7 +97,7 @@ TEST(ObservationManagerTest, MergesPointsAndReassignsSourceTrack) {
               1e-12);
 }
 
-TEST(ObservationManagerTest, RejectsMergeWithImageConflict) {
+TEST(ObservationManagerTest, MergesDistinctFeaturesFromSameImageLikeColmap) {
   Reconstruction reconstruction;
   reconstruction.AddCamera(MakeCamera());
   Image image = MakeImage(1);
@@ -115,13 +115,44 @@ TEST(ObservationManagerTest, RejectsMergeWithImageConflict) {
 
   ObservationManager manager(&reconstruction);
 
-  EXPECT_FALSE(manager.MergePoints(target_point3d_id, source_point3d_id,
-                                   Eigen::Vector3d(0.05, 0.0, 5.0)));
+  EXPECT_TRUE(manager.MergePoints(target_point3d_id, source_point3d_id,
+                                  Eigen::Vector3d(0.05, 0.0, 5.0)));
 
   EXPECT_TRUE(reconstruction.ExistsPoint3D(target_point3d_id));
-  EXPECT_TRUE(reconstruction.ExistsPoint3D(source_point3d_id));
-  EXPECT_EQ(reconstruction.GetPoint3D(target_point3d_id).track.Length(), 1U);
-  EXPECT_EQ(reconstruction.GetPoint3D(source_point3d_id).track.Length(), 1U);
+  EXPECT_FALSE(reconstruction.ExistsPoint3D(source_point3d_id));
+  EXPECT_EQ(reconstruction.GetPoint3D(target_point3d_id).track.Length(), 2U);
+  EXPECT_EQ(reconstruction.GetImage(1).points2d[1].point3d_id,
+            target_point3d_id);
+}
+
+TEST(ObservationManagerTest, MergesDuplicateFeaturesAtNearlySamePixel) {
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(MakeCamera());
+  Image image = MakeImage(1);
+  image.points2d.push_back({{500.4, 400.3}, 1, kInvalidPoint3DId});
+  reconstruction.AddImage(image);
+
+  Track target_track;
+  target_track.AddElement(1, 0);
+  const Point3DId target_point3d_id = reconstruction.AddPoint3D(
+      Eigen::Vector3d(0.0, 0.0, 5.0), target_track);
+  Track source_track;
+  source_track.AddElement(1, 1);
+  const Point3DId source_point3d_id = reconstruction.AddPoint3D(
+      Eigen::Vector3d(0.1, 0.0, 5.0), source_track);
+
+  ObservationManager manager(&reconstruction);
+
+  EXPECT_TRUE(manager.MergePoints(target_point3d_id, source_point3d_id,
+                                  Eigen::Vector3d(0.05, 0.0, 5.0)));
+
+  EXPECT_TRUE(reconstruction.ExistsPoint3D(target_point3d_id));
+  EXPECT_FALSE(reconstruction.ExistsPoint3D(source_point3d_id));
+  EXPECT_EQ(reconstruction.GetImage(1).points2d[0].point3d_id,
+            target_point3d_id);
+  EXPECT_EQ(reconstruction.GetImage(1).points2d[1].point3d_id,
+            target_point3d_id);
+  EXPECT_EQ(reconstruction.GetPoint3D(target_point3d_id).track.Length(), 2U);
 }
 
 }  // namespace colite

@@ -21,10 +21,12 @@ struct ReconSfmControllerOptions {
   double focal_length = 0.0;
   int max_num_features = 4096;
   int feature_num_threads = -1;
-  SiftBackend feature_backend = SiftBackend::kCvSift;
-  bool use_flann = false;
-  std::size_t nearby_match_window = 2;
-  double nearby_match_ratio = 0.9;
+  SiftBackend feature_backend = SiftBackend::kAuto;
+  bool use_flann = true;
+  // Match the standalone exhaustive matcher unless relaxation is explicitly
+  // requested by the caller.
+  std::size_t nearby_match_window = 0;
+  double nearby_match_ratio = 0.8;
   std::size_t max_registration_trials_per_image = 3;
   std::size_t max_initialization_trials = 3;
   double registration_retry_reprojection_error_multiplier = 1.5;

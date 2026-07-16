@@ -5,6 +5,8 @@
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <numeric>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -38,6 +40,13 @@ struct ColmapModel {
   std::map<std::size_t, ColmapImage> images_by_id;
   std::map<std::string, std::size_t> image_ids_by_name;
   std::map<std::size_t, ColmapPoint3D> points3d;
+};
+
+struct SimilarityAlignment {
+  bool valid = false;
+  double scale = 1.0;
+  Eigen::Matrix3d rotation = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d translation = Eigen::Vector3d::Zero();
 };
 
 struct PairKey {
@@ -203,6 +212,74 @@ double RotationAngleDeg(const Eigen::Quaterniond& ref_q_cw,
   return 2.0 * std::acos(w) * 180.0 / M_PI;
 }
 
+double Median(std::vector<double> values) {
+  if (values.empty()) {
+    return -1.0;
+  }
+  const std::size_t middle = values.size() / 2;
+  std::nth_element(values.begin(), values.begin() + middle, values.end());
+  if (values.size() % 2 == 1) {
+    return values[middle];
+  }
+  const double upper = values[middle];
+  std::nth_element(values.begin(), values.begin() + middle - 1, values.end());
+  return 0.5 * (values[middle - 1] + upper);
+}
+
+SimilarityAlignment EstimateSimilarityAlignment(
+    const ColmapModel& reference,
+    const ColmapModel& candidate) {
+  std::vector<Eigen::Vector3d> source_centers;
+  std::vector<Eigen::Vector3d> target_centers;
+  for (const auto& [name, ref_id] : reference.image_ids_by_name) {
+    const auto candidate_it = candidate.image_ids_by_name.find(name);
+    if (candidate_it == candidate.image_ids_by_name.end()) {
+      continue;
+    }
+    source_centers.push_back(
+        CameraCenterFromPose(candidate.images_by_id.at(candidate_it->second)));
+    target_centers.push_back(
+        CameraCenterFromPose(reference.images_by_id.at(ref_id)));
+  }
+  SimilarityAlignment alignment;
+  if (source_centers.size() < 3) {
+    return alignment;
+  }
+  Eigen::Matrix<double, 3, Eigen::Dynamic> source(3, source_centers.size());
+  Eigen::Matrix<double, 3, Eigen::Dynamic> target(3, target_centers.size());
+  for (std::size_t i = 0; i < source_centers.size(); ++i) {
+    source.col(static_cast<Eigen::Index>(i)) = source_centers[i];
+    target.col(static_cast<Eigen::Index>(i)) = target_centers[i];
+  }
+  const Eigen::Matrix4d transform = Eigen::umeyama(source, target, true);
+  const Eigen::Matrix3d linear = transform.topLeftCorner<3, 3>();
+  alignment.scale = linear.col(0).norm();
+  if (!std::isfinite(alignment.scale) || alignment.scale <= 0.0) {
+    return SimilarityAlignment{};
+  }
+  alignment.rotation = linear / alignment.scale;
+  alignment.translation = transform.topRightCorner<3, 1>();
+  alignment.valid = alignment.rotation.allFinite() &&
+                    alignment.translation.allFinite();
+  return alignment;
+}
+
+ColmapImage AlignImage(const ColmapImage& image,
+                       const SimilarityAlignment& alignment) {
+  if (!alignment.valid) {
+    return image;
+  }
+  ColmapImage aligned = image;
+  const Eigen::Vector3d center = CameraCenterFromPose(image);
+  const Eigen::Vector3d aligned_center =
+      alignment.scale * alignment.rotation * center + alignment.translation;
+  const Eigen::Matrix3d aligned_rotation =
+      image.q_cw.toRotationMatrix() * alignment.rotation.transpose();
+  aligned.q_cw = Eigen::Quaterniond(aligned_rotation).normalized();
+  aligned.t_cw = -aligned_rotation * aligned_center;
+  return aligned;
+}
+
 std::string StatusForPresence(const bool in_reference,
                               const bool in_candidate) {
   if (in_reference && in_candidate) {
@@ -224,7 +301,28 @@ void WriteSummary(const std::filesystem::path& output_path,
        << "common_points_by_id " << summary.common_points_by_id << "\n"
        << "reference_only_points " << summary.reference_only_points << "\n"
        << "candidate_only_points " << summary.candidate_only_points << "\n"
-       << "common_pairs " << summary.common_pairs << "\n";
+       << "common_pairs " << summary.common_pairs << "\n"
+       << "similarity_alignment_valid "
+       << (summary.similarity_alignment_valid ? 1 : 0) << "\n"
+       << "similarity_scale " << summary.similarity_scale << "\n"
+       << "mean_rotation_error_deg " << summary.mean_rotation_error_deg << "\n"
+       << "median_rotation_error_deg " << summary.median_rotation_error_deg << "\n"
+       << "max_rotation_error_deg " << summary.max_rotation_error_deg << "\n"
+       << "mean_center_error " << summary.mean_center_error << "\n"
+       << "median_center_error " << summary.median_center_error << "\n"
+       << "max_center_error " << summary.max_center_error << "\n"
+       << "mean_center_error_over_baseline "
+       << summary.mean_center_error_over_baseline << "\n"
+       << "max_center_error_over_baseline "
+       << summary.max_center_error_over_baseline << "\n"
+       << "reference_mean_reprojection_error "
+       << summary.reference_mean_reprojection_error << "\n"
+       << "candidate_mean_reprojection_error "
+       << summary.candidate_mean_reprojection_error << "\n"
+       << "reference_mean_track_length "
+       << summary.reference_mean_track_length << "\n"
+       << "candidate_mean_track_length "
+       << summary.candidate_mean_track_length << "\n";
 }
 
 void WriteImageDiff(const std::filesystem::path& output_path,
@@ -346,7 +444,8 @@ void WritePointDiff(const std::filesystem::path& output_path,
 
 void WritePoseDiff(const std::filesystem::path& output_path,
                    const ColmapModel& reference,
-                   const ColmapModel& candidate) {
+                   const ColmapModel& candidate,
+                   const SimilarityAlignment& alignment) {
   std::ofstream file(output_path / "pose_diff.tsv");
   file << "image_name\tref_registered\tcandidate_registered"
           "\trotation_angle_deg\ttranslation_delta_norm\tcenter_delta_norm"
@@ -369,10 +468,16 @@ void WritePoseDiff(const std::filesystem::path& output_path,
         ref_id_it == reference.image_ids_by_name.end()
             ? nullptr
             : &reference.images_by_id.at(ref_id_it->second);
-    const ColmapImage* cand =
+    const ColmapImage* raw_cand =
         cand_id_it == candidate.image_ids_by_name.end()
             ? nullptr
             : &candidate.images_by_id.at(cand_id_it->second);
+    const std::optional<ColmapImage> aligned_cand =
+        raw_cand == nullptr
+            ? std::nullopt
+            : std::optional<ColmapImage>(AlignImage(*raw_cand, alignment));
+    const ColmapImage* cand =
+        aligned_cand.has_value() ? &*aligned_cand : nullptr;
     const bool common = ref != nullptr && cand != nullptr;
     const Eigen::Vector3d ref_center =
         ref == nullptr ? Eigen::Vector3d::Zero() : CameraCenterFromPose(*ref);
@@ -399,7 +504,8 @@ ColmapCompareControllerSummary MakeSummary(
     const ColmapModel& reference,
     const ColmapModel& candidate,
     const std::map<PairKey, std::size_t>& reference_pairs,
-    const std::map<PairKey, std::size_t>& candidate_pairs) {
+    const std::map<PairKey, std::size_t>& candidate_pairs,
+    const SimilarityAlignment& alignment) {
   ColmapCompareControllerSummary summary;
   summary.reference_images = reference.images_by_id.size();
   summary.candidate_images = candidate.images_by_id.size();
@@ -441,6 +547,73 @@ ColmapCompareControllerSummary MakeSummary(
       ++summary.common_pairs;
     }
   }
+  summary.similarity_alignment_valid = alignment.valid;
+  summary.similarity_scale = alignment.scale;
+  std::vector<double> rotation_errors;
+  std::vector<double> center_errors;
+  std::vector<Eigen::Vector3d> reference_centers;
+  for (const auto& [name, ref_id] : reference.image_ids_by_name) {
+    const auto candidate_it = candidate.image_ids_by_name.find(name);
+    if (candidate_it == candidate.image_ids_by_name.end()) {
+      continue;
+    }
+    const ColmapImage& ref = reference.images_by_id.at(ref_id);
+    const ColmapImage cand = AlignImage(
+        candidate.images_by_id.at(candidate_it->second), alignment);
+    rotation_errors.push_back(RotationAngleDeg(ref.q_cw, cand.q_cw));
+    const Eigen::Vector3d ref_center = CameraCenterFromPose(ref);
+    reference_centers.push_back(ref_center);
+    center_errors.push_back(
+        (CameraCenterFromPose(cand) - ref_center).norm());
+  }
+  if (!rotation_errors.empty()) {
+    summary.mean_rotation_error_deg =
+        std::accumulate(rotation_errors.begin(), rotation_errors.end(), 0.0) /
+        rotation_errors.size();
+    summary.median_rotation_error_deg = Median(rotation_errors);
+    summary.max_rotation_error_deg =
+        *std::max_element(rotation_errors.begin(), rotation_errors.end());
+    summary.mean_center_error =
+        std::accumulate(center_errors.begin(), center_errors.end(), 0.0) /
+        center_errors.size();
+    summary.median_center_error = Median(center_errors);
+    summary.max_center_error =
+        *std::max_element(center_errors.begin(), center_errors.end());
+    double baseline = 0.0;
+    for (std::size_t i = 0; i < reference_centers.size(); ++i) {
+      for (std::size_t j = i + 1; j < reference_centers.size(); ++j) {
+        baseline = std::max(
+            baseline, (reference_centers[i] - reference_centers[j]).norm());
+      }
+    }
+    if (baseline > 0.0) {
+      summary.mean_center_error_over_baseline =
+          summary.mean_center_error / baseline;
+      summary.max_center_error_over_baseline =
+          summary.max_center_error / baseline;
+    }
+  }
+  const auto fill_model_stats = [](const ColmapModel& model,
+                                   double* mean_error,
+                                   double* mean_track_length) {
+    if (model.points3d.empty()) {
+      return;
+    }
+    double error_sum = 0.0;
+    std::size_t track_sum = 0;
+    for (const auto& [point_id, point] : model.points3d) {
+      (void)point_id;
+      error_sum += point.error;
+      track_sum += point.track.size();
+    }
+    *mean_error = error_sum / model.points3d.size();
+    *mean_track_length =
+        static_cast<double>(track_sum) / model.points3d.size();
+  };
+  fill_model_stats(reference, &summary.reference_mean_reprojection_error,
+                   &summary.reference_mean_track_length);
+  fill_model_stats(candidate, &summary.candidate_mean_reprojection_error,
+                   &summary.candidate_mean_track_length);
   return summary;
 }
 
@@ -463,15 +636,18 @@ ColmapCompareControllerSummary ColmapCompareController::Run() const {
       ComputeSharedPointPairs(reference);
   const std::map<PairKey, std::size_t> candidate_pairs =
       ComputeSharedPointPairs(candidate);
+  const SimilarityAlignment alignment =
+      EstimateSimilarityAlignment(reference, candidate);
   const ColmapCompareControllerSummary summary =
-      MakeSummary(reference, candidate, reference_pairs, candidate_pairs);
+      MakeSummary(reference, candidate, reference_pairs, candidate_pairs,
+                  alignment);
 
   std::filesystem::create_directories(options_.output_path);
   WriteSummary(options_.output_path, summary);
   WriteImageDiff(options_.output_path, reference, candidate);
   WritePairDiff(options_.output_path, reference_pairs, candidate_pairs);
   WritePointDiff(options_.output_path, reference, candidate);
-  WritePoseDiff(options_.output_path, reference, candidate);
+  WritePoseDiff(options_.output_path, reference, candidate, alignment);
   return summary;
 }
 

@@ -70,11 +70,56 @@ TEST(SiftExtractorTest, ExtractsFeaturesFromSyntheticImage) {
   EXPECT_EQ(features.descriptors.cols(), 128);
 }
 
+TEST(SiftExtractorTest, CvSiftHandlesKernelWiderThanSmallestPyramidLevel) {
+  cv::Mat image(768, 1024, CV_8UC1, cv::Scalar(24));
+  for (int y = 48; y < image.rows; y += 96) {
+    for (int x = 48; x < image.cols; x += 96) {
+      cv::circle(image, cv::Point(x, y), 24,
+                 cv::Scalar(((x + y) / 96) % 2 ? 220 : 120), -1);
+    }
+  }
+  cv::line(image, cv::Point(0, image.rows - 1),
+           cv::Point(image.cols - 1, 0), cv::Scalar(255), 9);
+
+  SiftExtractionOptions options;
+  options.backend = SiftBackend::kCvSift;
+  options.max_num_features = 512;
+  const FeatureSet features = ExtractSiftFeatures(image, options);
+
+  EXPECT_FALSE(features.keypoints.empty());
+  EXPECT_EQ(features.descriptors.rows(),
+            static_cast<Eigen::Index>(features.keypoints.size()));
+  EXPECT_EQ(features.descriptors.cols(), 128);
+}
+
+TEST(SiftExtractorTest, CvSiftReflectBorderHandlesTinyImages) {
+  for (const cv::Size size :
+       {cv::Size(1, 1), cv::Size(2, 1), cv::Size(1, 2), cv::Size(2, 2),
+        cv::Size(3, 2)}) {
+    cv::Mat image(size, CV_8UC1);
+    cv::randu(image, 0, 255);
+    SiftExtractionOptions options;
+    options.backend = SiftBackend::kCvSift;
+    options.max_num_features = 32;
+    EXPECT_NO_THROW({
+      const FeatureSet features = ExtractSiftFeatures(image, options);
+      EXPECT_EQ(features.descriptors.rows(),
+                static_cast<Eigen::Index>(features.keypoints.size()));
+      if (!features.keypoints.empty()) {
+        EXPECT_EQ(features.descriptors.cols(), 128);
+      }
+    }) << "size=" << size;
+  }
+}
+
 TEST(SiftExtractorTest, ParsesBackendNames) {
+  EXPECT_EQ(SiftBackendFromName("auto"), SiftBackend::kAuto);
   EXPECT_EQ(SiftBackendFromName("vlsift"), SiftBackend::kVlSift);
   EXPECT_EQ(SiftBackendFromName("cvsift"), SiftBackend::kCvSift);
   EXPECT_EQ(SiftBackendFromName("cudasift"), SiftBackend::kCudaSift);
   EXPECT_EQ(SiftBackendFromName("cuda_sift"), SiftBackend::kCudaSift);
+  EXPECT_EQ(SiftBackendFromName("cuda_opencv"), SiftBackend::kCudaSift);
+  EXPECT_EQ(SiftBackendFromName("cuda_vlfeat"), SiftBackend::kCudaVlSift);
   EXPECT_THROW(SiftBackendFromName("opencv"), std::invalid_argument);
   EXPECT_THROW(SiftBackendFromName("unknown"), std::invalid_argument);
 }
@@ -101,19 +146,26 @@ TEST(SiftExtractorTest, ExtractsFeaturesWithAllBackends) {
 
 TEST(SiftExtractorTest, CudaSiftBackendReportsAvailability) {
   SiftExtractionOptions options;
-  options.backend = SiftBackend::kCudaSift;
   options.max_num_features = 256;
   options.contrast_threshold = 0.0;
 
   if (IsCudaSiftAvailable()) {
-    const FeatureSet features =
-        ExtractSiftFeatures(MakeSyntheticImage(), options);
+    EXPECT_EQ(ResolveSiftBackend(SiftBackend::kAuto),
+              SiftBackend::kCudaSift);
+    for (const SiftBackend backend :
+         {SiftBackend::kCudaSift, SiftBackend::kCudaVlSift}) {
+      options.backend = backend;
+      const FeatureSet features =
+          ExtractSiftFeatures(MakeSyntheticImage(), options);
 
-    EXPECT_FALSE(features.keypoints.empty());
-    EXPECT_EQ(features.descriptors.rows(),
-              static_cast<Eigen::Index>(features.keypoints.size()));
-    EXPECT_EQ(features.descriptors.cols(), 128);
+      EXPECT_FALSE(features.keypoints.empty()) << SiftBackendName(backend);
+      EXPECT_EQ(features.descriptors.rows(),
+                static_cast<Eigen::Index>(features.keypoints.size()));
+      EXPECT_EQ(features.descriptors.cols(), 128);
+    }
   } else {
+    options.backend = SiftBackend::kCudaSift;
+    EXPECT_EQ(ResolveSiftBackend(SiftBackend::kAuto), SiftBackend::kCvSift);
     EXPECT_THROW(
         {
           try {

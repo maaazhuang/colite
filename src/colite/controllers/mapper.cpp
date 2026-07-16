@@ -29,6 +29,7 @@ std::string MapperConfigHash(const std::filesystem::path& workspace_path) {
   return StableConfigHash(
       {{"stage", "sparse"},
        {"geometry_hash", CurrentStageHash(workspace_path, "geometry")},
+       {"algorithm_version", "colmap_multiview_create_continue_v14"},
        {"min_pair_median_triangulation_angle_deg", "1"},
        {"local_retriangulation_min_angle_deg", "1"}});
 }
@@ -110,6 +111,32 @@ MapperControllerSummary MapperController::Run() const {
                << "points3d " << mapping_summary.num_points3d << "\n"
                << "initialization_attempts "
                << mapping_summary.initialization.num_initialization_attempts
+               << "\n"
+               << "global_completed_observations "
+               << mapping_summary.global_track_completion
+                      .num_completed_observations
+               << "\n"
+               << "global_merged_points "
+               << mapping_summary.global_track_completion.num_merged_points
+               << "\n"
+               << "global_merged_observations "
+               << mapping_summary.global_track_completion
+                      .num_merged_observations
+               << "\n"
+               << "global_ba_initial_mean_reprojection_error "
+               << mapping_summary.global_bundle_adjustment
+                      .initial_mean_reprojection_error
+               << "\n"
+               << "global_ba_final_mean_reprojection_error "
+               << mapping_summary.global_bundle_adjustment
+                      .final_mean_reprojection_error
+               << "\n"
+               << "global_filtered_observations "
+               << mapping_summary.global_observation_filter
+                      .num_removed_observations
+               << "\n"
+               << "global_filtered_points "
+               << mapping_summary.global_observation_filter.num_removed_points
                << "\n"
                << "message " << mapping_summary.message << "\n";
   if (!mapping_summary.initialization.message.empty()) {

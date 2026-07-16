@@ -134,6 +134,10 @@ const std::vector<float>& DenseDepthMap::Data() const {
   return data_;
 }
 
+std::vector<float>& DenseDepthMap::MutableData() {
+  return data_;
+}
+
 std::size_t DenseDepthMap::Offset(std::size_t row, std::size_t col) const {
   if (row >= height_ || col >= width_) {
     throw std::out_of_range("DenseDepthMap pixel index is out of range");
@@ -205,6 +209,10 @@ const std::vector<Eigen::Vector3f>& NormalMap::Data() const {
   return data_;
 }
 
+std::vector<Eigen::Vector3f>& NormalMap::MutableData() {
+  return data_;
+}
+
 std::size_t NormalMap::Offset(std::size_t row, std::size_t col) const {
   if (row >= height_ || col >= width_) {
     throw std::out_of_range("NormalMap pixel index is out of range");
@@ -266,6 +274,10 @@ std::size_t DenseCostMap::ValidPixelCount() const {
 }
 
 const std::vector<float>& DenseCostMap::Data() const {
+  return data_;
+}
+
+std::vector<float>& DenseCostMap::MutableData() {
   return data_;
 }
 
@@ -512,6 +524,35 @@ void WriteDenseCostMapText(const std::filesystem::path& path,
     }
     file << "\n";
   }
+}
+
+DenseCostMap ReadDenseCostMapText(const std::filesystem::path& path) {
+  std::ifstream file(path);
+  if (!file) {
+    throw std::runtime_error("Failed to read dense cost map: " + path.string());
+  }
+  std::string magic;
+  int version = 0;
+  std::size_t width = 0;
+  std::size_t height = 0;
+  file >> magic >> version >> width >> height;
+  RequireStream(magic == kCostMapMagic && version == kTextMapVersion, path);
+  DenseCostMap cost_map(width, height);
+  for (std::size_t row = 0; row < height; ++row) {
+    for (std::size_t col = 0; col < width; ++col) {
+      std::string token;
+      file >> token;
+      RequireStream(static_cast<bool>(file), path);
+      float value = 0.0F;
+      try {
+        value = std::stof(token);
+      } catch (const std::exception&) {
+        throw std::runtime_error("Invalid dense map file: " + path.string());
+      }
+      cost_map.Set(row, col, value);
+    }
+  }
+  return cost_map;
 }
 
 }  // namespace colite::mvs

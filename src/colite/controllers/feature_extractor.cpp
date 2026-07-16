@@ -19,6 +19,7 @@
 
 #include "colite/controllers/recon_sfm_controller.h"
 #include "colite/core/camera.h"
+#include "colite/core/parallel.h"
 #include "colite/io/camera_prior.h"
 #include "colite/io/sfm_workspace.h"
 
@@ -44,6 +45,8 @@ std::vector<std::pair<std::string, std::string>> FeatureCacheEntries(
   entries.emplace_back("focal_length", ToConfigValue(options.focal_length));
   entries.emplace_back("max_num_features", std::to_string(options.max_num_features));
   entries.emplace_back("backend", SiftBackendName(options.backend));
+  entries.emplace_back("resolved_backend",
+                       SiftBackendName(ResolveSiftBackend(options.backend)));
   entries.emplace_back("num_images", std::to_string(image_paths.size()));
   for (std::size_t i = 0; i < image_paths.size(); ++i) {
     const std::filesystem::path& image_path = image_paths[i];
@@ -170,9 +173,20 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
   sift_options.max_num_features = options_.max_num_features;
 
   int num_threads = EffectiveFeatureExtractionThreads(options_.num_threads);
-  if (sift_options.backend == SiftBackend::kCudaSift) {
+  const SiftBackend resolved_backend = ResolveSiftBackend(sift_options.backend);
+#if defined(COLITE_ENABLE_SIFT_PARALLEL)
+  // SIFT 内部固定线程池按连续图像区域切分；外层保持单图，避免两层并行争抢核心。
+  parallel::setNumThreads(resolved_backend == SiftBackend::kCudaSift ||
+                                  resolved_backend == SiftBackend::kCudaVlSift
+                              ? 1
+                              : num_threads);
+  num_threads = 1;
+#else
+  if (resolved_backend == SiftBackend::kCudaSift ||
+      resolved_backend == SiftBackend::kCudaVlSift) {
     num_threads = 1;
   }
+#endif
   const std::size_t num_workers =
       std::min<std::size_t>(image_paths.size(),
                             static_cast<std::size_t>(std::max(1, num_threads)));

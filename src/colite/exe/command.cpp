@@ -9,6 +9,9 @@
 #include "colite/exe/compare_colmap.h"
 #include "colite/exe/feature_extractor.h"
 #include "colite/exe/mapper.h"
+#include "colite/exe/mvs_stages.h"
+#include "colite/exe/mvs_tools.h"
+#include "colite/exe/recon_auto.h"
 #include "colite/exe/recon_mvs.h"
 #include "colite/exe/recon_sfm.h"
 #include "colite/exe/sequential_matcher.h"
@@ -37,12 +40,30 @@ constexpr Command kCommands[] = {
      &RunSpatialMatcher},
     {"vocab_tree_matcher", "Retrieve candidate pairs with visual words.",
      &RunVocabTreeMatcher},
+    {"vocab_tree_builder", "Build a persistent hierarchical vocabulary tree.",
+     &RunVocabTreeBuilder},
     {"mapper", "Run incremental SfM from a file workspace.", &RunMapper},
     {"compare_colmap", "Write fixed COLMAP text model difference reports.",
      &RunCompareColmap},
     {"recon_sfm", "Run the compact end-to-end SfM pipeline.", &RunReconSfm},
     {"recon_mvs", "Run the compact MVS pipeline from a sparse model.",
      &RunReconMvs},
+    {"recon_auto", "Run the staged SfM-to-dense reconstruction pipeline.",
+     &RunReconAuto},
+    {"image_undistorter", "Create the undistorted dense workspace.",
+     &RunImageUndistorter},
+    {"patch_match_stereo", "Estimate dense depth and normal maps.",
+     &RunPatchMatchStereo},
+    {"stereo_fusion", "Fuse dense stereo maps into a point cloud.",
+     &RunStereoFusion},
+    {"poisson_mesher", "Run bundled Poisson surface reconstruction.",
+     &RunPoissonMesher},
+    {"delaunay_mesher", "Run visibility-aware Delaunay meshing.",
+     &RunDelaunayMesher},
+    {"mesh_simplifier", "Simplify a triangular PLY mesh.",
+     &RunMeshSimplifier},
+    {"mesh_texturer", "Bake calibrated images into a mesh texture atlas.",
+     &RunMeshTexturer},
 };
 
 void PrintHelp(const std::string& executable, std::ostream& out) {

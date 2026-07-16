@@ -84,6 +84,9 @@ struct ImageRegistrationFailureSummary {
   std::size_t candidate_num_verified_inliers_to_registered_images = 0;
   double candidate_score = 0.0;
   double registration_max_reprojection_error_px = 0.0;
+  std::size_t registration_num_correspondences = 0;
+  std::size_t registration_num_ransac_inliers = 0;
+  std::size_t registration_num_inliers = 0;
   std::string message;
 };
 

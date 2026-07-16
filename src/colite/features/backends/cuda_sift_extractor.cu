@@ -1,8 +1,8 @@
 #include "backends/cuda_sift_extractor.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
-#include <mutex>
 #include <numeric>
 #include <stdexcept>
 #include <vector>
@@ -10,148 +10,154 @@
 #include <cuda_runtime_api.h>
 #include <opencv2/imgproc.hpp>
 
-#include "cudasift/thirdparty/cudaImage.h"
-#include "cudasift/thirdparty/cudaSift.h"
+#include "cuda_sift/cuda_sift.hpp"
 #include "../sift_descriptor_conversion.h"
 
 namespace colite {
 namespace {
 
-std::once_flag cuda_init_once;
+constexpr float kRadiansToDegrees = 57.295779513082320876F;
+constexpr double kDefaultOpenCvContrastThreshold = 0.04;
 
-cv::Mat ToGrayFloatImage(const cv::Mat& image) {
+float EffectiveCudaVlFeatPeakThreshold(
+    const SiftExtractionOptions& options) {
+  const double normalized =
+      std::abs(options.contrast_threshold -
+               kDefaultOpenCvContrastThreshold) < 1e-12
+          ? 0.02 / static_cast<double>(options.num_octave_layers)
+          : options.contrast_threshold;
+  // The CUDA pyramid preserves the input's [0, 255] intensity range while
+  // CPU VLFeat receives the same range as floats.
+  return static_cast<float>(normalized * 255.0);
+}
+
+cv::Mat ToContinuousGray(const cv::Mat& image) {
   if (image.empty()) {
     throw std::invalid_argument("Input image is empty.");
   }
-
   cv::Mat gray;
   if (image.channels() == 1) {
     gray = image;
   } else {
     cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
   }
-
-  cv::Mat gray_float;
-  gray.convertTo(gray_float, CV_32FC1);
-  if (!gray_float.isContinuous()) {
-    gray_float = gray_float.clone();
+  if (gray.type() != CV_8UC1) {
+    gray.convertTo(gray, CV_8UC1);
   }
-  return gray_float;
+  return gray.isContinuous() ? gray : gray.clone();
 }
 
-int CudaCandidateCapacity(const SiftExtractionOptions& options) {
-  constexpr int kDefaultCapacity = 32768;
-  constexpr int kMaxCapacity = 262144;
-  if (options.max_num_features <= 0) {
-    return kDefaultCapacity;
+void TransformVlFeatDescriptorToUbc(float* descriptor) {
+  std::array<float, 128> original{};
+  std::copy_n(descriptor, original.size(), original.data());
+  constexpr std::array<int, 8> permutation{{0, 7, 6, 5, 4, 3, 2, 1}};
+  for (int i = 0; i < 4; ++i) {
+    for (int j = 0; j < 4; ++j) {
+      for (int k = 0; k < 8; ++k) {
+        descriptor[8 * (j + 4 * i) + permutation[k]] =
+            original[8 * (j + 4 * i) + k];
+      }
+    }
   }
-  const long long expanded =
-      std::max<long long>(kDefaultCapacity,
-                          static_cast<long long>(options.max_num_features) * 4);
-  return static_cast<int>(std::min<long long>(expanded, kMaxCapacity));
 }
 
-float CudaResponse(const SiftPoint& point) {
-  // CudaSift 的 score 字段用于其 GPU matching，提取阶段不写入。
-  // sharpness 是 DoG 极值强度，取绝对值后可作为跨尺度筛选响应。
-  return std::abs(point.sharpness);
+features::cuda::CudaSiftMode CudaMode(const SiftBackend backend) {
+  return backend == SiftBackend::kCudaVlSift
+             ? features::cuda::CudaSiftMode::VLFeat
+             : features::cuda::CudaSiftMode::OpenCV;
 }
 
-std::vector<int> RankedCudaPointIndices(const SiftPoint* points,
-                                        const int num_points,
-                                        const int max_num_features) {
-  std::vector<int> indices(static_cast<std::size_t>(num_points));
-  std::iota(indices.begin(), indices.end(), 0);
-  std::stable_sort(indices.begin(), indices.end(), [&](const int lhs,
-                                                       const int rhs) {
-    const SiftPoint& lhs_point = points[lhs];
-    const SiftPoint& rhs_point = points[rhs];
-    const float lhs_response = CudaResponse(lhs_point);
-    const float rhs_response = CudaResponse(rhs_point);
-    if (lhs_response != rhs_response) {
-      return lhs_response > rhs_response;
-    }
-    if (lhs_point.ypos != rhs_point.ypos) {
-      return lhs_point.ypos < rhs_point.ypos;
-    }
-    if (lhs_point.xpos != rhs_point.xpos) {
-      return lhs_point.xpos < rhs_point.xpos;
-    }
-    if (lhs_point.scale != rhs_point.scale) {
-      return lhs_point.scale < rhs_point.scale;
-    }
-    return lhs_point.orientation < rhs_point.orientation;
+void RetainBestCudaFeatures(const std::size_t maximum,
+                            features::cuda::CudaSiftResult* result) {
+  if (maximum == 0 || result->keypoints.size() <= maximum) return;
+  std::vector<std::size_t> order(result->keypoints.size());
+  std::iota(order.begin(), order.end(), std::size_t{0});
+  std::stable_sort(order.begin(), order.end(), [&](const std::size_t lhs,
+                                                    const std::size_t rhs) {
+    return std::abs(result->keypoints[lhs].response) >
+           std::abs(result->keypoints[rhs].response);
   });
 
-  if (max_num_features > 0 &&
-      indices.size() > static_cast<std::size_t>(max_num_features)) {
-    indices.resize(static_cast<std::size_t>(max_num_features));
+  std::vector<features::cuda::CudaSiftKeypoint> keypoints;
+  std::vector<float> descriptors;
+  keypoints.reserve(maximum);
+  descriptors.reserve(maximum * 128);
+  for (std::size_t rank = 0; rank < maximum; ++rank) {
+    const std::size_t source = order[rank];
+    keypoints.push_back(result->keypoints[source]);
+    descriptors.insert(descriptors.end(),
+                       result->descriptors.begin() + source * 128,
+                       result->descriptors.begin() + (source + 1) * 128);
   }
-  return indices;
+  result->keypoints = std::move(keypoints);
+  result->descriptors = std::move(descriptors);
 }
 
 }  // namespace
 
 bool IsCudaSiftAvailable() {
   int device_count = 0;
-  const cudaError_t err = cudaGetDeviceCount(&device_count);
-  return err == cudaSuccess && device_count > 0;
+  const cudaError_t error = cudaGetDeviceCount(&device_count);
+  return error == cudaSuccess && device_count > 0;
 }
 
 FeatureSet ExtractCudaSiftFeatures(const cv::Mat& image,
                                    const SiftExtractionOptions& options) {
   if (!IsCudaSiftAvailable()) {
-    throw std::runtime_error("CudaSift backend was built, but no CUDA device "
-                             "is available at runtime.");
+    throw std::runtime_error("CUDA SIFT was built, but no CUDA device is available.");
   }
 
-  std::call_once(cuda_init_once, [&]() { InitCuda(options.cuda_device); });
+  const SiftBackend backend = ResolveSiftBackend(options.backend);
+  const bool vlfeat_mode = backend == SiftBackend::kCudaVlSift;
+  features::cuda::CudaSiftConfig config;
+  config.mode = CudaMode(backend);
+  config.firstOctave = options.upsample_first_octave ? -1 : 0;
+  config.octaveLayers = options.num_octave_layers;
+  config.maxOctaves = vlfeat_mode ? options.vl_num_octaves
+                                  : options.cuda_num_octaves;
+  config.sigma = static_cast<float>(options.sigma);
+  config.contrastThreshold = static_cast<float>(options.contrast_threshold);
+  config.peakThreshold = vlfeat_mode
+                             ? EffectiveCudaVlFeatPeakThreshold(options)
+                             : options.cuda_threshold;
+  config.edgeThreshold = static_cast<float>(options.edge_threshold);
+  config.maxFeatures = options.max_num_features;
 
-  const cv::Mat gray_float = ToGrayFloatImage(image);
-  const int width = gray_float.cols;
-  const int height = gray_float.rows;
-  const int pitch = iAlignUp(width, 128);
-
-  CudaImage cuda_image;
-  cuda_image.Allocate(width, height, pitch, false, nullptr,
-                      reinterpret_cast<float*>(gray_float.data));
-  cuda_image.Download();
-
-  SiftData sift_data;
-  const int max_points = CudaCandidateCapacity(options);
-  InitSiftData(sift_data, max_points, true, true);
-
-  float* temp_memory = AllocSiftTempMemory(width, height,
-                                           options.cuda_num_octaves,
-                                           options.cuda_scale_up);
-  ExtractSift(sift_data, cuda_image, options.cuda_num_octaves,
-              options.cuda_init_blur, options.cuda_threshold,
-              options.cuda_lowest_scale, options.cuda_scale_up, temp_memory);
-  FreeSiftTempMemory(temp_memory);
+  const cv::Mat gray = ToContinuousGray(image);
+  features::cuda::CudaSiftResult cuda_result =
+      features::cuda::CudaSift(config, options.cuda_device)
+          .detectAndCompute(gray.ptr<std::uint8_t>(), gray.cols, gray.rows);
+  RetainBestCudaFeatures(static_cast<std::size_t>(options.max_num_features),
+                         &cuda_result);
 
   FeatureSet result;
-  const std::vector<int> ranked_indices = RankedCudaPointIndices(
-      sift_data.h_data, sift_data.numPts, options.max_num_features);
-  result.keypoints.reserve(ranked_indices.size());
+  result.keypoints.reserve(cuda_result.keypoints.size());
+  for (const features::cuda::CudaSiftKeypoint& keypoint :
+       cuda_result.keypoints) {
+    FeatureKeypoint converted;
+    // COLMAP's VLFeat wrapper stores pixel-center coordinates, whereas the
+    // low-level VLFeat/CUDA kernels both use integer pixel coordinates.
+    converted.x = keypoint.x + (vlfeat_mode ? 0.5F : 0.0F);
+    converted.y = keypoint.y + (vlfeat_mode ? 0.5F : 0.0F);
+    converted.scale = keypoint.size;
+    converted.orientation =
+        vlfeat_mode ? keypoint.angle * kRadiansToDegrees : keypoint.angle;
+    if (converted.orientation < 0.0F) converted.orientation += 360.0F;
+    converted.response = std::abs(keypoint.response);
+    result.keypoints.push_back(converted);
+  }
 
-  std::vector<float> descriptors;
-  descriptors.reserve(ranked_indices.size() * 128);
-  for (const int point_idx : ranked_indices) {
-    const SiftPoint& point = sift_data.h_data[point_idx];
-    FeatureKeypoint keypoint;
-    keypoint.x = point.xpos;
-    keypoint.y = point.ypos;
-    keypoint.scale = point.scale;
-    keypoint.orientation = point.orientation;
-    keypoint.response = CudaResponse(point);
-    result.keypoints.push_back(keypoint);
-
-    descriptors.insert(descriptors.end(), point.data, point.data + 128);
+  std::vector<float> descriptors = cuda_result.descriptors;
+  if (descriptors.size() != result.keypoints.size() * 128) {
+    throw std::runtime_error("CUDA SIFT descriptor buffer has unexpected size.");
+  }
+  if (vlfeat_mode) {
+    for (std::size_t i = 0; i < result.keypoints.size(); ++i) {
+      TransformVlFeatDescriptorToUbc(descriptors.data() + i * 128);
+    }
   }
   result.descriptors = features::ConvertSiftDescriptors(
       descriptors.data(), result.keypoints.size(), options.use_root_sift);
-
-  FreeSiftData(sift_data);
   return result;
 }
 

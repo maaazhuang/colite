@@ -4,6 +4,8 @@
 
 #include <gtest/gtest.h>
 
+#include "colite/core/reconstruction.h"
+
 namespace colite {
 namespace {
 
@@ -78,6 +80,35 @@ TEST(GeometryTest, ReprojectionErrorIsMeasuredInPixels) {
   EXPECT_NEAR(*error, 5.0, 1e-12);
 }
 
+TEST(GeometryTest, ComputesPointTrackRootMeanSquaredReprojectionError) {
+  Reconstruction reconstruction;
+  const Camera camera = MakePinholeCamera();
+  reconstruction.AddCamera(camera);
+
+  Image image1;
+  image1.id = 1;
+  image1.camera_id = camera.id;
+  image1.cam_from_world = CameraAt(Eigen::Vector3d::Zero());
+  image1.registered = true;
+  image1.points2d.push_back({Eigen::Vector2d(503.0, 404.0), 0, 1});
+  reconstruction.AddImage(image1);
+
+  Image image2 = image1;
+  image2.id = 2;
+  image2.points2d[0].xy = Eigen::Vector2d(500.0, 400.0);
+  reconstruction.AddImage(image2);
+
+  Point3D point;
+  point.id = 1;
+  point.xyz = Eigen::Vector3d(0.0, 0.0, 5.0);
+  point.track.AddElement(1, 0);
+  point.track.AddElement(2, 0);
+  const auto error = Point3DTrackReprojectionError(reconstruction, point);
+
+  ASSERT_TRUE(error.has_value());
+  EXPECT_NEAR(*error, std::sqrt(12.5), 1e-12);
+}
+
 TEST(GeometryTest, TriangulatesPointFromTwoViews) {
   const Camera camera = MakePinholeCamera();
   const Pose3 cam1_from_world = CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0));
@@ -120,4 +151,3 @@ TEST(GeometryTest, ComputesTriangulationAngle) {
 
 }  // namespace
 }  // namespace colite
-

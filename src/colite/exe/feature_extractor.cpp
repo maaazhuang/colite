@@ -21,7 +21,9 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --focal_length <px>       Initial focal length in pixels.\n"
       << "  --max_num_features <n>   SIFT feature limit, default 4096.\n"
       << "  --feature_num_threads <n> CPU feature threads, default -1.\n"
-      << "  --feature_extractor <vlsift|cvsift|cudasift>\n";
+      << "  --feature_extractor <auto|vlsift|cvsift|cuda_opencv|cuda_vlfeat>\n"
+      << "                            Default auto prefers CUDA OpenCV and falls "
+         "back to CPU OpenCV.\n";
 }
 
 std::string RequireValue(const std::vector<std::string>& args,

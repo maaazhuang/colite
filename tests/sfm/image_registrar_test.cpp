@@ -143,7 +143,9 @@ TEST(ImageRegistrarTest, RegistersImageFromExistingPointsUsingPnPRansac) {
   EXPECT_TRUE(summary.success);
   EXPECT_EQ(summary.image_id, 3U);
   EXPECT_GE(summary.num_correspondences, 20U);
+  EXPECT_GE(summary.num_ransac_inliers, 20U);
   EXPECT_GE(summary.num_inliers, 20U);
+  EXPECT_GE(summary.num_inliers, summary.num_ransac_inliers);
   EXPECT_TRUE(reconstruction.IsImageRegistered(3));
   EXPECT_TRUE(reconstruction.GetImage(3).HasPose());
   EXPECT_GE(reconstruction.GetImage(3).NumPoints3D(), 20U);

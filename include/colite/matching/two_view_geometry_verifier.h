@@ -17,7 +17,11 @@ struct TwoViewGeometryOptions {
   double confidence = 0.999;
 
   // 内部 RANSAC 最大迭代次数。
-  int max_num_iterations = 1000;
+  // COLMAP-style adaptive robust-estimation bounds. The estimator always
+  // performs at least min_num_iterations and may continue until confidence is
+  // reached or max_num_iterations is exhausted.
+  int min_num_iterations = 100;
+  int max_num_iterations = 10000;
 
   // 判定几何关系有效所需的最少内点数。
   int min_num_inliers = 15;

@@ -25,6 +25,7 @@
 #include "colite/core/reconstruction.h"
 #include "colite/core/version.h"
 #include "colite/controllers/recon_mvs_controller.h"
+#include "colite/mvs/meshing.h"
 #include "colite/mvs/patch_match.h"
 
 namespace colite::exe {
@@ -59,6 +60,11 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --source_coverage_grid_size <n> Grid size used by source-view "
          "coverage scoring, default 4.\n"
       << "  --image_path <dir>          Directory containing input images.\n"
+      << "  --image_undistorter         Write undistorted/images and sparse model before MVS.\n"
+      << "  --undistort_blank_pixels <r> Allowed blank output fraction, default 0.\n"
+      << "  --undistort_min_scale <v>   Minimum focal scale, default 0.2.\n"
+      << "  --undistort_max_scale <v>   Maximum focal scale, default 2.\n"
+      << "  --undistort_max_image_size <n> Maximum undistorted side, default -1.\n"
       << "  --dense_map_format <fmt>    Dense map output format: text or "
          "binary, default text.\n"
       << "  --initialize_patch_match    Initialize dense depth/normal maps.\n"
@@ -72,6 +78,26 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --patch_match_pyramid_levels <n> Coarse-to-fine PatchMatch "
          "pyramid levels, default 1.\n"
       << "  --patch_match_window_radius <n> ZNCC window radius, default 2.\n"
+      << "  --patch_match_bilateral_ncc Enable COLMAP-style bilateral "
+         "weighted NCC; disabled by default.\n"
+      << "  --patch_match_sigma_spatial <s> Bilateral NCC spatial sigma; "
+         "default follows window radius.\n"
+      << "  --patch_match_sigma_color <s> Bilateral NCC grayscale sigma, "
+         "default 0.2.\n"
+      << "  --patch_match_dynamic_source_selection Enable iterative NCC "
+         "likelihood source probabilities; disabled by default.\n"
+      << "  --patch_match_directional_hmm Apply CUDA row/column "
+         "forward-backward source messages after each NCC update.\n"
+      << "  --patch_match_source_samples <n> Per-pixel source CDF samples; "
+         "default 0 uses best-K; 15 enables the experimental COLMAP-style "
+         "CDF path.\n"
+      << "  --patch_match_ncc_sigma <s> NCC likelihood sigma, default 0.6.\n"
+      << "  --patch_match_previous_selection_probability_weight <w> Previous "
+         "source probability EMA weight, default 0.5.\n"
+      << "  --patch_match_min_selection_probability <p> Dynamic source "
+         "probability floor, default 0.05.\n"
+      << "  --patch_match_max_selection_probability <p> Dynamic source "
+         "probability ceiling, default 0.999.\n"
       << "  --patch_match_perturbation_samples <n> Random plane candidates "
          "per valid pixel during perturbation, default 1.\n"
       << "  --patch_match_min_num_valid_sources <n> Minimum valid source "
@@ -80,7 +106,7 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
          "aggregated per PatchMatch hypothesis, default 3; 0 uses all.\n"
       << "  --patch_match_propagation_schedule <name> Propagation schedule: "
          "forward_backward, four_direction, or checkerboard; default "
-         "forward_backward.\n"
+         "checkerboard.\n"
       << "  --patch_match_geometric_refinement_iterations <n> PatchMatch "
          "second-pass geometric refinement iterations, default 0.\n"
       << "  --patch_match_geometric_consistency_weight <w> Source-depth "
@@ -128,10 +154,44 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
          "default 0 disables edge limit.\n"
       << "  --mesh_max_normal_angle <deg> Prototype mesh normal angle "
          "threshold, default 30.\n"
+      << "  --poisson_mesher          Reconstruct dense/meshed-poisson.ply "
+         "with PoissonRecon.\n"
+      << "  --poisson_point_weight <w> Screened Poisson point weight, default 1.\n"
+      << "  --poisson_depth <n>       Maximum Poisson octree depth, default 13.\n"
+      << "  --poisson_color <0|1>     Enable Poisson vertex colors, default 1.\n"
+      << "  --poisson_trim <v>        Remove low-density mesh regions, default 10.\n"
+      << "  --delaunay_mesher         Reconstruct dense/meshed-delaunay.ply "
+         "using visibility-aware CGAL meshing.\n"
+      << "  --delaunay_max_proj_dist <px> Reprojected subsampling radius, default 20.\n"
+      << "  --delaunay_max_depth_dist <r> Relative subsampling depth tolerance, default 0.05.\n"
+      << "  --delaunay_visibility_sigma <v> Visibility confidence sigma, default 3.\n"
+      << "  --delaunay_distance_sigma_factor <v> Surface distance scale, default 1.\n"
+      << "  --delaunay_quality_regularization <v> Graph-cut smoothness, default 1.\n"
+      << "  --delaunay_max_side_length_factor <v> Outlier face factor, default 25.\n"
+      << "  --delaunay_max_side_length_percentile <p> Face baseline percentile, default 95.\n"
+      << "  --mesh_simplifier        Simplify each generated mesh with QEM edge collapses.\n"
+      << "  --mesh_simplification_ratio <r> Target triangle ratio, default 0.5.\n"
+      << "  --mesh_simplification_target_triangles <n> Explicit target; overrides ratio.\n"
+      << "  --mesh_simplification_max_error <e> Optional quadric-error limit, default 0 disables.\n"
+      << "  --mesh_simplification_allow_boundary_changes Allow collapses that alter boundaries.\n"
+      << "  --mesh_simplification_max_normal_change <deg> Maximum local face rotation, default 60.\n"
+      << "  --mesh_texturer          Bake generated meshes to OBJ/MTL/PNG texture atlases.\n"
+      << "  --texture_atlas_size <n> Square atlas dimension, default 4096.\n"
+      << "  --texture_max_atlas_size <n> Maximum growing atlas side, default 32768.\n"
+      << "  --texture_patch_padding <n> Atlas region padding, default 2.\n"
+      << "  --texture_inpaint_radius <n> Atlas dilation radius, default 5.\n"
+      << "  --texture_scale <v>      Source projection scale, default 1.\n"
+      << "  --texture_min_cos_normal_angle <v> Grazing-angle threshold, default 0.1.\n"
+      << "  --texture_min_visible_vertices <n> Required projected vertices, default 3.\n"
+      << "  --texture_view_smoothing_iterations <n> Neighbor label smoothing, default 3.\n"
+      << "  --texture_visibility_resolution <n> Depth-buffer longest side, default 1024.\n"
+      << "  --texture_occlusion_tolerance <r> Relative depth tolerance, default 0.01.\n"
+      << "  --texture_color_correction <0|1> Apply global seam correction, default 1.\n"
+      << "  --texture_color_correction_regularization <v> Correction regularizer, default 0.1.\n"
       << "  --geometric_max_reprojection_error <px> Geometric consistency "
-         "reprojection threshold, default 2.\n"
-      << "  --geometric_max_relative_depth_error <r> Geometric consistency "
-         "relative depth threshold, default 0.01.\n"
+         "forward-backward reprojection threshold, default 1.\n"
+      << "  --geometric_max_relative_depth_error <r> Optional geometric "
+         "relative-depth threshold; default 0 disables it to match COLMAP.\n"
       << "  --num_threads <n>        Number of PatchMatch worker threads, "
          "default 1.\n"
       << "  --image_cache_size <n>      LRU image cache size, default 16.\n"
@@ -169,6 +229,18 @@ ReconMvsCliOptions ParseOptions(const std::vector<std::string>& args) {
       options.image_path = RequireValue(args, &i, arg);
     } else if (arg == "--output_path") {
       options.output_path = RequireValue(args, &i, arg);
+    } else if (arg == "--image_undistorter") {
+      options.image_undistorter = true;
+    } else if (arg == "--undistort_blank_pixels") {
+      options.undistort_blank_pixels =
+          std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--undistort_min_scale") {
+      options.undistort_min_scale = std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--undistort_max_scale") {
+      options.undistort_max_scale = std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--undistort_max_image_size") {
+      options.undistort_max_image_size =
+          std::stoi(RequireValue(args, &i, arg));
     } else if (arg == "--max_num_source_images") {
       options.max_num_source_images =
           static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
@@ -214,6 +286,35 @@ ReconMvsCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--patch_match_window_radius") {
       options.patch_match_window_radius =
           std::stoi(RequireValue(args, &i, arg));
+    } else if (arg == "--patch_match_bilateral_ncc") {
+      options.patch_match_bilateral_ncc = true;
+    } else if (arg == "--patch_match_sigma_spatial") {
+      options.patch_match_sigma_spatial =
+          std::stof(RequireValue(args, &i, arg));
+    } else if (arg == "--patch_match_sigma_color") {
+      options.patch_match_sigma_color =
+          std::stof(RequireValue(args, &i, arg));
+    } else if (arg == "--patch_match_dynamic_source_selection") {
+      options.patch_match_dynamic_source_selection = true;
+    } else if (arg == "--patch_match_directional_hmm") {
+      options.patch_match_directional_hmm = true;
+      options.patch_match_dynamic_source_selection = true;
+    } else if (arg == "--patch_match_source_samples") {
+      options.patch_match_source_samples =
+          static_cast<std::size_t>(
+              std::stoull(RequireValue(args, &i, arg)));
+    } else if (arg == "--patch_match_ncc_sigma") {
+      options.patch_match_ncc_sigma = std::stof(RequireValue(args, &i, arg));
+    } else if (arg ==
+               "--patch_match_previous_selection_probability_weight") {
+      options.patch_match_previous_selection_probability_weight =
+          std::stof(RequireValue(args, &i, arg));
+    } else if (arg == "--patch_match_min_selection_probability") {
+      options.patch_match_min_selection_probability =
+          std::stof(RequireValue(args, &i, arg));
+    } else if (arg == "--patch_match_max_selection_probability") {
+      options.patch_match_max_selection_probability =
+          std::stof(RequireValue(args, &i, arg));
     } else if (arg == "--patch_match_perturbation_samples") {
       options.patch_match_perturbation_samples =
           static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
@@ -293,6 +394,95 @@ ReconMvsCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--mesh_max_normal_angle") {
       options.mesh_max_normal_angle_degrees =
           std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--poisson_mesher") {
+      options.poisson_mesher = true;
+      options.fuse_stereo = true;
+      options.check_geometric_consistency = true;
+      if (options.filter_geometric_min_num_consistent_sources == 0) {
+        options.filter_geometric_min_num_consistent_sources = 1;
+      }
+    } else if (arg == "--poisson_point_weight") {
+      options.poisson_point_weight = std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--poisson_depth") {
+      options.poisson_depth = std::stoi(RequireValue(args, &i, arg));
+    } else if (arg == "--poisson_color") {
+      options.poisson_color = std::stoi(RequireValue(args, &i, arg)) != 0;
+    } else if (arg == "--poisson_trim") {
+      options.poisson_trim = std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--delaunay_mesher") {
+      options.delaunay_mesher = true;
+      options.fuse_stereo = true;
+      options.check_geometric_consistency = true;
+      if (options.filter_geometric_min_num_consistent_sources == 0) {
+        options.filter_geometric_min_num_consistent_sources = 1;
+      }
+    } else if (arg == "--delaunay_max_proj_dist") {
+      options.delaunay_max_proj_dist = std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--delaunay_max_depth_dist") {
+      options.delaunay_max_depth_dist = std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--delaunay_visibility_sigma") {
+      options.delaunay_visibility_sigma = std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--delaunay_distance_sigma_factor") {
+      options.delaunay_distance_sigma_factor =
+          std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--delaunay_quality_regularization") {
+      options.delaunay_quality_regularization =
+          std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--delaunay_max_side_length_factor") {
+      options.delaunay_max_side_length_factor =
+          std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--delaunay_max_side_length_percentile") {
+      options.delaunay_max_side_length_percentile =
+          std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--mesh_simplifier") {
+      options.mesh_simplifier = true;
+    } else if (arg == "--mesh_simplification_ratio") {
+      options.mesh_simplification_ratio =
+          std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--mesh_simplification_target_triangles") {
+      options.mesh_simplification_target_triangles =
+          static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
+    } else if (arg == "--mesh_simplification_max_error") {
+      options.mesh_simplification_max_error =
+          std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--mesh_simplification_allow_boundary_changes") {
+      options.mesh_simplification_preserve_boundary = false;
+    } else if (arg == "--mesh_simplification_max_normal_change") {
+      options.mesh_simplification_max_normal_change_degrees =
+          std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--mesh_texturer") {
+      options.mesh_texturer = true;
+    } else if (arg == "--texture_atlas_size") {
+      options.texture_atlas_size = std::stoi(RequireValue(args, &i, arg));
+    } else if (arg == "--texture_max_atlas_size") {
+      options.texture_max_atlas_size = std::stoi(RequireValue(args, &i, arg));
+    } else if (arg == "--texture_patch_padding") {
+      options.texture_patch_padding = std::stoi(RequireValue(args, &i, arg));
+    } else if (arg == "--texture_inpaint_radius") {
+      options.texture_inpaint_radius = std::stoi(RequireValue(args, &i, arg));
+    } else if (arg == "--texture_scale") {
+      options.texture_scale = std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--texture_min_cos_normal_angle") {
+      options.texture_min_cos_normal_angle =
+          std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--texture_min_visible_vertices") {
+      options.texture_min_visible_vertices =
+          std::stoi(RequireValue(args, &i, arg));
+    } else if (arg == "--texture_view_smoothing_iterations") {
+      options.texture_view_smoothing_iterations =
+          std::stoi(RequireValue(args, &i, arg));
+    } else if (arg == "--texture_visibility_resolution") {
+      options.texture_visibility_resolution =
+          std::stoi(RequireValue(args, &i, arg));
+    } else if (arg == "--texture_occlusion_tolerance") {
+      options.texture_occlusion_relative_tolerance =
+          std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--texture_color_correction") {
+      options.texture_apply_color_correction =
+          std::stoi(RequireValue(args, &i, arg)) != 0;
+    } else if (arg == "--texture_color_correction_regularization") {
+      options.texture_color_correction_regularization =
+          std::stod(RequireValue(args, &i, arg));
     } else if (arg == "--geometric_max_reprojection_error") {
       options.geometric_max_reprojection_error_pixels =
           std::stof(RequireValue(args, &i, arg));
@@ -361,6 +551,22 @@ void ValidateOptions(const ReconMvsCliOptions& options) {
     throw std::invalid_argument(
         "--initialize_patch_match requires --image_path");
   }
+  if (options.image_undistorter && options.image_path.empty()) {
+    throw std::invalid_argument(
+        "--image_undistorter requires --image_path");
+  }
+  const bool undistortion_options_valid =
+      std::isfinite(options.undistort_blank_pixels) &&
+      options.undistort_blank_pixels >= 0.0 &&
+      options.undistort_blank_pixels <= 1.0 &&
+      std::isfinite(options.undistort_min_scale) &&
+      std::isfinite(options.undistort_max_scale) &&
+      options.undistort_min_scale > 0.0 &&
+      options.undistort_min_scale <= options.undistort_max_scale &&
+      options.undistort_max_image_size != 0;
+  if (!undistortion_options_valid) {
+    throw std::invalid_argument("Invalid image undistortion options");
+  }
   if (options.run_patch_match && options.image_path.empty()) {
     throw std::invalid_argument("--run_patch_match requires --image_path");
   }
@@ -373,6 +579,28 @@ void ValidateOptions(const ReconMvsCliOptions& options) {
   if (options.patch_match_window_radius < 0) {
     throw std::invalid_argument(
         "--patch_match_window_radius must be non-negative");
+  }
+  if (!std::isfinite(options.patch_match_sigma_spatial) ||
+      !std::isfinite(options.patch_match_sigma_color) ||
+      options.patch_match_sigma_color <= 0.0F) {
+    throw std::invalid_argument(
+        "PatchMatch bilateral NCC sigmas must be finite and color sigma "
+        "must be positive");
+  }
+  if (!std::isfinite(options.patch_match_ncc_sigma) ||
+      options.patch_match_ncc_sigma <= 0.0F ||
+      !std::isfinite(
+          options.patch_match_previous_selection_probability_weight) ||
+      options.patch_match_previous_selection_probability_weight < 0.0F ||
+      options.patch_match_previous_selection_probability_weight > 1.0F ||
+      !std::isfinite(options.patch_match_min_selection_probability) ||
+      !std::isfinite(options.patch_match_max_selection_probability) ||
+      options.patch_match_min_selection_probability < 0.0F ||
+      options.patch_match_max_selection_probability > 1.0F ||
+      options.patch_match_min_selection_probability >
+          options.patch_match_max_selection_probability) {
+    throw std::invalid_argument(
+        "PatchMatch dynamic source selection options are invalid");
   }
   try {
     (void)mvs::PatchMatchBackendFromName(options.patch_match_backend);
@@ -424,17 +652,93 @@ void ValidateOptions(const ReconMvsCliOptions& options) {
     throw std::invalid_argument(
         "--filter_photometric_max_cost must be non-negative when enabled");
   }
-  if (options.check_geometric_consistency && !options.run_patch_match) {
+  if (options.check_geometric_consistency && !options.run_patch_match &&
+      !options.fuse_stereo) {
     throw std::invalid_argument(
         "--check_geometric_consistency requires --run_patch_match");
-  }
-  if (options.fuse_stereo && !options.run_patch_match) {
-    throw std::invalid_argument("--fuse_stereo requires --run_patch_match");
   }
   if ((options.filter_dense_cloud || options.mesh_dense_cloud) &&
       !options.fuse_stereo) {
     throw std::invalid_argument(
         "Dense cloud filtering and meshing require --fuse_stereo");
+  }
+  const bool poisson_options_valid =
+      std::isfinite(options.poisson_point_weight) &&
+      options.poisson_point_weight >= 0.0 && options.poisson_depth > 0 &&
+      std::isfinite(options.poisson_trim) && options.poisson_trim >= 0.0;
+  if (!poisson_options_valid) {
+    throw std::invalid_argument("Invalid Poisson meshing options");
+  }
+  const bool delaunay_options_valid =
+      std::isfinite(options.delaunay_max_proj_dist) &&
+      options.delaunay_max_proj_dist >= 0.0 &&
+      std::isfinite(options.delaunay_max_depth_dist) &&
+      options.delaunay_max_depth_dist >= 0.0 &&
+      options.delaunay_max_depth_dist <= 1.0 &&
+      std::isfinite(options.delaunay_visibility_sigma) &&
+      options.delaunay_visibility_sigma > 0.0 &&
+      std::isfinite(options.delaunay_distance_sigma_factor) &&
+      options.delaunay_distance_sigma_factor > 0.0 &&
+      std::isfinite(options.delaunay_quality_regularization) &&
+      options.delaunay_quality_regularization >= 0.0 &&
+      std::isfinite(options.delaunay_max_side_length_factor) &&
+      options.delaunay_max_side_length_factor >= 0.0 &&
+      std::isfinite(options.delaunay_max_side_length_percentile) &&
+      options.delaunay_max_side_length_percentile >= 0.0 &&
+      options.delaunay_max_side_length_percentile <= 100.0;
+  if (!delaunay_options_valid) {
+    throw std::invalid_argument("Invalid Delaunay meshing options");
+  }
+  const bool simplification_options_valid =
+      std::isfinite(options.mesh_simplification_ratio) &&
+      options.mesh_simplification_ratio > 0.0 &&
+      options.mesh_simplification_ratio <= 1.0 &&
+      std::isfinite(options.mesh_simplification_max_error) &&
+      options.mesh_simplification_max_error >= 0.0 &&
+      std::isfinite(options.mesh_simplification_max_normal_change_degrees) &&
+      options.mesh_simplification_max_normal_change_degrees >= 0.0 &&
+      options.mesh_simplification_max_normal_change_degrees <= 180.0;
+  if (!simplification_options_valid) {
+    throw std::invalid_argument("Invalid mesh simplification options");
+  }
+  if (options.mesh_simplifier && !options.poisson_mesher &&
+      !options.delaunay_mesher && !options.mesh_dense_cloud) {
+    throw std::invalid_argument(
+        "--mesh_simplifier requires a mesh generation option");
+  }
+  const bool texturing_options_valid =
+      options.texture_atlas_size >= 16 &&
+      options.texture_max_atlas_size >= options.texture_atlas_size &&
+      options.texture_patch_padding >= 0 &&
+      options.texture_inpaint_radius >= 0 &&
+      options.texture_patch_padding * 2 + 1 < options.texture_atlas_size &&
+      std::isfinite(options.texture_scale) && options.texture_scale > 0.0 &&
+      std::isfinite(options.texture_min_cos_normal_angle) &&
+      options.texture_min_cos_normal_angle >= -1.0 &&
+      options.texture_min_cos_normal_angle <= 1.0 &&
+      options.texture_min_visible_vertices >= 1 &&
+      options.texture_min_visible_vertices <= 3 &&
+      options.texture_view_smoothing_iterations >= 0 &&
+      options.texture_visibility_resolution >= 16 &&
+      std::isfinite(options.texture_occlusion_relative_tolerance) &&
+      options.texture_occlusion_relative_tolerance >= 0.0 &&
+      std::isfinite(options.texture_color_correction_regularization) &&
+      options.texture_color_correction_regularization > 0.0;
+  if (!texturing_options_valid) {
+    throw std::invalid_argument("Invalid mesh texturing options");
+  }
+  if (options.mesh_texturer && !options.poisson_mesher &&
+      !options.delaunay_mesher && !options.mesh_dense_cloud) {
+    throw std::invalid_argument(
+        "--mesh_texturer requires a mesh generation option");
+  }
+  if (options.poisson_mesher && !mvs::IsPoissonMeshingAvailable()) {
+    throw std::invalid_argument(
+        "--poisson_mesher is unavailable in this build");
+  }
+  if (options.delaunay_mesher && !mvs::IsDelaunayMeshingAvailable()) {
+    throw std::invalid_argument(
+        "--delaunay_mesher requires a build configured with CGAL");
   }
   if (options.fusion_min_num_observations == 0) {
     throw std::invalid_argument(

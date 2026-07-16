@@ -13,7 +13,7 @@ struct FeatureExtractorControllerOptions {
   double focal_length = 0.0;
   int max_num_features = 4096;
   int num_threads = -1;
-  SiftBackend backend = SiftBackend::kCvSift;
+  SiftBackend backend = SiftBackend::kAuto;
 };
 
 struct FeatureExtractorControllerSummary {

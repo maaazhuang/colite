@@ -1,5 +1,121 @@
 # COLITE MVS 实验矩阵
 
+### Milestone 27: CUDA NCC likelihood dynamic source probability
+
+Date: 2026-07-14
+
+Controlled building-18 setup: `max_image_size=64`, two PatchMatch iterations,
+one perturbation sample, one geometric refinement iteration.
+
+```text
+case                                      fused_points  CUDA total sum (ms)
+static source probability                         272             132.765
+dynamic probability, deterministic floor gate    272             139.459
+dynamic probability + bilateral NCC              219                 n/a
+```
+
+Dynamic diagnostics:
+
+```text
+probability updates: 442368
+source selection tests: 12712
+source selection acceptances: 12712
+source selection rejections: 0
+final per-source mean probability: approximately 0.35 to 0.44
+```
+
+Outputs:
+
+```text
+static:    build-wsl/mvs-building-18/cuda-static-selection-i2-ms62-64
+dynamic:   build-wsl/mvs-building-18/cuda-dynamic-gate-i2-ms66-64
+combined:  build-wsl/mvs-building-18/cuda-dynamic-gate-bilateral-i2-ms67-64
+```
+
+An intermediate independent-Bernoulli experiment produced only 34 fused
+points because candidates frequently had fewer than the required number of
+sources. The retained implementation therefore uses a deterministic floor
+gate until fixed-count CDF sampling is available.
+
+Conclusion: the likelihood/posterior update loop is functional and neutral on
+the current demo, but does not yet reproduce COLMAP's directional HMM or
+fixed-count source sampling. Bilateral NCC remains opt-in.
+
+### Milestone 26: opt-in bilateral weighted NCC
+
+Date: 2026-07-13
+
+Implementation:
+
+- CPU and CUDA share the COLMAP-style reference-driven bilateral weight.
+- The existing COLITE `0.5 * (1 - NCC)` scale is preserved.
+- The feature is exposed by `--patch_match_bilateral_ncc` and is disabled by default.
+- Effective mode and sigma values are exported to `stereo/patch_match.tsv`.
+
+building-18 controlled results (`max_image_size=64`):
+
+```text
+case                                      radius  sigma_color  fused_points
+previous unweighted baseline                  1       n/a           268
+bilateral                                     1       0.2           216
+bilateral                                     1       0.3           230
+bilateral                                     1       0.5           238
+near-unweighted                               2       1000          186
+bilateral                                     2       0.2           129
+new default, bilateral disabled               1       0.2           268
+```
+
+Outputs:
+
+```text
+opt-in bilateral: build-wsl/mvs-building-18/cuda-bilateral-ncc-ms56-64
+default guarded:  build-wsl/mvs-building-18/cuda-bilateral-optin-ms61-64
+```
+
+Conclusion: bilateral weighting is numerically correct and suppresses synthetic cross-edge outliers, but enabling it alone regresses the current low-resolution, small-window pipeline. It therefore remains opt-in until NCC likelihood and dynamic source selection are integrated and evaluated together.
+
+### Milestone 25: CUDA plane propagation and decoupled perturbation candidates
+
+Date: 2026-07-13
+
+Goal: align the CUDA hypothesis search semantics with COLMAP before replacing
+the current photometric cost.
+
+Implemented:
+
+- deterministic randomized initial normals on CUDA;
+- plane-induced neighbor propagation to the current reference ray;
+- joint, normal-only, and depth-only perturbation candidates;
+- separate propagation and perturbation candidate counters in TSV diagnostics.
+
+Controlled building-18 result (`max_image_size=64`, one PatchMatch iteration,
+one perturbation sample, one geometric refinement iteration):
+
+```text
+baseline output: build-wsl/mvs-building-18/cuda-overlap-thread2-64-ms52-default-checkerboard
+current output:  build-wsl/mvs-building-18/cuda-colmap-align-ms55-64
+
+metric                              baseline       current
+geometric_consistent_pixels             216           268
+fused_points                            216           268
+photometric_filtered_pixels           32124         26477
+CUDA refinement total (ms)          169.779       109.978
+CUDA propagation (ms)                64.468        16.618
+CUDA perturbation (ms)                3.025         2.626
+
+current plane propagation candidates: 868608
+current perturbation candidates:       165888
+```
+
+Interpretation:
+
+- The fused-point count improved by 24.1%, so the first alignment milestone
+  closes rather than regresses the building-18 quality proxy.
+- Timing is a single low-resolution observation and must not be treated as a
+  stable speedup until repeated at 128 px and a practical resolution.
+- The next implementation target is bilateral weighted NCC, followed by
+  dynamic selection probability and stronger reprojection geometry scoring.
+
 更新日期：2026-06-25
 
 本文记录 MVS 阶段的可复现实验指标。当前主数据集为 `data/building-18`，输入稀疏模型为 `build-wsl/compare-building-18/controlled-colite-4000-pinhole`。
@@ -1291,6 +1407,1064 @@ ctest --test-dir build-wsl -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|Rec
 100% tests passed, 0 tests failed out of 26
 ```
 
+### Milestone 40: CUDA output normal materialization
+
+Goal: remove host-side output normal normalization from dense map
+materialization while keeping CUDA output normals valid and normalized.
+
+Implemented:
+
+- Added `cuda_host_initial_normal_upload_normalizations` and
+  `cuda_host_output_normalizations` diagnostics to `PatchMatchStereoSummary`.
+- Exported both diagnostics in `patch_match_initial.tsv` and
+  `patch_match.tsv`.
+- Normalized initial-map normals before asynchronous CUDA upload, so external
+  non-unit initial maps do not break the device-side hypothesis invariant.
+- Normalized packed output normals in `PackOutputMapsKernel`, then let host
+  materialization copy finite non-zero normals directly into `NormalMap`.
+- Added a CUDA regression test with non-unit initial normals.
+
+building-18 CUDA profiling:
+
+```text
+baseline: build-wsl/mvs-building-18/cuda-overlap-thread2-64-ms47
+current : build-wsl/mvs-building-18/cuda-overlap-thread2-64-ms49
+
+initial result_materialization_sum:
+  ms47 = 86.179596 ms
+  ms49 = 64.711323 ms
+
+initial dense_map_fill_sum:
+  ms47 = 55.341985 ms
+  ms49 = 34.116230 ms
+
+final result_materialization_sum:
+  ms47 = 82.700163 ms
+  ms49 = 61.074301 ms
+
+final dense_map_fill_sum:
+  ms47 = 55.202973 ms
+  ms49 = 34.254693 ms
+
+final cuda_total_time_sum:
+  ms47 = 117.598514 ms
+  ms49 = 93.137280 ms
+
+fused_points:
+  ms47 = 156
+  ms49 = 155
+```
+
+Conclusion:
+
+- Moving output normal normalization out of host materialization removes the
+  largest remaining dense-map-fill cost at this 64px test size.
+- The current implementation keeps normalization in CUDA pack output instead of
+  dropping it entirely, which is a conservative compromise between performance
+  and prior output semantics.
+- The one-point fused cloud difference on building-18 should be treated as a
+  watch item. It may be a threshold-edge numeric difference, but larger tests
+  should verify that the optimization does not systematically reduce geometric
+  consistency or fusion density.
+
+Verification:
+
+```text
+./build-wsl-cuda-mvs-tests/tests/colite_core_tests --gtest_filter='PatchMatchBackendTest.CudaBackendNormalizesInitialNormalsBeforeUpload'
+1/1 passed
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+22/22 passed, 1 skipped
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+1/1 passed
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWithTwoThreadsWhenRequested --output-on-failure
+1/1 passed
+
+cmake --build build-wsl --target colite_core_tests -j2
+passed / no work to do
+
+ctest --test-dir build-wsl -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+1/1 passed
+```
+
+### Milestone 41: Default CUDA propagation schedule moves to checkerboard
+
+Goal: close the stability/quality gap between COLITE CUDA PatchMatch and
+COLMAP-style red-black propagation after observing a one-point fused cloud
+difference in the output-normal materialization milestone.
+
+Investigation:
+
+- The ms47 -> ms49 one-point difference was isolated to:
+  - image id 14,
+  - `P1180179.JPG`,
+  - pixel `(row=5, col=52)`.
+- In ms47, the pixel had:
+  - `depth=7.79879427`,
+  - `cost=0.0737642869`,
+  - consistency graph entry `5 52 1 15`.
+- In ms49, the same pixel was removed by geometric consistency.
+- Photometric filtering for image 14 was unchanged:
+  - `valid_cost_pixels_after_filter=1343`,
+  - `photometric_filtered_pixels=1729`.
+- Re-running the current code with the old default `forward_backward` produced
+  `fused_points=156` again, so the ms49 one-point drop is a schedule/timing
+  sensitive edge case rather than a fixed normal-materialization quality
+  regression.
+
+Implemented:
+
+- Changed `ReconMvsControllerOptions::patch_match_propagation_schedule` default
+  from `forward_backward` to `checkerboard`.
+- Changed `PatchMatchStereoOptions::propagation_schedule` default from
+  `kForwardBackward` to `kCheckerboard`, so library API and CLI defaults are
+  aligned.
+- Updated `recon_mvs --help` to report `default checkerboard`.
+- Kept explicit CLI overrides for all schedules.
+- Added a help regression test for the new user-facing default.
+- Added a PatchMatch options regression test for the lower-level default.
+
+building-18 CUDA profiling:
+
+```text
+ms50 current code, old implicit forward_backward:
+  output: build-wsl/mvs-building-18/cuda-overlap-thread2-64-ms50
+  geometric_consistent_pixels=156
+  fused_points=156
+
+ms51 explicit checkerboard:
+  output: build-wsl/mvs-building-18/cuda-overlap-thread2-64-ms51-checkerboard
+  geometric_consistent_pixels=216
+  fused_points=216
+
+ms52 default checkerboard:
+  output: build-wsl/mvs-building-18/cuda-overlap-thread2-64-ms52-default-checkerboard
+  geometric_consistent_pixels=216
+  fused_points=216
+```
+
+Conclusion:
+
+- Checkerboard/red-black propagation is a better default for the CUDA path and
+  more aligned with COLMAP's PatchMatch structure.
+- The previous forward/backward CUDA kernel remains useful as an experiment but
+  is more sensitive because it reads and writes neighboring hypotheses in the
+  same global map during a propagation pass.
+- On building-18 at 64px, the new default increases fused points from 156 to
+  216 under otherwise identical parameters.
+
+Verification:
+
+```text
+./build-wsl-cuda-mvs-tests/tests/colite_core_tests --gtest_filter='ReconMvsExeTest.PrintsHelp'
+1/1 passed
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+23/23 passed, 1 skipped
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+1/1 passed
+
+./build-wsl-cuda-mvs-tests/tests/colite_core_tests --gtest_filter='PatchMatchBackendTest.DefaultsToCheckerboardPropagation'
+1/1 passed
+
+cmake --build build-wsl --target colite_core_tests -j2
+passed
+
+ctest --test-dir build-wsl -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+1/1 passed
+```
+
+Not rerun in this pass:
+
+```text
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWithTwoThreadsWhenRequested --output-on-failure
+reason: WSL escalation request rejected by approval system.
+```
+
+### Milestone 39: CUDA dense map bulk materialization
+
+Goal: reduce the host-side dense map fill cost after CUDA output readback by
+writing directly into map storage instead of using per-pixel setters.
+
+Implemented:
+
+- Added mutable storage accessors:
+  - `DenseDepthMap::MutableData()`
+  - `NormalMap::MutableData()`
+  - `DenseCostMap::MutableData()`
+- Added unit tests proving mutable writes are visible through the public map
+  query APIs.
+- Changed CUDA output materialization to fill depth, normal, and cost maps by
+  linear index.
+- Kept normal validity behavior unchanged: invalid output normals become zero;
+  valid normals remain normalized.
+
+building-18 CUDA profiling:
+
+```text
+baseline: build-wsl/mvs-building-18/cuda-overlap-thread2-64-ms46
+current : build-wsl/mvs-building-18/cuda-overlap-thread2-64-ms47
+
+initial dense_map_fill_sum:
+  ms46 = 56.471037 ms
+  ms47 = 55.341985 ms
+
+final dense_map_fill_sum:
+  ms46 = 56.587363 ms
+  ms47 = 55.202973 ms
+
+final result_materialization_sum:
+  ms46 = 84.490515 ms
+  ms47 = 82.700163 ms
+
+fused_points:
+  ms46 = 156
+  ms47 = 156
+```
+
+Conclusion:
+
+- The bulk write path removes some setter overhead without changing output
+  scale, but the measured gain is modest at 64px.
+- Remaining materialization time is dominated by normal handling and downstream
+  normal refinement rather than vector copying or setter dispatch.
+- Next optimization target should be a stronger CUDA normal-output invariant
+  plus either GPU-side normal refinement or avoiding duplicate initial/final
+  normal refinement work.
+
+Verification:
+
+```text
+./build-wsl-cuda-mvs-tests/tests/colite_core_tests --gtest_filter='DenseDepthMapTest.MutableDataUpdatesDepthValues:NormalMapTest.MutableDataUpdatesNormalValues:DenseCostMapTest.MutableDataUpdatesCostValues'
+3/3 passed
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+21/21 passed, 1 skipped
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+1/1 passed
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWithTwoThreadsWhenRequested --output-on-failure
+1/1 passed
+
+cmake --build build-wsl --target colite_core_tests -j2
+passed
+
+ctest --test-dir build-wsl -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+1/1 passed
+```
+
+### Milestone 32: CUDA workspace pool and double buffering
+
+Goal: reduce inter-image host/device idle time by allowing one CUDA PatchMatch
+workspace to download results while another workspace uploads and runs kernels
+for the next reference image.
+
+Implemented:
+
+- Added controller-level `CudaPatchMatchWorkspace` pooling for CUDA/auto
+  `recon_mvs` runs.
+- The pool is conservatively capped at two slots:
+  `min(num_threads, num_images, 2)`.
+- Each slot owns its own CUDA stream, cached textures, reusable device buffers,
+  and pinned host staging buffers.
+- Initial PatchMatch dispatch now uses at most one active future per workspace
+  slot. A slot is reused only after its previous future has completed.
+- Geometric refinement remains sequential, but now also uses the pool by
+  round-robin slot selection.
+- `PatchMatchStereoSummary` and `stereo/patch_match.tsv` now report:
+  - `cuda_workspace_pool_size`,
+  - `cuda_workspace_pool_slot`.
+
+Why this matters:
+
+- This moves the CUDA path from a single shared workspace toward a pipeline
+  where D2H readback for image N can overlap upload/kernel work for image N+1.
+- It preserves the previous cache-reuse work while avoiding concurrent writes
+  to the same workspace.
+
+Still not complete:
+
+- The pool size is intentionally capped at two until real scene profiling shows
+  that more concurrent streams help more than they increase memory pressure.
+- Geometric refinement is not yet fully pipelined.
+- Per-slot timing is reported per image through the existing PatchMatch TSV,
+  but there is no end-to-end overlap efficiency metric yet.
+
+Verification:
+
+```text
+CUDA build:
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+100% tests passed, 0 tests failed out of 19, 1 skipped
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWithTwoThreadsWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+CPU build:
+cmake --build build-wsl --target colite_core_tests -j2
+passed
+
+ctest --test-dir build-wsl -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+ctest --test-dir build-wsl -R ReconMvsExeTest.RunsPatchMatchStereoWithTwoThreadsWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+```
+
+### Milestone 33: CUDA pinned async H2D upload staging for initial maps
+
+Goal: continue reducing host-device transfer stalls by moving reusable
+linear-buffer uploads onto pinned host staging and the workspace stream.
+
+Implemented:
+
+- Added `DeviceBuffer::CopyFromHostAsync`.
+- Added pinned upload staging buffers to `CudaPatchMatchWorkspace`:
+  - `host_depth_upload`,
+  - `host_normal_upload`.
+- When CUDA PatchMatch receives `initial_maps`, depth and normal maps are now
+  copied into pinned host buffers and uploaded with
+  `cudaMemcpyAsync(..., cudaMemcpyHostToDevice, stream)`.
+- The subsequent CUDA kernels run on the same workspace stream, so they are
+  ordered after the async uploads without a global device synchronize.
+- Added diagnostics:
+  - `cuda_async_host_uploads`,
+  - `cuda_pinned_host_upload_bytes`.
+- Added the same fields to `stereo/patch_match.tsv`.
+
+Why this matters:
+
+- CUDA pyramid execution and geometric refinement commonly enter PatchMatch
+  with prior depth/normal hypotheses. Those paths no longer use synchronous
+  depth/normal H2D copies.
+- This fits the existing workspace-pool direction: each slot now owns both
+  pinned upload staging and pinned download staging.
+
+Current limitation:
+
+- This milestone covers only linear depth/normal uploads for `initial_maps`.
+  Texture-backed inputs are handled by the following texture-upload milestone.
+
+Verification:
+
+```text
+CUDA target test:
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest.CudaBackendUsesPinnedAsyncUploadStagingForInitialMaps --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+CUDA backend regression:
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+100% tests passed, 0 tests failed out of 20, 1 skipped
+
+CUDA recon_mvs integration:
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+CPU build and backend regression:
+cmake --build build-wsl --target colite_core_tests -j2
+passed
+
+ctest --test-dir build-wsl -R PatchMatchBackendTest --output-on-failure
+100% tests passed, 0 tests failed out of 19, CUDA-only tests skipped
+
+CPU recon_mvs integration:
+ctest --test-dir build-wsl -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+```
+
+### Milestone 34: CUDA pinned async texture upload staging
+
+Goal: extend the previous pinned/async H2D work from linear depth/normal
+buffers to the texture-backed inputs that dominate CUDA PatchMatch setup.
+
+Implemented:
+
+- Added `FloatLayeredTexture::CreateAsync`.
+- Replaced synchronous `cudaMemcpy3D` texture uploads in CUDA PatchMatch with
+  `cudaMemcpy3DAsync(..., workspace_stream)`.
+- Added per-texture pinned staging buffers to `CudaPatchMatchWorkspace`:
+  - `host_reference_texture_upload`,
+  - `host_source_images_texture_upload`,
+  - `host_poses_texture_upload`,
+  - `host_source_depth_maps_texture_upload`,
+  - `host_selection_probability_texture_upload`.
+- Each texture input uses a distinct staging buffer so queued async copies do
+  not race with host-side overwrites from later texture packing.
+- The following inputs now upload through pinned staging and the workspace
+  stream:
+  - reference image texture,
+  - source image layered texture,
+  - pose texture,
+  - optional source depth maps texture,
+  - optional dense selection probability texture.
+- Added diagnostics:
+  - `cuda_async_texture_uploads`,
+  - `cuda_pinned_texture_upload_bytes`.
+- Added the same fields to `stereo/patch_match.tsv`.
+
+Why this matters:
+
+- The CUDA workspace slot now owns pinned staging for both upload and download
+  sides of PatchMatch.
+- Together with workspace pooling, this gives the runtime a cleaner chance to
+  overlap image N downloads with image N+1 texture uploads and kernels.
+
+Current limitation:
+
+- CUDA array allocation and texture object creation still happen on the host
+  setup path. The async work covers the host-to-array copy, not allocation.
+- Pinned texture staging is capacity-based per workspace slot; real-scene
+  profiling should watch host pinned memory pressure before increasing pool
+  size beyond two.
+- The following workspace-pool diagnostics milestone adds summary-level
+  overlap-efficiency estimates.
+
+Verification:
+
+```text
+CUDA target test:
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest.CudaBackendUsesPinnedAsyncTextureUploadStaging --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+CUDA backend regression:
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+100% tests passed, 0 tests failed out of 21, 1 skipped
+
+CUDA recon_mvs integration:
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+CPU build and backend regression:
+cmake --build build-wsl --target colite_core_tests -j2
+passed
+
+ctest --test-dir build-wsl -R PatchMatchBackendTest --output-on-failure
+100% tests passed, 0 tests failed out of 20, CUDA-only tests skipped
+
+CPU recon_mvs integration:
+ctest --test-dir build-wsl -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+```
+
+### Milestone 35: CUDA workspace-pool overlap diagnostics
+
+Goal: make the workspace-pool / double-buffering optimization measurable at the
+batch level, instead of inferring overlap only from per-image timings.
+
+Implemented:
+
+- Added `PatchMatchSchedulingSummary` in `recon_mvs`.
+- The initial PatchMatch batch now records:
+  - `patch_match_initial_wall_time_ms`,
+  - `patch_match_initial_sum_cuda_time_ms`,
+  - `patch_match_initial_overlap_saved_time_ms`,
+  - `patch_match_initial_overlap_ratio`.
+- The values are written to `summary.txt`.
+- The overlap estimate is conservative:
+  - wall time is measured around the full initial PatchMatch dispatch/collect
+    phase,
+  - summed CUDA time adds each CUDA image's `cuda_total_time_ms`,
+  - saved time is `max(0, summed_cuda_time - wall_time)`,
+  - ratio is saved time divided by summed CUDA time.
+
+Why this matters:
+
+- Upload/download/kernel work has been moved onto per-workspace streams and
+  pinned staging. This milestone makes it possible to tell whether the
+  two-slot workspace pool is actually reducing batch wall time.
+- The metric is especially useful when comparing `--num_threads 1` and
+  `--num_threads 2` with the CUDA backend.
+
+Current limitation:
+
+- The following refinement-pool milestone adds a separate overlap phase for
+  geometric refinement.
+- `cuda_total_time_ms` and controller wall time are not perfectly identical
+  timing domains, so this should be treated as a diagnostic estimate, not a
+  benchmark-grade profiler result.
+
+Verification:
+
+```text
+CUDA two-thread integration:
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWithTwoThreadsWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+CUDA backend regression:
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+100% tests passed, 0 tests failed out of 21, 1 skipped
+
+CUDA recon_mvs single-thread integration:
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+CPU build:
+cmake --build build-wsl --target colite_core_tests -j2
+passed
+
+CPU recon_mvs integration:
+ctest --test-dir build-wsl -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+ctest --test-dir build-wsl -R ReconMvsExeTest.RunsPatchMatchStereoWithTwoThreadsWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+```
+
+### Milestone 36: CUDA workspace-pool geometric refinement
+
+Goal: remove the sequential geometric-refinement bottleneck now that CUDA
+PatchMatch inputs and outputs are stream-aware and workspace-slot scoped.
+
+Implemented:
+
+- Added `PatchMatchRefinementJob` and `PatchMatchRefinementResult`.
+- Geometric refinement now builds immutable per-image jobs before dispatch:
+  - reference view/image,
+  - source views/images,
+  - source depth map snapshots,
+  - per-image depth range.
+- The CUDA/auto path dispatches refinement jobs through the same
+  `CudaPatchMatchWorkspace` pool used by the initial PatchMatch pass.
+- The CPU path can also dispatch refinement through `--num_threads`.
+- Source depth maps for refinement are taken from the initial PatchMatch
+  snapshot, removing the previous order-dependent behavior where later images
+  could read already-refined source depth maps.
+- Added refinement-stage scheduling diagnostics to `summary.txt`:
+  - `patch_match_refinement_wall_time_ms`,
+  - `patch_match_refinement_sum_cuda_time_ms`,
+  - `patch_match_refinement_overlap_saved_time_ms`,
+  - `patch_match_refinement_overlap_ratio`.
+
+Why this matters:
+
+- Geometric refinement now benefits from the same stream/pinned-staging
+  pipeline as the initial pass.
+- The snapshot input model is easier to reason about and prepares the code for
+  future multi-round geometric consistency refinement.
+
+Current limitation:
+
+- Initial PatchMatch and geometric refinement are still separate phases.
+  Refinement starts only after all initial depth maps are complete.
+- The source-depth snapshot increases temporary memory use; larger scenes
+  should be profiled before increasing the workspace pool beyond two slots.
+
+Verification:
+
+```text
+CUDA refinement integration:
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+CUDA backend regression:
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+100% tests passed, 0 tests failed out of 21, 1 skipped
+
+CUDA two-thread integration:
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWithTwoThreadsWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+CPU build:
+cmake --build build-wsl --target colite_core_tests -j2
+passed
+
+CPU recon_mvs integration:
+ctest --test-dir build-wsl -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+ctest --test-dir build-wsl -R ReconMvsExeTest.RunsPatchMatchStereoWithTwoThreadsWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+```
+
+### Milestone 25: CUDA PatchMatch profiling baseline
+
+Goal: establish measurable CUDA PatchMatch performance diagnostics before
+changing memory reuse, host-device transfer behavior, or kernel organization.
+
+Implemented:
+
+- Added CUDA timing fields to `PatchMatchStereoSummary`:
+  `cuda_upload_time_ms`, `cuda_initialization_time_ms`,
+  `cuda_evaluate_cost_time_ms`, `cuda_propagation_time_ms`,
+  `cuda_perturbation_time_ms`, `cuda_download_time_ms`, and
+  `cuda_total_time_ms`.
+- Single-scale CUDA PatchMatch now records:
+  - host packing, layered texture creation, device buffer allocation, and H2D
+    upload wall time,
+  - initialization kernel time,
+  - initial cost evaluation kernel time,
+  - propagation kernel group time across iterations,
+  - perturbation kernel time across iterations,
+  - D2H download wall time,
+  - total CUDA backend wall time.
+- CUDA pyramid execution accumulates per-level timing into the final summary.
+- `stereo/patch_match.tsv` now writes the same profiling fields for every image.
+  CPU backend rows keep these values at zero.
+
+Why this matters:
+
+- The next optimization stages need a stable baseline. These fields separate
+  upload/download overhead from kernel execution, so buffer/texture reuse and
+  host-device roundtrip changes can be measured directly.
+- The propagation and perturbation split makes it possible to decide whether
+  checkerboard/red-black scheduling, random perturbation, or cost aggregation
+  dominates runtime.
+
+Current limitation:
+
+- CUDA event timing intentionally synchronizes after measured kernel groups.
+  This is acceptable for diagnostics now, but should become optional if profiling
+  overhead becomes visible in full-scale dense reconstruction.
+
+Verification:
+
+```text
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest.CudaBackendReportsProfilingTimes --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+```
+
+### Milestone 30: CUDA async D2H with pinned host staging
+
+Goal: move CUDA PatchMatch readbacks toward stream-aware asynchronous transfers
+without changing the public MVS output model.
+
+Implemented:
+
+- Added pinned host staging buffers to `CudaPatchMatchWorkspace`:
+  - `host_iteration_counters`,
+  - `host_output_pixels`.
+- Added `DeviceBuffer::CopyToHostAsync`.
+- Changed iteration-counter D2H from synchronous copy to
+  `cudaMemcpyAsync(..., cudaMemcpyDeviceToHost, workspace_stream)` into pinned
+  host memory.
+- Changed packed output D2H from synchronous copy to async copy into pinned host
+  memory.
+- Added a lazy-created CUDA stream to `CudaPatchMatchWorkspace`.
+  The stream is created only after device selection, so externally created
+  workspaces do not bind early to the wrong GPU.
+- Moved CUDA PatchMatch kernels, propagation/perturbation events, output pack,
+  and async D2H onto the workspace stream.
+- Added diagnostics:
+  `cuda_async_counter_readbacks`, `cuda_async_output_readbacks`,
+  `cuda_pinned_host_staging_bytes`, and `cuda_stream_kernel_launches`.
+
+Why this matters:
+
+- `cudaMemcpyAsync` only gives useful overlap with page-locked host memory.
+  This milestone establishes the staging buffers and stream ownership needed for
+  real overlapping transfers in later work.
+- The implementation still synchronizes before constructing CPU-side dense maps,
+  but it removes default-stream assumptions and makes the data path ready for
+  double-buffering or a workspace pool.
+
+Current limitation:
+
+- The controller still consumes each result immediately, so a final
+  `cudaStreamSynchronize` remains necessary before filling `DenseDepthMap`,
+  `NormalMap`, and `DenseCostMap`.
+- Uploads and texture creation are still mostly synchronous. Future work should
+  target pinned upload staging and overlapping the next image's upload with the
+  previous image's output transfer.
+
+Verification:
+
+```text
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest.CudaBackendUsesPinnedAsyncReadbackStaging --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+100% tests passed, 0 tests failed out of 19
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+```
+
+### Milestone 26: CUDA shared-memory reference tile
+
+Goal: start CUDA PatchMatch shared-memory optimization without changing
+photometric/geometric behavior.
+
+Implemented:
+
+- `EvaluateCostKernel` now allocates a dynamic shared-memory reference tile.
+- Each CUDA block caches the reference image center pixels covered by that
+  block.
+- Reference patch samples that fall inside the cached linear block range read
+  from shared memory; samples outside that range keep using the original
+  reference texture path.
+- Source image sampling, source depth sampling, pose texture access,
+  propagation, checkerboard propagation, and perturbation remain unchanged.
+- Added `cuda_shared_reference_tile_pixels` to `PatchMatchStereoSummary` and
+  `stereo/patch_match.tsv`.
+
+Why this matters:
+
+- The initial cost evaluation repeatedly reads the same reference pixels across
+  source views and pose variants. This milestone removes part of that repeated
+  reference texture traffic while preserving the existing texture fallback for
+  block boundaries.
+- The implementation is intentionally conservative. It validates the shared
+  memory path before moving to a larger 2D tile with halo pixels.
+
+Current limitation:
+
+- The tile is one-dimensional and covers only pixels owned by the current block,
+  so patch halo pixels near block boundaries still fall back to texture reads.
+- Propagation and perturbation still use the old reference texture sampling path.
+
+Verification:
+
+```text
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest.CudaBackendReportsSharedReferenceTileUsage --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+100% tests passed, 0 tests failed out of 15
+```
+
+### Milestone 27: CUDA PatchMatch workspace/cache reuse
+
+Goal: reduce repeated CUDA allocation and texture-object setup across pyramid
+levels and across reference images in the `recon_mvs` PatchMatch batch.
+
+Implemented:
+
+- Added an opaque `CudaPatchMatchWorkspace` handle with:
+  - `MakeCudaPatchMatchWorkspace`,
+  - `DestroyCudaPatchMatchWorkspace`,
+  - `CudaPatchMatchRequest::workspace`.
+- The CUDA backend now uses a caller-provided workspace when available and
+  creates a temporary workspace otherwise.
+- The workspace owns reusable CUDA resources:
+  - reference image layered texture,
+  - source images layered texture,
+  - pose texture,
+  - optional source depth maps texture,
+  - optional dense source-selection probability texture,
+  - source image metadata buffer,
+  - depth, normal, and cost buffers,
+  - device counter buffer.
+- `DeviceBuffer` now keeps capacity and only calls `cudaMalloc` when the new
+  requested size exceeds current capacity.
+- `FloatLayeredTexture` now reuses its CUDA array and texture object when
+  width, height, depth, and filter mode match; it only re-uploads data.
+- CUDA pyramid execution reuses one workspace across levels.
+- `recon_mvs` creates one CUDA workspace for the PatchMatch batch and reuses it
+  across initial PatchMatch images and geometric refinement passes.
+- Added diagnostics:
+  `cuda_workspace_texture_allocations`, `cuda_workspace_texture_reuses`,
+  `cuda_workspace_buffer_allocations`, and `cuda_workspace_buffer_reuses`.
+
+Why this matters:
+
+- Dense reconstruction runs PatchMatch repeatedly over similarly sized images.
+  Before this milestone, every reference image and every pyramid level created
+  fresh CUDA textures and buffers. This made upload/setup time harder to
+  separate from actual kernel cost and introduced avoidable allocation churn.
+- The new diagnostics make reuse visible in `stereo/patch_match.tsv`, so later
+  host-device and kernel-fusion work can be measured against allocation churn.
+
+Current limitation:
+
+- `recon_mvs` uses sequential PatchMatch scheduling when a shared CUDA workspace
+  is active. This avoids concurrent writes to the same workspace. Future work can
+  add one workspace per CPU worker, CUDA streams, or a small workspace pool.
+- Textures are reused only when dimensions and filter mode match. Different
+  pyramid levels usually allocate separate shapes as expected; same-size images
+  benefit most.
+
+Verification:
+
+```text
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest.CudaBackendReusesWorkspaceResources --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+100% tests passed, 0 tests failed out of 16
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+cmake --build build-wsl --target colite_core_tests -j2
+passed
+
+ctest --test-dir build-wsl -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+```
+
+### Milestone 28: CUDA iteration counter batching and sync reduction
+
+Goal: reduce per-iteration host-device traffic in CUDA PatchMatch while keeping
+the existing per-iteration diagnostics.
+
+Implemented:
+
+- Added a reusable device-side `iteration_counters` buffer to
+  `CudaPatchMatchWorkspace`.
+- Added `ResetCountersKernel` so each iteration resets counters on device rather
+  than uploading a host-side zeroed `DeviceCounters`.
+- Added `StoreIterationCountersKernel` so each iteration snapshots counters on
+  device after propagation and perturbation.
+- Replaced per-iteration `cudaDeviceSynchronize()` plus scalar D2H counter copy
+  with one final synchronization and one batched counter `CopyToHost`.
+- Changed propagation and perturbation profiling events so the loop records
+  event stops immediately but reads elapsed time only after the final sync.
+- Added diagnostics:
+  `cuda_iteration_counter_snapshots` and
+  `cuda_iteration_counter_readbacks`.
+
+Why this matters:
+
+- PatchMatch iteration diagnostics previously forced a host-device roundtrip per
+  iteration. That made profiling more intrusive and serialized the CUDA stream
+  more than necessary.
+- The new path preserves the same per-iteration vectors while reducing counter
+  readback count from `num_iterations` to `1`.
+
+Current limitation:
+
+- Depth, normal, and cost maps are still downloaded as three separate buffers.
+  A later kernel-fusion or packed-output step can reduce those final downloads.
+- Kernel launches are still host-driven per propagation/perturbation step. This
+  milestone removes the most obvious diagnostics readback loop, not the full
+  launch overhead.
+
+Verification:
+
+```text
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest.CudaBackendBatchesIterationCounterReadbacks --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+100% tests passed, 0 tests failed out of 17
+```
+
+### Milestone 29: CUDA packed output map readback
+
+Goal: reduce final CUDA PatchMatch map downloads from three host-device
+readbacks to one.
+
+Implemented:
+
+- Added `DeviceOutputPixel` containing depth, normal x/y/z, and cost.
+- Added a reusable `output_pixels` buffer to `CudaPatchMatchWorkspace`.
+- Added `PackOutputMapsKernel` to pack depth, normal, and cost device buffers
+  into `output_pixels` before host download.
+- Replaced three final D2H copies:
+  - depth map,
+  - normal map,
+  - cost map,
+  with one packed `CopyToHost`.
+- Added diagnostics:
+  `cuda_packed_output_pixels` and `cuda_output_map_readbacks`.
+
+Why this matters:
+
+- The previous output path performed three separate synchronous downloads after
+  PatchMatch. Packing output on GPU reduces host-device roundtrips and gives a
+  cleaner boundary for later async/pinned-memory work.
+- This also keeps the CPU map construction code simple: host-side reconstruction
+  now reads one contiguous output vector.
+
+Current limitation:
+
+- The packed buffer is still copied with synchronous `cudaMemcpy`.
+  The next natural step is pinned host memory plus `cudaMemcpyAsync`, or a
+  stream-aware workspace so output copy can overlap with setup for the next
+  reference image.
+
+Verification:
+
+```text
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest.CudaBackendPacksOutputMapsForSingleReadback --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+100% tests passed, 0 tests failed out of 18
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+100% tests passed, 0 tests failed out of 1
+```
+
+### Milestone 30: CPU/CUDA geometric pre-cost gate with occlusion and depth conflicts
+
+Goal: make the geometric candidate gate stronger and consistent across CPU and
+CUDA PatchMatch propagation / perturbation candidates.
+
+Implemented:
+
+- CPU source-depth consistency now follows the CUDA/COLMAP-like
+  forward/backward reference-depth check:
+  1. project the reference hypothesis to the source view,
+  2. sample the source depth map,
+  3. back-project the sampled source depth to the reference camera,
+  4. compare returned reference depth against the candidate depth.
+- The geometric candidate gate classifies each source as:
+  - `consistent`: absolute returned-depth error is within threshold,
+  - `occluded`: returned depth is closer than the candidate depth,
+  - `conflicting`: returned depth is farther than the candidate depth.
+- CPU propagation, CPU checkerboard propagation, and CPU perturbation now use
+  the same pre-cost gate before multi-source cost aggregation.
+- CUDA propagation and CUDA perturbation now use the same classification rule.
+- The default rule is conservative:
+  - reject if fewer than `min_num_valid_sources` are consistent,
+  - reject if any source clearly occludes the candidate,
+  - reject if the number of conflicting sources is greater than or equal to the
+    number of consistent sources.
+- `PatchMatchCostOptions` now exposes:
+  - `geometric_reject_occluded_candidates`,
+  - `geometric_reject_depth_conflicts`.
+- Added regression tests for:
+  - CPU propagation rejecting an occluded candidate before cost aggregation,
+  - CPU propagation rejecting competing depth conflicts,
+  - CUDA rejecting an occluded candidate despite one consistent source,
+  - CUDA rejecting a farther depth conflict despite one consistent source.
+
+Notes:
+
+- The existing `num_perturbation_geometric_candidate_*` summary fields are kept
+  for compatibility, but now represent the total geometric candidate gate
+  counters for propagation + perturbation.
+- This still does not implement a full COLMAP visibility graph or full
+  occlusion ordering across all depth hypotheses; it is a local candidate gate
+  that prevents obviously inconsistent hypotheses from entering the cost stage.
+
+Verification:
+
+```text
+New occlusion/conflict tests:
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'RejectsGeometricallyOccludedCandidateBeforeCostAggregation|RejectsCandidateWhenDepthConflictsCompeteWithConsistentSources|CudaBackendRejectsOccludedCandidateDespiteOneConsistentSource|CudaBackendRejectsDepthConflictDespiteOneConsistentSource' --output-on-failure
+100% tests passed, 0 tests failed out of 4
+
+PatchMatch targeted regression:
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest|CpuPatchMatchPropagationTest|CpuPatchMatchPerturbationTest|CpuPatchMatchStereoTest|CpuPatchMatchPhotometricCostTest' --output-on-failure
+100% tests passed, 0 tests failed out of 38
+
+CPU targeted regression:
+ctest --test-dir build-wsl -R 'PatchMatchBackendTest|CpuPatchMatchPropagationTest|CpuPatchMatchPerturbationTest|CpuPatchMatchStereoTest|CpuPatchMatchPhotometricCostTest' --output-on-failure
+100% tests passed, 0 tests failed out of 38
+```
+
+### Milestone 31: COLMAP-style consistency graph and fused point visibility
+
+Goal: implement the MVS visibility pieces that COLMAP exposes around
+`patch_match_stereo` and `stereo_fusion`, while keeping COLITE's existing text
+and binary diagnostics stable.
+
+Implemented:
+
+- `ConsistencyGraph` can now convert to/from COLMAP's sparse consistency graph
+  data layout: `[col, row, N, image_idx_1, ...]` for every pixel with at least
+  one consistent source image.
+- Added COLMAP-compatible consistency graph binary IO:
+  - header: `width&height&1&`,
+  - payload: little-endian `int` sparse graph data.
+- The internal `ConsistencyGraph` continues to store `ImageId`; COLMAP graph IO
+  maps between `ImageId` and MVS image index through `image_ids_by_index`.
+- `StereoFusionResult` now records `points_visibility`, one sorted unique
+  image-index list per fused dense point.
+- Added COLMAP-compatible `points_visibility.bin` IO:
+  - `num_points:uint64`,
+  - for each point: `num_visible_images:uint32` followed by
+    `image_idx:uint32[]`.
+- `recon_mvs` now writes:
+  - `stereo/consistency_graphs_colmap/<image_name>.bin`,
+  - `dense/points_visibility.bin`.
+
+Why this matters:
+
+- COLITE fused dense points now carry the same kind of per-point visibility
+  information as COLMAP stereo fusion.
+- The consistency graph can be inspected or compared in a COLMAP-like binary
+  layout without replacing the existing COLITE graph files.
+- Downstream meshing can consume fused point visibility explicitly instead of
+  relying only on local-neighbor geometry.
+
+Still not complete:
+
+- This is not yet COLMAP's Delaunay/free-space graph-cut meshing visibility.
+- The image index order is COLITE's current MVS result order; it is stable for a
+  run and documented, but downstream consumers must use the same order.
+
+Verification:
+
+```text
+Core visibility tests:
+ctest --test-dir build-wsl -R 'RoundTripsConsistencyGraphAsColmapBinary|RoundTripsColmapPointsVisibilityBinary|MergesReciprocalConsistentPixelsIntoSingleTrack' --output-on-failure
+100% tests passed, 0 tests failed out of 3
+
+recon_mvs output tests:
+ctest --test-dir build-wsl -R 'ReconMvsExeTest.(WritesBinaryDenseMapsWhenRequested|WritesStereoFusionPlyWhenRequested)' --output-on-failure
+100% tests passed, 0 tests failed out of 2
+```
+
+### Milestone 29: CUDA geometric candidate filtering before cost aggregation
+
+Goal: strengthen geometric consistency in CUDA PatchMatch by rejecting
+obviously inconsistent propagation and perturbation hypotheses before the full
+photometric/geometric cost aggregation step.
+
+Implemented:
+
+- Added a device-side `PassesGeometricCandidateFilter` helper.
+- The filter reuses the existing COLMAP-like forward/backward source-depth
+  check:
+  1. project the reference hypothesis into each source view,
+  2. sample the source depth map,
+  3. back-project the source depth to the reference camera,
+  4. compare returned reference depth with the current hypothesis depth.
+- Propagation candidates now pass this geometric candidate filter before
+  `ComputeAggregatedCost`.
+- Perturbation candidates now pass the same filter before
+  `ComputeAggregatedCost`.
+- CUDA summary records candidate accept/reject counters through the existing
+  geometric candidate diagnostic fields. These fields now include both
+  propagation and perturbation candidates.
+- Added a CUDA regression test with intentionally inconsistent source depths to
+  verify that the backend rejects inconsistent candidates before accepting any
+  update.
+
+Why this matters:
+
+- Geometric consistency is no longer only a soft term inside the aggregated
+  cost for CUDA refinement. It now also acts as a hard candidate gate, closer to
+  COLMAP's repeated geometric consistency refinement direction.
+- The filter reduces wasted NCC/cost work on candidates that are already
+  inconsistent with available source depth maps.
+- This creates a clearer hook for later occlusion/depth-conflict handling.
+
+Still not complete:
+
+- The current gate is a relative-depth consistency filter; it does not yet model
+  occlusion ordering or competing-depth conflicts explicitly.
+- The diagnostic field names still mention perturbation, but the counters now
+  cover both propagation and perturbation candidates.
+- CPU PatchMatch already has geometric refinement support, but this exact hard
+  pre-cost candidate gate is currently implemented on the CUDA path only.
+
+Verification:
+
+```text
+CUDA targeted regression:
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest.CudaBackendRejectsGeometricallyInconsistentCandidates' --output-on-failure
+100% tests passed, 0 tests failed out of 1
+
+CUDA MVS regression:
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+100% tests passed, 0 tests failed out of 32
+
+CPU MVS regression:
+ctest --test-dir build-wsl -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+100% tests passed, 0 tests failed out of 32
+```
+
 ### Milestone 25: CUDA sweep variants, source selection, angle weighting, and pyramid execution
 
 Goal: continue the CUDA PatchMatch COLMAP-ization by filling in the next
@@ -1446,6 +2620,42 @@ compile errors in incremental_mapper_test.cpp against IncrementalMappingOptions.
 The CUDA diagnostics implementation and recon_mvs target compile successfully.
 ```
 
+### Milestone 28: dense CUDA selection probability maps and explicit red-black propagation
+
+Goal: replace the source-level selection gate with an optional dense
+reference-view probability texture, and make CUDA checkerboard propagation use
+explicit red/black parity updates.
+
+Implemented:
+
+- `CudaPatchMatchRequest` now accepts optional per-source dense selection
+  probability maps on the reference image grid.
+- The CUDA backend validates, clamps, packs, and uploads those maps as a
+  layered texture.
+- Source selection now samples the dense probability texture when present, and
+  falls back to the source-level pose texture probability otherwise.
+- Pyramid execution resizes dense selection probability maps per level.
+- Added `CheckerboardPropagationKernel`, which updates only one red/black
+  parity and evaluates four-neighbor propagation candidates.
+- CUDA `kCheckerboard` now runs the same 8-pass parity sequence used by the CPU
+  implementation: `0,1,1,0,0,1,1,0`.
+
+Verification:
+
+```text
+CUDA dense selection / red-black tests:
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest.CudaBackendUsesDenseSelectionProbabilityMap|PatchMatchBackendTest.CudaBackendRunsExplicitRedBlackCheckerboard' --output-on-failure
+100% tests passed, 0 tests failed out of 2
+
+CUDA MVS regression:
+ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+100% tests passed, 0 tests failed out of 31
+
+CPU MVS regression:
+ctest --test-dir build-wsl -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
+100% tests passed, 0 tests failed out of 31
+```
+
 ### Milestone 23: CUDA layered texture image cache
 
 Goal: move the first CUDA backend closer to COLMAP's image access structure by
@@ -1487,6 +2697,346 @@ ctest --test-dir build-wsl-cuda-mvs-tests -R 'PatchMatchBackendTest|CpuPatchMatc
 CPU build:
 ctest --test-dir build-wsl -R 'PatchMatchBackendTest|CpuPatchMatchStereoTest|ReconMvsExeTest|MvsSweepScriptTest' --output-on-failure
 100% tests passed, 0 tests failed out of 26
+```
+
+### Milestone 37: Defer redundant initial photometric stats
+
+Goal: reduce CPU-side overhead in the CUDA PatchMatch scheduling path without
+changing final MVS outputs.
+
+Implemented:
+
+- When `--patch_match_geometric_refinement_iterations > 0` and geometric cost is
+  enabled, initial PatchMatch skips the immediate `ComputePatchMatchPhotometricStats`
+  scans.
+- The refinement pass still recomputes final photometric stats and applies the
+  photometric filter for every result, so `stereo/patch_match.tsv` remains based
+  on post-refinement maps.
+- `summary.txt` now includes
+  `patch_match_initial_deferred_photometric_stats_images`.
+
+building-18 CUDA profiling:
+
+```text
+baseline output: build-wsl/mvs-building-18/cuda-overlap-thread1-64-ms37c
+current  output: build-wsl/mvs-building-18/cuda-overlap-thread1-64-ms38
+
+thread1 baseline: initial_wall=560.480585 ms, initial_cuda_sum=153.011242 ms, fused_points=155
+thread1 current : initial_wall=476.695071 ms, initial_cuda_sum=151.284996 ms, deferred=18, fused_points=156
+
+baseline output: build-wsl/mvs-building-18/cuda-overlap-thread2-64-ms37c
+current  output: build-wsl/mvs-building-18/cuda-overlap-thread2-64-ms38
+
+thread2 baseline: initial_wall=432.277589 ms, initial_cuda_sum=171.995448 ms, refine_overlap_ratio=0.485008, fused_points=156
+thread2 current : initial_wall=388.363980 ms, initial_cuda_sum=165.981279 ms, deferred=18, refine_overlap_ratio=0.479275, fused_points=155
+```
+
+Verification:
+
+```text
+cmake --build build-wsl-cuda-mvs-tests --target colite_core_tests -j2
+passed
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+1/1 passed
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+21/21 passed, 1 skipped
+
+cmake --build build-wsl --target colite_core_tests -j2
+passed
+
+ctest --test-dir build-wsl -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+1/1 passed
+```
+
+### Milestone 41: CUDA result materialization breakdown
+
+Goal: reduce and explain `cuda_result_materialization_time_ms` after explicit
+warmup removed first-use CUDA runtime overhead from per-image timings.
+
+Implemented:
+
+- Removed the packed-output `ToVector()` copy. CUDA result materialization now
+  reads directly from `PinnedHostBuffer<DeviceOutputPixel>` after the stream has
+  synchronized.
+- Added sub-timers:
+  - `cuda_output_to_vector_time_ms`
+  - `cuda_dense_map_fill_time_ms`
+  - `cuda_normal_refinement_time_ms`
+  - `cuda_valid_cost_count_time_ms`
+
+building-18 CUDA profiling:
+
+```text
+before sub-timers: build-wsl/mvs-building-18/cuda-overlap-thread2-64-ms45
+after sub-timers : build-wsl/mvs-building-18/cuda-overlap-thread2-64-ms46
+
+ms45 initial:
+cuda_result_materialization_time_ms=88.445675 ms
+cuda_output_to_vector_time_ms=0.000402 ms
+cuda_dense_map_fill_time_ms=58.126664 ms
+
+ms46 initial:
+cuda_result_materialization_time_ms=86.848577 ms
+cuda_output_to_vector_time_ms=0.000408 ms
+cuda_dense_map_fill_time_ms=56.471037 ms
+cuda_normal_refinement_time_ms=29.741048 ms
+cuda_valid_cost_count_time_ms=0.554789 ms
+
+ms46 final/refinement:
+cuda_result_materialization_time_ms=84.490515 ms
+cuda_output_to_vector_time_ms=0.000396 ms
+cuda_dense_map_fill_time_ms=56.587363 ms
+cuda_normal_refinement_time_ms=27.263273 ms
+cuda_valid_cost_count_time_ms=0.559550 ms
+fused_points=156
+```
+
+Conclusion:
+
+- The extra packed-output vector copy has been removed and is now effectively
+  zero in diagnostics.
+- The remaining CPU-side materialization is dominated by dense map fill and CPU
+  normal refinement, not by D2H staging conversion.
+- Next candidates:
+  - add mutable/bulk dense-map storage APIs to avoid repeated `Set` /
+    `SetNormalized` overhead,
+  - move normal refinement to CUDA,
+  - skip initial normal refinement when geometric refinement will run and
+    recompute/refilter the maps.
+
+Verification:
+
+```text
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+1/1 passed
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+21/21 passed, 1 skipped
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWithTwoThreadsWhenRequested --output-on-failure
+1/1 passed
+
+ctest --test-dir build-wsl -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+1/1 passed
+```
+
+### Milestone 40: Explicit CUDA warmup
+
+Goal: remove first-use CUDA runtime initialization from per-image PatchMatch
+diagnostics.
+
+Implemented:
+
+- Added `WarmupCudaPatchMatch`.
+- Warmup validates cached device count, applies the requested GPU index when
+  needed, and calls `cudaFree(nullptr)` to initialize the CUDA runtime/context.
+- `summary.txt` now includes `cuda_warmup_time_ms`.
+- `recon_mvs` runs warmup before initial PatchMatch for `cuda` and `auto`
+  backends. Forced CUDA propagates warmup failure; auto mode keeps CPU fallback.
+
+building-18 CUDA profiling:
+
+```text
+before warmup: build-wsl/mvs-building-18/cuda-overlap-thread2-64-ms43
+after warmup : build-wsl/mvs-building-18/cuda-overlap-thread2-64-ms44
+
+ms43:
+initial_wall=447.090526 ms
+initial_cuda_sum=200.449025 ms
+stereo_run_sum=888.002476 ms
+wrapper_overhead_sum=687.553451 ms
+initial cuda_request_validation_time_ms=403.682959 ms
+fused_points=155
+
+ms44:
+cuda_warmup_time_ms=345.080609 ms
+initial_wall=90.707164 ms
+initial_cuda_sum=173.398549 ms
+stereo_run_sum=174.600051 ms
+wrapper_overhead_sum=1.201502 ms
+initial cuda_request_validation_time_ms=0.017520 ms
+initial cuda_device_count_queries=0
+initial cuda_device_count_cache_hits=18
+fused_points=156
+```
+
+Conclusion:
+
+- The remaining large validation cost was the CUDA runtime's first-use
+  initialization, not PatchMatch-specific work.
+- After explicit warmup, initial per-image wrapper overhead is effectively
+  removed from the scheduling diagnostics.
+- The next performance target is result materialization:
+  `cuda_result_materialization_time_ms` still sums to roughly 80-90 ms for this
+  18-image, 64px test. Candidate optimizations are direct dense-map
+  materialization from pinned output, reduced CPU copies, and optional deferred
+  materialization when only diagnostics or fusion need a subset.
+
+Verification:
+
+```text
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+1/1 passed
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+21/21 passed, 1 skipped
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWithTwoThreadsWhenRequested --output-on-failure
+1/1 passed
+
+ctest --test-dir build-wsl -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+1/1 passed
+```
+
+### Milestone 39: Initial CUDA wrapper diagnostics and device-count cache
+
+Goal: explain the remaining initial PatchMatch wrapper overhead and remove
+repeated CUDA device-count queries from per-image execution.
+
+Implemented:
+
+- Added CUDA wrapper sub-timers to `PatchMatchStereoSummary` and TSV output:
+  - `cuda_wrapper_total_time_ms`
+  - `cuda_request_validation_time_ms`
+  - `cuda_pyramid_resize_time_ms`
+  - `cuda_host_pack_time_ms`
+  - `cuda_single_scale_dispatch_time_ms`
+  - `cuda_result_materialization_time_ms`
+- Added `stereo/patch_match_initial.tsv`, written before geometric refinement
+  mutates/replaces the initial results.
+- Added a process-local CUDA device-count cache based on `std::call_once`.
+- Added device-count diagnostics:
+  - `cuda_device_count_queries`
+  - `cuda_device_count_cache_hits`
+
+building-18 CUDA profiling:
+
+```text
+before cache: build-wsl/mvs-building-18/cuda-overlap-thread2-64-ms42
+after cache : build-wsl/mvs-building-18/cuda-overlap-thread2-64-ms43
+
+ms42 summary:
+initial_wall=453.418734 ms
+initial_cuda_sum=183.762562 ms
+stereo_run_sum=903.350113 ms
+wrapper_overhead_sum=719.587551 ms
+
+ms42 patch_match_initial.tsv:
+cuda_request_validation_time_ms=441.954736 ms
+cuda_wrapper_total_time_ms=902.324954 ms
+cuda_wrapper_overhead_time_ms=718.562392 ms
+
+ms43 summary:
+initial_wall=447.090526 ms
+initial_cuda_sum=200.449025 ms
+stereo_run_sum=888.002476 ms
+wrapper_overhead_sum=687.553451 ms
+fused_points=155
+
+ms43 patch_match_initial.tsv:
+cuda_device_count_queries=1
+cuda_device_count_cache_hits=17
+cuda_request_validation_time_ms=403.682959 ms
+cuda_wrapper_total_time_ms=886.850895 ms
+cuda_wrapper_overhead_time_ms=686.401870 ms
+cuda_host_pack_time_ms=5.436191 ms
+cuda_result_materialization_time_ms=86.388447 ms
+
+ms43 final patch_match.tsv:
+cuda_device_count_queries=0
+cuda_device_count_cache_hits=18
+cuda_request_validation_time_ms=0.018279 ms
+```
+
+Conclusion:
+
+- Initial and final/refinement CUDA diagnostics must be inspected separately.
+- Device-count caching works: initial stage performs one runtime query and all
+  later image calls hit the cache; refinement performs only cache hits.
+- The large remaining initial validation time is the first CUDA runtime/device
+  initialization cost. The next milestone should add explicit CUDA warmup and
+  report `cuda_warmup_time_ms` separately from per-image PatchMatch timings.
+
+Verification:
+
+```text
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+1/1 passed
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+21/21 passed, 1 skipped
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWithTwoThreadsWhenRequested --output-on-failure
+1/1 passed
+
+ctest --test-dir build-wsl -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+1/1 passed
+```
+
+### Milestone 38: Initial PatchMatch timing breakdown
+
+Goal: identify where the remaining initial CUDA PatchMatch wall time is spent
+after deferring redundant photometric stats.
+
+Implemented:
+
+- Added per-initial-job timing for source setup, full stereo call, and
+  postprocess.
+- Added the derived wrapper/CPU overhead field:
+  `patch_match_initial_stereo_wrapper_overhead_sum_time_ms`.
+- Wrote all timing fields into `summary.txt`.
+
+New fields:
+
+```text
+patch_match_initial_source_setup_sum_time_ms
+patch_match_initial_stereo_run_sum_time_ms
+patch_match_initial_stereo_wrapper_overhead_sum_time_ms
+patch_match_initial_postprocess_sum_time_ms
+```
+
+building-18 CUDA profiling:
+
+```text
+output: build-wsl/mvs-building-18/cuda-overlap-thread2-64-ms40
+
+initial_wall=427.307613 ms
+initial_cuda_sum=172.494390 ms
+source_setup_sum=0.174237 ms
+stereo_run_sum=849.639651 ms
+stereo_wrapper_overhead_sum=677.145261 ms
+postprocess_sum=0.725358 ms
+refinement_wall=61.334458 ms
+refinement_overlap_ratio=0.479375
+fused_points=155
+```
+
+Conclusion:
+
+- Source vector assembly and postprocess/stat filtering are effectively noise at
+  this resolution.
+- The next optimization target is inside the PatchMatch CUDA call wrapper, not
+  in `ReconMvsController` source setup.
+- `stereo/patch_match.tsv` currently reflects the final/refinement results, so
+  initial-stage CUDA phase sums should be exported separately before using TSV
+  phase sums to explain initial wall time.
+
+Verification:
+
+```text
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+1/1 passed
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R PatchMatchBackendTest --output-on-failure
+21/21 passed, 1 skipped
+
+ctest --test-dir build-wsl-cuda-mvs-tests -R ReconMvsExeTest.RunsPatchMatchStereoWithTwoThreadsWhenRequested --output-on-failure
+1/1 passed
+
+ctest --test-dir build-wsl -R ReconMvsExeTest.RunsPatchMatchStereoWhenRequested --output-on-failure
+1/1 passed
 ```
 
 ### Milestone 24: CUDA pose texture and COLMAP-like geometry cost

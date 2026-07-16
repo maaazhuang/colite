@@ -2,7 +2,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <map>
 #include <set>
+#include <vector>
+
+#include <Eigen/SVD>
 
 #include "colite/core/geometry.h"
 #include "colite/sfm/observation_manager.h"
@@ -51,96 +56,9 @@ bool HasValidMatchIndices(const FeatureMatch& match,
          match.idx2 < image2.points2d.size();
 }
 
-bool BothObservationsAreNew(const FeatureMatch& match,
-                            const Image& image1,
-                            const Image& image2) {
-  return !image1.points2d[match.idx1].HasPoint3D() &&
-         !image2.points2d[match.idx2].HasPoint3D();
-}
-
 bool IsFinitePoint(const Eigen::Vector3d& point) {
   return std::isfinite(point.x()) && std::isfinite(point.y()) &&
          std::isfinite(point.z());
-}
-
-bool PassesTriangulationAngle(const Camera& camera1,
-                              const Pose3& cam1_from_world,
-                              const Eigen::Vector2d& pixel1,
-                              const Camera& camera2,
-                              const Pose3& cam2_from_world,
-                              const Eigen::Vector2d& pixel2,
-                              double min_angle_deg) {
-  const Eigen::Vector3d bearing1 = PixelToBearing(camera1, pixel1);
-  const Eigen::Vector3d bearing2 = PixelToBearing(camera2, pixel2);
-  return TriangulationAngleDegrees(cam1_from_world, bearing1, cam2_from_world,
-                                   bearing2) >= min_angle_deg;
-}
-
-bool PassesReprojectionCheck(const Camera& camera1,
-                             const Pose3& cam1_from_world,
-                             const Eigen::Vector2d& pixel1,
-                             const Camera& camera2,
-                             const Pose3& cam2_from_world,
-                             const Eigen::Vector2d& pixel2,
-                             const Eigen::Vector3d& xyz,
-                             double max_error_px) {
-  const auto error1 = ReprojectionError(camera1, cam1_from_world, xyz, pixel1);
-  const auto error2 = ReprojectionError(camera2, cam2_from_world, xyz, pixel2);
-  return error1.has_value() && error2.has_value() && *error1 <= max_error_px &&
-         *error2 <= max_error_px;
-}
-
-bool TryCreatePointFromMatch(const ImagePair& pair,
-                             const FeatureMatch& match,
-                             const IncrementalTriangulatorOptions& options,
-                             Reconstruction* reconstruction) {
-  Image& image1 = reconstruction->GetImage(pair.image_id1);
-  Image& image2 = reconstruction->GetImage(pair.image_id2);
-  if (!HasValidMatchIndices(match, image1, image2) ||
-      !BothObservationsAreNew(match, image1, image2)) {
-    return false;
-  }
-
-  const Camera& camera1 = reconstruction->GetCamera(image1.camera_id);
-  const Camera& camera2 = reconstruction->GetCamera(image2.camera_id);
-  const Pose3& cam1_from_world = *image1.cam_from_world;
-  const Pose3& cam2_from_world = *image2.cam_from_world;
-  const Eigen::Vector2d pixel1 = image1.points2d[match.idx1].xy;
-  const Eigen::Vector2d pixel2 = image2.points2d[match.idx2].xy;
-
-  if (!PassesTriangulationAngle(camera1, cam1_from_world, pixel1, camera2,
-                                cam2_from_world, pixel2,
-                                options.min_triangulation_angle_deg)) {
-    return false;
-  }
-
-  const auto point = TriangulatePoint(camera1, cam1_from_world, pixel1, camera2,
-                                      cam2_from_world, pixel2);
-  if (!point.has_value() || !IsFinitePoint(*point)) {
-    return false;
-  }
-  if (!PassesReprojectionCheck(camera1, cam1_from_world, pixel1, camera2,
-                               cam2_from_world, pixel2, *point,
-                               options.create_max_reprojection_error_px)) {
-    return false;
-  }
-
-  Track track;
-  track.AddElement(pair.image_id1, match.idx1);
-  track.AddElement(pair.image_id2, match.idx2);
-  ObservationManager observation_manager(reconstruction);
-  return observation_manager.AddPoint3D(*point, track).has_value();
-}
-
-bool TrackHasImageConflict(const Track& track1, const Track& track2) {
-  for (const TrackElement& element1 : track1.elements) {
-    for (const TrackElement& element2 : track2.elements) {
-      if (element1.image_id == element2.image_id) {
-        return true;
-      }
-    }
-  }
-  return false;
 }
 
 bool ReprojectsTrackWithinThreshold(const Reconstruction& reconstruction,
@@ -191,18 +109,18 @@ bool TryMergePoint3Ds(Point3DId target_point3d_id,
       reconstruction->GetPoint3D(target_point3d_id);
   const Point3D& source_point3d =
       reconstruction->GetPoint3D(source_point3d_id);
-  if (TrackHasImageConflict(target_point3d.track, source_point3d.track)) {
-    return false;
-  }
-
+  // Match COLMAP's merge policy: preserve the two optimized point estimates
+  // using a track-length weighted position. Re-triangulating the combined
+  // track here can move a good point enough to reject an otherwise valid
+  // merge before the next bundle-adjustment pass.
   const Eigen::Vector3d merged_xyz =
       WeightedMergedPointPosition(target_point3d, source_point3d);
   if (!ReprojectsTrackWithinThreshold(
           *reconstruction, target_point3d.track, merged_xyz,
-          options.create_max_reprojection_error_px) ||
+          options.merge_max_reprojection_error_px) ||
       !ReprojectsTrackWithinThreshold(
           *reconstruction, source_point3d.track, merged_xyz,
-          options.create_max_reprojection_error_px)) {
+          options.merge_max_reprojection_error_px)) {
     return false;
   }
 
@@ -211,20 +129,26 @@ bool TryMergePoint3Ds(Point3DId target_point3d_id,
                                          merged_xyz);
 }
 
-bool TryCompleteTargetObservation(const ImagePair& pair,
-                                  ImageId target_image_id,
-                                  const FeatureMatch& match,
-                                  const IncrementalTriangulatorOptions& options,
-                                  Reconstruction* reconstruction) {
+bool TryCompleteObservation(const ImagePair& pair,
+                            ImageId requested_image_id,
+                            const FeatureMatch& match,
+                            const IncrementalTriangulatorOptions& options,
+                            Reconstruction* reconstruction) {
   Image& image1 = reconstruction->GetImage(pair.image_id1);
   Image& image2 = reconstruction->GetImage(pair.image_id2);
   if (!HasValidMatchIndices(match, image1, image2)) {
     return false;
   }
 
-  const bool target_is_first = pair.image_id1 == target_image_id;
+  const bool first_has_point = image1.points2d[match.idx1].HasPoint3D();
+  const bool requested_is_first = pair.image_id1 == requested_image_id;
+  const bool target_is_first = options.complete_neighbor_observations
+                                   ? !first_has_point
+                                   : requested_is_first;
   Image& target_image = target_is_first ? image1 : image2;
   const Image& source_image = target_is_first ? image2 : image1;
+  const ImageId target_image_id = target_is_first ? pair.image_id1
+                                                   : pair.image_id2;
   const Point2DIdx target_idx = target_is_first ? match.idx1 : match.idx2;
   const Point2DIdx source_idx = target_is_first ? match.idx2 : match.idx1;
 
@@ -244,7 +168,7 @@ bool TryCompleteTargetObservation(const ImagePair& pair,
                                        source_point3d.xyz,
                                        target_point2d.xy);
   if (!error.has_value() ||
-      *error > options.create_max_reprojection_error_px) {
+      *error > options.complete_max_reprojection_error_px) {
     return false;
   }
 
@@ -298,6 +222,485 @@ void AccumulateTrackUpdates(const IncrementalTriangulatorSummary& update,
   summary->num_merged_observations += update.num_merged_observations;
 }
 
+using ObservationKey = std::pair<ImageId, Point2DIdx>;
+using CorrespondenceAdjacency =
+    std::map<ObservationKey, std::vector<ObservationKey>>;
+
+CorrespondenceAdjacency BuildCorrespondenceAdjacency(
+    const MatchGraph& graph) {
+  CorrespondenceAdjacency adjacency;
+  for (const auto& [pair, geometry] : graph.verified_geometries) {
+    if (!IsUsableGeometry(geometry)) {
+      continue;
+    }
+    for (const FeatureMatch& match : geometry.inlier_matches) {
+      if (match.idx1 == kInvalidPoint2DIdx ||
+          match.idx2 == kInvalidPoint2DIdx) {
+        continue;
+      }
+      const ObservationKey first{pair.image_id1, match.idx1};
+      const ObservationKey second{pair.image_id2, match.idx2};
+      adjacency[first].push_back(second);
+      adjacency[second].push_back(first);
+    }
+  }
+  return adjacency;
+}
+
+bool IsTwoViewObservation(const CorrespondenceAdjacency& adjacency,
+                          const ObservationKey& observation) {
+  const auto it = adjacency.find(observation);
+  if (it == adjacency.end() || it->second.size() != 1) {
+    return false;
+  }
+  const auto other_it = adjacency.find(it->second.front());
+  return other_it != adjacency.end() && other_it->second.size() == 1;
+}
+
+bool IsUsableObservation(const ObservationKey& observation,
+                         const Reconstruction& reconstruction) {
+  if (!reconstruction.IsImageRegistered(observation.first) ||
+      !HasPoseAndCamera(reconstruction, observation.first)) {
+    return false;
+  }
+  const Image& image = reconstruction.GetImage(observation.first);
+  return observation.second < image.points2d.size();
+}
+
+std::vector<ObservationKey> CollectTransitiveCorrespondences(
+    const ObservationKey& reference,
+    const CorrespondenceAdjacency& adjacency,
+    std::size_t max_transitivity,
+    const Reconstruction& reconstruction) {
+  std::vector<ObservationKey> correspondences;
+  std::vector<ObservationKey> frontier{reference};
+  std::set<ObservationKey> visited{reference};
+  for (std::size_t depth = 0;
+       depth < max_transitivity && !frontier.empty(); ++depth) {
+    std::vector<ObservationKey> next_frontier;
+    for (const ObservationKey& source : frontier) {
+      const auto adjacency_it = adjacency.find(source);
+      if (adjacency_it == adjacency.end()) {
+        continue;
+      }
+      for (const ObservationKey& target : adjacency_it->second) {
+        if (!visited.insert(target).second) {
+          continue;
+        }
+        next_frontier.push_back(target);
+        if (IsUsableObservation(target, reconstruction)) {
+          correspondences.push_back(target);
+        }
+      }
+    }
+    frontier = std::move(next_frontier);
+  }
+  return correspondences;
+}
+
+double AngularErrorDegrees(const ObservationKey& observation,
+                           const Eigen::Vector3d& xyz,
+                           const Reconstruction& reconstruction) {
+  if (!IsUsableObservation(observation, reconstruction)) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const Image& image = reconstruction.GetImage(observation.first);
+  const Camera& camera = reconstruction.GetCamera(image.camera_id);
+  const Eigen::Vector3d point_camera =
+      image.cam_from_world->TransformPoint(xyz);
+  if (point_camera.z() <= 0.0 || !IsFinitePoint(point_camera)) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const Eigen::Vector3d bearing =
+      PixelToBearing(camera, image.points2d[observation.second].xy);
+  const double cosine = std::clamp(
+      bearing.dot(point_camera.normalized()), -1.0, 1.0);
+  constexpr double kRadiansToDegrees = 180.0 / 3.14159265358979323846;
+  return std::acos(cosine) * kRadiansToDegrees;
+}
+
+double ObservationPairAngleDegrees(const ObservationKey& first,
+                                   const ObservationKey& second,
+                                   const Reconstruction& reconstruction) {
+  const Image& image1 = reconstruction.GetImage(first.first);
+  const Image& image2 = reconstruction.GetImage(second.first);
+  const Camera& camera1 = reconstruction.GetCamera(image1.camera_id);
+  const Camera& camera2 = reconstruction.GetCamera(image2.camera_id);
+  return TriangulationAngleDegrees(
+      *image1.cam_from_world,
+      PixelToBearing(camera1, image1.points2d[first.second].xy),
+      *image2.cam_from_world,
+      PixelToBearing(camera2, image2.points2d[second.second].xy));
+}
+
+std::optional<Eigen::Vector3d> TriangulateObservationsLinear(
+    const std::vector<ObservationKey>& observations,
+    const Reconstruction& reconstruction) {
+  if (observations.size() < 2) {
+    return std::nullopt;
+  }
+  Eigen::MatrixXd equations(2 * observations.size(), 4);
+  for (std::size_t index = 0; index < observations.size(); ++index) {
+    const ObservationKey& observation = observations[index];
+    const Image& image = reconstruction.GetImage(observation.first);
+    const Camera& camera = reconstruction.GetCamera(image.camera_id);
+    const Eigen::Vector3d bearing =
+        PixelToBearing(camera, image.points2d[observation.second].xy);
+    if (std::abs(bearing.z()) < 1e-12) {
+      return std::nullopt;
+    }
+    Eigen::Matrix<double, 3, 4> projection;
+    projection.leftCols<3>() =
+        image.cam_from_world->q_cw.toRotationMatrix();
+    projection.rightCols<1>() = image.cam_from_world->t_cw;
+    const double x = bearing.x() / bearing.z();
+    const double y = bearing.y() / bearing.z();
+    equations.row(2 * index) = x * projection.row(2) - projection.row(0);
+    equations.row(2 * index + 1) =
+        y * projection.row(2) - projection.row(1);
+  }
+  const Eigen::JacobiSVD<Eigen::MatrixXd> svd(equations,
+                                               Eigen::ComputeFullV);
+  const Eigen::Vector4d homogeneous = svd.matrixV().col(3);
+  if (std::abs(homogeneous.w()) < 1e-12) {
+    return std::nullopt;
+  }
+  const Eigen::Vector3d xyz = homogeneous.hnormalized();
+  return IsFinitePoint(xyz) ? std::optional<Eigen::Vector3d>(xyz)
+                            : std::nullopt;
+}
+
+struct RobustTrackEstimate {
+  Eigen::Vector3d xyz = Eigen::Vector3d::Zero();
+  std::vector<bool> inlier_mask;
+  std::size_t num_inliers = 0;
+  double inlier_error_sum = std::numeric_limits<double>::infinity();
+};
+
+RobustTrackEstimate ScoreTrackHypothesis(
+    const Eigen::Vector3d& xyz,
+    const std::vector<ObservationKey>& observations,
+    double max_angle_error_deg,
+    const Reconstruction& reconstruction) {
+  RobustTrackEstimate estimate;
+  estimate.xyz = xyz;
+  estimate.inlier_mask.assign(observations.size(), false);
+  estimate.inlier_error_sum = 0.0;
+  for (std::size_t index = 0; index < observations.size(); ++index) {
+    const double error =
+        AngularErrorDegrees(observations[index], xyz, reconstruction);
+    if (error <= max_angle_error_deg) {
+      estimate.inlier_mask[index] = true;
+      ++estimate.num_inliers;
+      estimate.inlier_error_sum += error;
+    }
+  }
+  return estimate;
+}
+
+bool IsBetterTrackEstimate(const RobustTrackEstimate& candidate,
+                           const RobustTrackEstimate& best) {
+  return candidate.num_inliers > best.num_inliers ||
+         (candidate.num_inliers == best.num_inliers &&
+          candidate.inlier_error_sum < best.inlier_error_sum);
+}
+
+std::optional<RobustTrackEstimate> EstimateRobustTrack(
+    const std::vector<ObservationKey>& observations,
+    const IncrementalTriangulatorOptions& options,
+    const Reconstruction& reconstruction) {
+  if (observations.size() < 2) {
+    return std::nullopt;
+  }
+
+  RobustTrackEstimate best;
+  best.inlier_mask.assign(observations.size(), false);
+  constexpr std::size_t kMaxPairHypotheses = 10000;
+  std::size_t num_hypotheses = 0;
+  for (std::size_t first = 0; first + 1 < observations.size(); ++first) {
+    for (std::size_t second = first + 1; second < observations.size();
+         ++second) {
+      if (++num_hypotheses > kMaxPairHypotheses) {
+        break;
+      }
+      if (ObservationPairAngleDegrees(observations[first],
+                                      observations[second], reconstruction) <
+          options.min_triangulation_angle_deg) {
+        continue;
+      }
+      const Image& image1 =
+          reconstruction.GetImage(observations[first].first);
+      const Image& image2 =
+          reconstruction.GetImage(observations[second].first);
+      const Camera& camera1 = reconstruction.GetCamera(image1.camera_id);
+      const Camera& camera2 = reconstruction.GetCamera(image2.camera_id);
+      const std::optional<Eigen::Vector3d> xyz = TriangulatePoint(
+          camera1, *image1.cam_from_world,
+          image1.points2d[observations[first].second].xy, camera2,
+          *image2.cam_from_world,
+          image2.points2d[observations[second].second].xy);
+      if (!xyz || !IsFinitePoint(*xyz)) {
+        continue;
+      }
+      const RobustTrackEstimate candidate = ScoreTrackHypothesis(
+          *xyz, observations, options.create_max_angle_error_deg,
+          reconstruction);
+      if (candidate.num_inliers >= 2 &&
+          IsBetterTrackEstimate(candidate, best)) {
+        best = candidate;
+      }
+    }
+    if (num_hypotheses > kMaxPairHypotheses) {
+      break;
+    }
+  }
+  if (best.num_inliers < 2) {
+    return std::nullopt;
+  }
+
+  // COLMAP's LORANSAC locally re-estimates the model from all current
+  // inliers. Two deterministic refinement rounds provide the same important
+  // behavior without introducing another RANSAC framework dependency.
+  for (int refinement = 0; refinement < 2; ++refinement) {
+    std::vector<ObservationKey> inliers;
+    for (std::size_t index = 0; index < observations.size(); ++index) {
+      if (best.inlier_mask[index]) {
+        inliers.push_back(observations[index]);
+      }
+    }
+    const std::optional<Eigen::Vector3d> refined_xyz =
+        TriangulateObservationsLinear(inliers, reconstruction);
+    if (!refined_xyz) {
+      break;
+    }
+    const RobustTrackEstimate refined = ScoreTrackHypothesis(
+        *refined_xyz, observations, options.create_max_angle_error_deg,
+        reconstruction);
+    if (refined.num_inliers < 2 || !IsBetterTrackEstimate(refined, best)) {
+      break;
+    }
+    best = refined;
+  }
+  return best;
+}
+
+struct CreateTrackSummary {
+  std::size_t num_points = 0;
+  std::size_t num_observations = 0;
+};
+
+CreateTrackSummary CreatePointsFromCorrespondences(
+    const std::vector<ObservationKey>& correspondences,
+    const CorrespondenceAdjacency& adjacency,
+    const IncrementalTriangulatorOptions& options,
+    Reconstruction* reconstruction) {
+  std::vector<ObservationKey> candidates;
+  candidates.reserve(correspondences.size());
+  for (const ObservationKey& observation : correspondences) {
+    if (!IsUsableObservation(observation, *reconstruction)) {
+      continue;
+    }
+    const Image& image = reconstruction->GetImage(observation.first);
+    if (!image.points2d[observation.second].HasPoint3D()) {
+      candidates.push_back(observation);
+    }
+  }
+  if (candidates.size() < 2 ||
+      (options.ignore_two_view_tracks && candidates.size() == 2 &&
+       IsTwoViewObservation(adjacency, candidates.front()))) {
+    return {};
+  }
+
+  const std::optional<RobustTrackEstimate> estimate =
+      EstimateRobustTrack(candidates, options, *reconstruction);
+  if (!estimate) {
+    return {};
+  }
+  Track track;
+  for (std::size_t index = 0; index < candidates.size(); ++index) {
+    if (estimate->inlier_mask[index]) {
+      track.AddElement(candidates[index].first, candidates[index].second);
+    }
+  }
+  ObservationManager observation_manager(reconstruction);
+  if (!observation_manager.AddPoint3D(estimate->xyz, track).has_value()) {
+    return {};
+  }
+
+  CreateTrackSummary summary{1, track.Length()};
+  constexpr std::size_t kMinRecursiveTrackLength = 3;
+  if (candidates.size() - track.Length() >= kMinRecursiveTrackLength) {
+    const CreateTrackSummary recursive = CreatePointsFromCorrespondences(
+        correspondences, adjacency, options, reconstruction);
+    summary.num_points += recursive.num_points;
+    summary.num_observations += recursive.num_observations;
+  }
+  return summary;
+}
+
+bool ContinueObservationAngular(
+    const ObservationKey& reference,
+    const std::vector<ObservationKey>& correspondences,
+    const IncrementalTriangulatorOptions& options,
+    Reconstruction* reconstruction) {
+  if (!IsUsableObservation(reference, *reconstruction)) {
+    return false;
+  }
+  Image& reference_image = reconstruction->GetImage(reference.first);
+  if (reference_image.points2d[reference.second].HasPoint3D()) {
+    return false;
+  }
+
+  Point3DId best_point3d_id = kInvalidPoint3DId;
+  double best_error = std::numeric_limits<double>::infinity();
+  std::set<Point3DId> tested_point_ids;
+  for (const ObservationKey& correspondence : correspondences) {
+    if (!IsUsableObservation(correspondence, *reconstruction)) {
+      continue;
+    }
+    const Point2D& point2d = reconstruction->GetImage(correspondence.first)
+                                 .points2d[correspondence.second];
+    if (!point2d.HasPoint3D() ||
+        !reconstruction->ExistsPoint3D(point2d.point3d_id) ||
+        !tested_point_ids.insert(point2d.point3d_id).second) {
+      continue;
+    }
+    const double error = AngularErrorDegrees(
+        reference, reconstruction->GetPoint3D(point2d.point3d_id).xyz,
+        *reconstruction);
+    if (error < best_error ||
+        (error == best_error && point2d.point3d_id < best_point3d_id)) {
+      best_error = error;
+      best_point3d_id = point2d.point3d_id;
+    }
+  }
+  if (best_point3d_id == kInvalidPoint3DId ||
+      best_error > options.continue_max_angle_error_deg) {
+    return false;
+  }
+  ObservationManager observation_manager(reconstruction);
+  return observation_manager.AddObservation(best_point3d_id, reference.first,
+                                            reference.second);
+}
+
+std::size_t CompletePointTrack(
+    Point3DId point3d_id,
+    const CorrespondenceAdjacency& adjacency,
+    const IncrementalTriangulatorOptions& options,
+    Reconstruction* reconstruction) {
+  if (!reconstruction->ExistsPoint3D(point3d_id)) {
+    return 0;
+  }
+  const Eigen::Vector3d xyz = reconstruction->GetPoint3D(point3d_id).xyz;
+  std::vector<ObservationKey> frontier;
+  std::set<ObservationKey> visited;
+  for (const TrackElement& element :
+       reconstruction->GetPoint3D(point3d_id).track.elements) {
+    const ObservationKey observation{element.image_id, element.point2d_idx};
+    frontier.push_back(observation);
+    visited.insert(observation);
+  }
+
+  std::size_t num_completed = 0;
+  ObservationManager observation_manager(reconstruction);
+  for (std::size_t depth = 0;
+       depth < options.complete_max_transitivity && !frontier.empty();
+       ++depth) {
+    std::vector<ObservationKey> next_frontier;
+    for (const ObservationKey& source : frontier) {
+      const auto adjacency_it = adjacency.find(source);
+      if (adjacency_it == adjacency.end()) {
+        continue;
+      }
+      for (const ObservationKey& target : adjacency_it->second) {
+        if (!visited.insert(target).second ||
+            !reconstruction->IsImageRegistered(target.first) ||
+            !HasPoseAndCamera(*reconstruction, target.first)) {
+          continue;
+        }
+        Image& image = reconstruction->GetImage(target.first);
+        if (target.second >= image.points2d.size()) {
+          continue;
+        }
+        Point2D& point2d = image.points2d[target.second];
+        if (point2d.HasPoint3D()) {
+          continue;
+        }
+        const Camera& camera = reconstruction->GetCamera(image.camera_id);
+        const std::optional<double> error = ReprojectionError(
+            camera, *image.cam_from_world, xyz, point2d.xy);
+        if (!error.has_value() ||
+            *error > options.complete_max_reprojection_error_px) {
+          continue;
+        }
+        if (observation_manager.AddObservation(point3d_id, target.first,
+                                               target.second)) {
+          ++num_completed;
+          next_frontier.push_back(target);
+        }
+      }
+    }
+    frontier = std::move(next_frontier);
+  }
+  return num_completed;
+}
+
+void MergePointTrack(
+    Point3DId point3d_id,
+    const CorrespondenceAdjacency& adjacency,
+    const IncrementalTriangulatorOptions& options,
+    Reconstruction* reconstruction,
+    IncrementalTriangulatorSummary* summary) {
+  while (reconstruction->ExistsPoint3D(point3d_id)) {
+    std::set<Point3DId> candidates;
+    const Track track = reconstruction->GetPoint3D(point3d_id).track;
+    for (const TrackElement& element : track.elements) {
+      const auto adjacency_it =
+          adjacency.find({element.image_id, element.point2d_idx});
+      if (adjacency_it == adjacency.end()) {
+        continue;
+      }
+      for (const ObservationKey& observation : adjacency_it->second) {
+        if (!reconstruction->ExistsImage(observation.first)) {
+          continue;
+        }
+        const Image& image = reconstruction->GetImage(observation.first);
+        if (observation.second >= image.points2d.size()) {
+          continue;
+        }
+        const Point2D& point2d = image.points2d[observation.second];
+        if (point2d.HasPoint3D() && point2d.point3d_id != point3d_id &&
+            reconstruction->ExistsPoint3D(point2d.point3d_id)) {
+          candidates.insert(point2d.point3d_id);
+        }
+      }
+    }
+
+    bool merged = false;
+    for (const Point3DId candidate_id : candidates) {
+      if (!reconstruction->ExistsPoint3D(candidate_id)) {
+        continue;
+      }
+      const Point3DId target_id = std::min(point3d_id, candidate_id);
+      const Point3DId source_id = std::max(point3d_id, candidate_id);
+      const std::size_t merged_observations =
+          reconstruction->GetPoint3D(target_id).track.Length() +
+          reconstruction->GetPoint3D(source_id).track.Length();
+      if (TryMergePoint3Ds(target_id, source_id, options,
+                           reconstruction)) {
+        point3d_id = target_id;
+        ++summary->num_merged_points;
+        summary->num_merged_observations += merged_observations;
+        merged = true;
+        break;
+      }
+    }
+    if (!merged) {
+      break;
+    }
+  }
+}
+
 }  // namespace
 
 IncrementalTriangulatorSummary TriangulateRegisteredImage(
@@ -314,34 +717,40 @@ IncrementalTriangulatorSummary TriangulateRegisteredImage(
     return summary;
   }
 
-  std::set<std::pair<ImageId, Point2DIdx>> tried_observations;
-  for (const auto& [pair, geometry] : graph.verified_geometries) {
-    if (!PairContainsImage(pair, image_id) || !IsUsableGeometry(geometry) ||
-        !PassesPairAngleLayer(geometry, options)) {
+  const CorrespondenceAdjacency adjacency =
+      BuildCorrespondenceAdjacency(graph);
+  const Image& reference_image = reconstruction->GetImage(image_id);
+  for (Point2DIdx point2d_idx = 0;
+       point2d_idx < reference_image.points2d.size(); ++point2d_idx) {
+    const ObservationKey reference{image_id, point2d_idx};
+    std::vector<ObservationKey> correspondences =
+        CollectTransitiveCorrespondences(reference, adjacency,
+                                         options.max_transitivity,
+                                         *reconstruction);
+    if (correspondences.empty()) {
       continue;
     }
 
-    const ImageId neighbor_id = OtherImageId(pair, image_id);
-    if (!reconstruction->IsImageRegistered(neighbor_id) ||
-        !HasPoseAndCamera(*reconstruction, neighbor_id)) {
-      continue;
-    }
-
-    for (const FeatureMatch& match : geometry.inlier_matches) {
-      const Point2DIdx target_idx =
-          pair.image_id1 == image_id ? match.idx1 : match.idx2;
-      const auto target_observation = std::make_pair(image_id, target_idx);
-      if (tried_observations.find(target_observation) !=
-          tried_observations.end()) {
-        continue;
-      }
-
-      if (TryCreatePointFromMatch(pair, match, options, reconstruction)) {
-        tried_observations.insert(target_observation);
-        ++summary.num_created_points;
-        summary.num_created_observations += 2;
+    bool has_triangulated_correspondence = false;
+    for (const ObservationKey& correspondence : correspondences) {
+      const Point2D& point2d = reconstruction->GetImage(correspondence.first)
+                                   .points2d[correspondence.second];
+      if (point2d.HasPoint3D()) {
+        has_triangulated_correspondence = true;
+        break;
       }
     }
+    if (has_triangulated_correspondence &&
+        ContinueObservationAngular(reference, correspondences, options,
+                                   reconstruction)) {
+      ++summary.num_completed_observations;
+    }
+
+    correspondences.push_back(reference);
+    const CreateTrackSummary created = CreatePointsFromCorrespondences(
+        correspondences, adjacency, options, reconstruction);
+    summary.num_created_points += created.num_points;
+    summary.num_created_observations += created.num_observations;
   }
 
   for (std::size_t iteration = 1;
@@ -397,8 +806,8 @@ IncrementalTriangulatorSummary CompleteTracksForRegisteredImage(
         continue;
       }
 
-      if (TryCompleteTargetObservation(pair, image_id, match, options,
-                                       reconstruction)) {
+      if (TryCompleteObservation(pair, image_id, match, options,
+                                 reconstruction)) {
         tried_observations.insert(target_observation);
         ++summary.num_completed_observations;
       } else if (TryMergeMatchedExistingPoints(pair, image_id, match, options,
@@ -411,6 +820,53 @@ IncrementalTriangulatorSummary CompleteTracksForRegisteredImage(
   }
 
   summary.message = "Track completion finished";
+  return summary;
+}
+
+IncrementalTriangulatorSummary CompleteAndMergeAllTracks(
+    const MatchGraph& graph,
+    const IncrementalTriangulatorOptions& options,
+    Reconstruction* reconstruction) {
+  IncrementalTriangulatorSummary summary;
+  if (reconstruction == nullptr) {
+    summary.message = "Reconstruction is null";
+    return summary;
+  }
+  const CorrespondenceAdjacency adjacency =
+      BuildCorrespondenceAdjacency(graph);
+  for (std::size_t iteration = 0;
+       iteration < options.max_track_update_iterations; ++iteration) {
+    const std::size_t updates_before =
+        summary.num_completed_observations + summary.num_merged_points;
+    std::vector<Point3DId> point_ids;
+    point_ids.reserve(reconstruction->Points3D().size());
+    for (const auto& [point3d_id, point3d] : reconstruction->Points3D()) {
+      (void)point3d;
+      point_ids.push_back(point3d_id);
+    }
+    for (const Point3DId point3d_id : point_ids) {
+      summary.num_completed_observations += CompletePointTrack(
+          point3d_id, adjacency, options, reconstruction);
+    }
+
+    point_ids.clear();
+    for (const auto& [point3d_id, point3d] : reconstruction->Points3D()) {
+      (void)point3d;
+      point_ids.push_back(point3d_id);
+    }
+    for (const Point3DId point3d_id : point_ids) {
+      if (reconstruction->ExistsPoint3D(point3d_id)) {
+        MergePointTrack(point3d_id, adjacency, options, reconstruction,
+                        &summary);
+      }
+    }
+    const std::size_t updates_after =
+        summary.num_completed_observations + summary.num_merged_points;
+    if (updates_after == updates_before) {
+      break;
+    }
+  }
+  summary.message = "Global track completion and merging finished";
   return summary;
 }
 

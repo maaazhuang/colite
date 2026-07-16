@@ -79,7 +79,26 @@ int RunCompareColmap(const std::vector<std::string>& args,
         << "Candidate images: " << summary.candidate_images << "\n"
         << "Common images: " << summary.common_images << "\n"
         << "Common points by id: " << summary.common_points_by_id << "\n"
-        << "Common pairs: " << summary.common_pairs << "\n";
+        << "Common pairs: " << summary.common_pairs << "\n"
+        << "Sim(3) alignment: "
+        << (summary.similarity_alignment_valid ? 1 : 0) << "\n"
+        << "Rotation error mean/median/max (deg): "
+        << summary.mean_rotation_error_deg << "/"
+        << summary.median_rotation_error_deg << "/"
+        << summary.max_rotation_error_deg << "\n"
+        << "Camera center error mean/median/max: "
+        << summary.mean_center_error << "/"
+        << summary.median_center_error << "/"
+        << summary.max_center_error << "\n"
+        << "Camera center error / baseline mean/max: "
+        << summary.mean_center_error_over_baseline << "/"
+        << summary.max_center_error_over_baseline << "\n"
+        << "Mean reprojection error reference/candidate: "
+        << summary.reference_mean_reprojection_error << "/"
+        << summary.candidate_mean_reprojection_error << "\n"
+        << "Mean track length reference/candidate: "
+        << summary.reference_mean_track_length << "/"
+        << summary.candidate_mean_track_length << "\n";
     return EXIT_SUCCESS;
   } catch (const std::exception& exception) {
     err << "Error: " << exception.what() << "\n\n";

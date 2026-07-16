@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -12,6 +13,7 @@
 #include <ios>
 #include <limits>
 #include <map>
+#include <memory>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
@@ -21,15 +23,23 @@
 #include <utility>
 #include <vector>
 
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+
 #include "colite/core/camera.h"
+#include "colite/core/geometry.h"
 #include "colite/core/point2d.h"
 #include "colite/core/point3d.h"
 #include "colite/core/reconstruction.h"
 #include "colite/mvs/dense_cloud.h"
 #include "colite/mvs/dense_map.h"
 #include "colite/mvs/image_workspace.h"
+#include "colite/mvs/image_undistorter.h"
+#include "colite/mvs/meshing.h"
+#include "colite/mvs/mesh_texturer.h"
 #include "colite/mvs/mvs_pipeline.h"
 #include "colite/mvs/patch_match.h"
+#include "colite/mvs/patch_match_cuda.h"
 
 namespace colite::controllers {
 
@@ -41,6 +51,8 @@ const ReconMvsControllerOptions& ReconMvsController::Options() const {
 }
 
 namespace {
+using ControllerClock = std::chrono::steady_clock;
+
 std::vector<std::string> DataLines(const std::filesystem::path& path) {
   std::ifstream file(path);
   if (!file) {
@@ -160,14 +172,151 @@ Reconstruction ReadColmapTextModel(const std::filesystem::path& model_path) {
   return reconstruction;
 }
 
+void WriteColmapTextModel(const std::filesystem::path& model_path,
+                          const Reconstruction& reconstruction) {
+  std::filesystem::create_directories(model_path);
+  std::ofstream cameras(model_path / "cameras.txt");
+  std::ofstream images(model_path / "images.txt");
+  std::ofstream points(model_path / "points3D.txt");
+  if (!cameras || !images || !points) {
+    throw std::runtime_error("Failed to write undistorted sparse model.");
+  }
+  cameras << std::setprecision(17);
+  for (const auto& [camera_id, camera] : reconstruction.Cameras()) {
+    cameras << camera_id << ' ' << CameraModelIdToName(camera.model_id) << ' '
+            << camera.width << ' ' << camera.height;
+    for (const double parameter : camera.params) cameras << ' ' << parameter;
+    cameras << '\n';
+  }
+  images << std::setprecision(17);
+  for (const ImageId image_id : reconstruction.RegisteredImageIds()) {
+    const Image& image = reconstruction.GetImage(image_id);
+    const Pose3& pose = *image.cam_from_world;
+    images << image.id << ' ' << pose.q_cw.w() << ' ' << pose.q_cw.x() << ' '
+           << pose.q_cw.y() << ' ' << pose.q_cw.z() << ' ' << pose.t_cw.x()
+           << ' ' << pose.t_cw.y() << ' ' << pose.t_cw.z() << ' '
+           << image.camera_id << ' ' << image.name << '\n';
+    for (const Point2D& point : image.points2d) {
+      images << point.xy.x() << ' ' << point.xy.y() << ' ';
+      if (point.HasPoint3D()) images << point.point3d_id;
+      else images << -1;
+      images << ' ';
+    }
+    images << '\n';
+  }
+  points << std::setprecision(17);
+  for (const auto& [point_id, point] : reconstruction.Points3D()) {
+    points << point_id << ' ' << point.xyz.x() << ' ' << point.xyz.y() << ' '
+           << point.xyz.z() << ' ' << static_cast<int>(point.color.x()) << ' '
+           << static_cast<int>(point.color.y()) << ' '
+           << static_cast<int>(point.color.z()) << ' '
+           << point.reprojection_error;
+    for (const TrackElement& element : point.track.elements) {
+      points << ' ' << element.image_id << ' ' << element.point2d_idx;
+    }
+    points << '\n';
+  }
+}
+
+std::size_t UndistortWorkspaceImages(
+    const ReconMvsControllerOptions& cli_options,
+    const std::filesystem::path& output_path,
+    Reconstruction* reconstruction) {
+  mvs::ImageUndistortionOptions options;
+  options.blank_pixels = cli_options.undistort_blank_pixels;
+  options.min_scale = cli_options.undistort_min_scale;
+  options.max_scale = cli_options.undistort_max_scale;
+  options.max_image_size = cli_options.undistort_max_image_size;
+  const auto original_cameras = reconstruction->Cameras();
+  const std::filesystem::path image_output =
+      output_path / "undistorted" / "images";
+  std::filesystem::create_directories(image_output);
+  std::ofstream diagnostics(output_path / "undistorted" / "images.tsv");
+  diagnostics << "image_id\tname\twidth\theight\tvalid_pixel_ratio\n";
+  std::size_t count = 0;
+  for (const ImageId image_id : reconstruction->RegisteredImageIds()) {
+    Image& image = reconstruction->GetImage(image_id);
+    const Camera& original_camera = original_cameras.at(image.camera_id);
+    const std::filesystem::path source_path =
+        image.file_path.empty() ? cli_options.image_path / image.name
+                                : std::filesystem::path(image.file_path);
+    cv::Mat source = cv::imread(source_path.string(), cv::IMREAD_COLOR);
+    if (source.empty()) {
+      throw std::runtime_error("Failed to read image for undistortion: " +
+                               source_path.string());
+    }
+    const cv::Size expected_size(static_cast<int>(original_camera.width),
+                                 static_cast<int>(original_camera.height));
+    if (source.size() != expected_size) {
+      cv::resize(source, source, expected_size, 0.0, 0.0, cv::INTER_AREA);
+    }
+    mvs::UndistortedImage undistorted =
+        mvs::UndistortImage(original_camera, source, options);
+    const std::filesystem::path image_output_path = image_output / image.name;
+    std::filesystem::create_directories(image_output_path.parent_path());
+    if (!cv::imwrite(image_output_path.string(), undistorted.image)) {
+      throw std::runtime_error("Failed to write undistorted image: " +
+                               image_output_path.string());
+    }
+    reconstruction->GetCamera(image.camera_id) = undistorted.camera;
+    image.file_path = image_output_path.string();
+    diagnostics << image.id << '\t' << image.name << '\t'
+                << undistorted.camera.width << '\t'
+                << undistorted.camera.height << '\t'
+                << std::setprecision(17) << undistorted.valid_pixel_ratio
+                << '\n';
+    ++count;
+  }
+  for (const ImageId image_id : reconstruction->RegisteredImageIds()) {
+    Image& image = reconstruction->GetImage(image_id);
+    const Camera& camera = reconstruction->GetCamera(image.camera_id);
+    const Camera& original_camera = original_cameras.at(image.camera_id);
+    for (Point2D& point : image.points2d) {
+      const std::optional<Eigen::Vector2d> undistorted =
+          mvs::UndistortPixel(original_camera, camera, point.xy);
+      if (undistorted.has_value()) point.xy = *undistorted;
+      if (!point.HasPoint3D() ||
+          !reconstruction->ExistsPoint3D(point.point3d_id)) {
+        continue;
+      }
+      const std::optional<Eigen::Vector2d> projected = ProjectWorldPoint(
+          camera, *image.cam_from_world,
+          reconstruction->GetPoint3D(point.point3d_id).xyz);
+      if (projected.has_value()) point.xy = *projected;
+    }
+  }
+  WriteColmapTextModel(output_path / "undistorted" / "sparse",
+                       *reconstruction);
+  return count;
+}
+
+struct PatchMatchSchedulingSummary {
+  double cuda_warmup_time_ms = 0.0;
+  double initial_wall_time_ms = 0.0;
+  double initial_sum_cuda_time_ms = 0.0;
+  double initial_overlap_saved_time_ms = 0.0;
+  double initial_overlap_ratio = 0.0;
+  std::size_t initial_deferred_photometric_stats_images = 0;
+  double initial_source_setup_sum_time_ms = 0.0;
+  double initial_stereo_run_sum_time_ms = 0.0;
+  double initial_stereo_wrapper_overhead_sum_time_ms = 0.0;
+  double initial_postprocess_sum_time_ms = 0.0;
+  double refinement_wall_time_ms = 0.0;
+  double refinement_sum_cuda_time_ms = 0.0;
+  double refinement_overlap_saved_time_ms = 0.0;
+  double refinement_overlap_ratio = 0.0;
+};
+
 void WriteMvsSummary(const std::filesystem::path& output_path,
                      const mvs::MvsPipelineSummary& summary,
+                     std::size_t num_undistorted_images,
                      std::size_t num_initialized_patch_match_images,
                      std::size_t num_patch_match_images,
                      std::size_t num_photometric_filtered_pixels,
                      std::size_t num_normal_refined_pixels,
                      std::size_t num_geometric_consistent_pixels,
                      std::size_t num_geometric_filtered_pixels,
+                     const PatchMatchSchedulingSummary& scheduling_summary,
                      const mvs::StereoFusionSummary& fusion_summary) {
   std::filesystem::create_directories(output_path);
   std::ofstream file(output_path / "summary.txt");
@@ -176,6 +325,7 @@ void WriteMvsSummary(const std::filesystem::path& output_path,
        << "num_images " << summary.num_images << "\n"
        << "num_sparse_depth_samples " << summary.num_sparse_depth_samples
        << "\n"
+       << "undistorted_images " << num_undistorted_images << "\n"
        << "initialized_patch_match_images "
        << num_initialized_patch_match_images
        << "\n"
@@ -193,6 +343,48 @@ void WriteMvsSummary(const std::filesystem::path& output_path,
        << "\n"
        << "geometric_filtered_pixels "
        << num_geometric_filtered_pixels
+       << "\n"
+       << "cuda_warmup_time_ms "
+       << scheduling_summary.cuda_warmup_time_ms
+       << "\n"
+       << "patch_match_initial_wall_time_ms "
+       << scheduling_summary.initial_wall_time_ms
+       << "\n"
+       << "patch_match_initial_sum_cuda_time_ms "
+       << scheduling_summary.initial_sum_cuda_time_ms
+       << "\n"
+       << "patch_match_initial_overlap_saved_time_ms "
+       << scheduling_summary.initial_overlap_saved_time_ms
+       << "\n"
+       << "patch_match_initial_overlap_ratio "
+       << scheduling_summary.initial_overlap_ratio
+       << "\n"
+       << "patch_match_initial_deferred_photometric_stats_images "
+       << scheduling_summary.initial_deferred_photometric_stats_images
+       << "\n"
+       << "patch_match_initial_source_setup_sum_time_ms "
+       << scheduling_summary.initial_source_setup_sum_time_ms
+       << "\n"
+       << "patch_match_initial_stereo_run_sum_time_ms "
+       << scheduling_summary.initial_stereo_run_sum_time_ms
+       << "\n"
+       << "patch_match_initial_stereo_wrapper_overhead_sum_time_ms "
+       << scheduling_summary.initial_stereo_wrapper_overhead_sum_time_ms
+       << "\n"
+       << "patch_match_initial_postprocess_sum_time_ms "
+       << scheduling_summary.initial_postprocess_sum_time_ms
+       << "\n"
+       << "patch_match_refinement_wall_time_ms "
+       << scheduling_summary.refinement_wall_time_ms
+       << "\n"
+       << "patch_match_refinement_sum_cuda_time_ms "
+       << scheduling_summary.refinement_sum_cuda_time_ms
+       << "\n"
+       << "patch_match_refinement_overlap_saved_time_ms "
+       << scheduling_summary.refinement_overlap_saved_time_ms
+       << "\n"
+       << "patch_match_refinement_overlap_ratio "
+       << scheduling_summary.refinement_overlap_ratio
        << "\n"
        << "fused_points "
        << fusion_summary.num_fused_points
@@ -331,6 +523,34 @@ mvs::PatchMatchView MakePatchMatchView(const Reconstruction& reconstruction,
   return view;
 }
 
+std::vector<mvs::MeshTextureView> LoadMeshTextureViews(
+    const Reconstruction& reconstruction,
+    const std::vector<mvs::PatchMatchView>& geometry_views,
+    const std::filesystem::path& image_path) {
+  std::vector<mvs::MeshTextureView> texture_views;
+  texture_views.reserve(geometry_views.size());
+  for (const mvs::PatchMatchView& geometry : geometry_views) {
+    const Image& reconstruction_image =
+        reconstruction.GetImage(geometry.image_id);
+    const std::filesystem::path path =
+        reconstruction_image.file_path.empty()
+            ? image_path / reconstruction_image.name
+            : std::filesystem::path(reconstruction_image.file_path);
+    cv::Mat image = cv::imread(path.string(), cv::IMREAD_COLOR);
+    if (image.empty()) {
+      throw std::runtime_error("Failed to read texture image: " +
+                               path.string());
+    }
+    const cv::Size expected_size(static_cast<int>(geometry.camera.width),
+                                 static_cast<int>(geometry.camera.height));
+    if (image.size() != expected_size) {
+      cv::resize(image, image, expected_size, 0.0, 0.0, cv::INTER_AREA);
+    }
+    texture_views.push_back({geometry, std::move(image)});
+  }
+  return texture_views;
+}
+
 std::string FormatStat(double value) {
   std::ostringstream stream;
   stream << std::setprecision(9) << value;
@@ -432,9 +652,142 @@ struct PatchMatchWorkspaceResult {
   mvs::PatchMatchPhotometricStats stats_before_filter;
   mvs::PatchMatchPhotometricStats stats_after_photometric_filter;
   std::size_t photometric_filtered_pixels = 0;
+  bool photometric_stats_deferred = false;
+  double initial_source_setup_time_ms = 0.0;
+  double initial_stereo_run_time_ms = 0.0;
+  double initial_postprocess_time_ms = 0.0;
   std::size_t geometric_consistent_pixels = 0;
   std::size_t geometric_filtered_pixels = 0;
 };
+
+void WriteInitialPatchMatchDiagnostics(
+    const std::filesystem::path& output_path,
+    const std::vector<PatchMatchWorkspaceResult>& results) {
+  std::filesystem::create_directories(output_path / "stereo");
+  std::ofstream diagnostics(output_path / "stereo" /
+                            "patch_match_initial.tsv");
+  diagnostics << "image_id\trequested_backend\tactual_backend"
+              << "\tpyramid_levels\titerations\tvalid_cost_pixels"
+              << "\tplane_propagation_candidates"
+              << "\tperturbation_candidate_evaluations"
+              << "\tsource_selection_probability_updates"
+              << "\titeration_source_selection_probability_means"
+              << "\tfinal_source_selection_probability_means"
+              << "\tcuda_upload_time_ms"
+              << "\tcuda_initialization_time_ms"
+              << "\tcuda_evaluate_cost_time_ms"
+              << "\tcuda_propagation_time_ms"
+              << "\tcuda_perturbation_time_ms"
+              << "\tcuda_download_time_ms"
+              << "\tcuda_total_time_ms"
+              << "\tcuda_wrapper_total_time_ms"
+              << "\tcuda_wrapper_overhead_time_ms"
+              << "\tcuda_request_validation_time_ms"
+              << "\tcuda_pyramid_resize_time_ms"
+              << "\tcuda_host_pack_time_ms"
+              << "\tcuda_single_scale_dispatch_time_ms"
+              << "\tcuda_result_materialization_time_ms"
+              << "\tcuda_output_to_vector_time_ms"
+              << "\tcuda_dense_map_fill_time_ms"
+              << "\tcuda_normal_refinement_time_ms"
+              << "\tcuda_valid_cost_count_time_ms"
+              << "\tcuda_host_initial_normal_upload_normalizations"
+              << "\tcuda_host_output_normalizations"
+              << "\tcuda_device_count_queries"
+              << "\tcuda_device_count_cache_hits"
+              << "\tcuda_workspace_pool_size"
+              << "\tcuda_workspace_pool_slot\n";
+  for (const PatchMatchWorkspaceResult& result : results) {
+    const mvs::PatchMatchStereoSummary& summary = result.result.summary;
+    const double wrapper_overhead_time_ms =
+        std::max(0.0,
+                 summary.cuda_wrapper_total_time_ms -
+                     summary.cuda_total_time_ms);
+    diagnostics << result.image_id << "\t"
+                << mvs::PatchMatchBackendToName(summary.requested_backend)
+                << "\t"
+                << mvs::PatchMatchBackendToName(summary.actual_backend)
+                << "\t"
+                << summary.num_pyramid_levels << "\t"
+                << summary.num_iterations << "\t"
+                << summary.num_valid_cost_pixels << "\t"
+                << summary.num_plane_propagation_candidates << "\t"
+                << summary.num_perturbation_candidate_evaluations << "\t"
+                << summary.num_source_selection_probability_updates << "\t"
+                << JoinDiagnosticVector(
+                       summary.iteration_source_selection_probability_means)
+                << "\t"
+                << JoinDiagnosticVector(
+                       summary.final_source_selection_probability_means)
+                << "\t"
+                << FormatStat(summary.cuda_upload_time_ms) << "\t"
+                << FormatStat(summary.cuda_initialization_time_ms) << "\t"
+                << FormatStat(summary.cuda_evaluate_cost_time_ms) << "\t"
+                << FormatStat(summary.cuda_propagation_time_ms) << "\t"
+                << FormatStat(summary.cuda_perturbation_time_ms) << "\t"
+                << FormatStat(summary.cuda_download_time_ms) << "\t"
+                << FormatStat(summary.cuda_total_time_ms) << "\t"
+                << FormatStat(summary.cuda_wrapper_total_time_ms) << "\t"
+                << FormatStat(wrapper_overhead_time_ms) << "\t"
+                << FormatStat(summary.cuda_request_validation_time_ms)
+                << "\t"
+                << FormatStat(summary.cuda_pyramid_resize_time_ms) << "\t"
+                << FormatStat(summary.cuda_host_pack_time_ms) << "\t"
+                << FormatStat(summary.cuda_single_scale_dispatch_time_ms)
+                << "\t"
+                << FormatStat(summary.cuda_result_materialization_time_ms)
+                << "\t"
+                << FormatStat(summary.cuda_output_to_vector_time_ms) << "\t"
+                << FormatStat(summary.cuda_dense_map_fill_time_ms) << "\t"
+                << FormatStat(summary.cuda_normal_refinement_time_ms) << "\t"
+                << FormatStat(summary.cuda_valid_cost_count_time_ms) << "\t"
+                << summary.cuda_host_initial_normal_upload_normalizations
+                << "\t"
+                << summary.cuda_host_output_normalizations << "\t"
+                << summary.cuda_device_count_queries << "\t"
+                << summary.cuda_device_count_cache_hits << "\t"
+                << summary.cuda_workspace_pool_size << "\t"
+                << summary.cuda_workspace_pool_slot << "\n";
+  }
+}
+
+using CudaWorkspacePool = std::vector<mvs::CudaPatchMatchWorkspacePtr>;
+
+bool UsesCudaWorkspacePool(const mvs::PatchMatchStereoOptions& options) {
+  return options.backend != mvs::PatchMatchBackend::kCpu;
+}
+
+CudaWorkspacePool CreateCudaWorkspacePool(
+    const mvs::PatchMatchStereoOptions& options,
+    const ReconMvsControllerOptions& cli_options,
+    std::size_t num_images) {
+  CudaWorkspacePool pool;
+  if (!UsesCudaWorkspacePool(options) || num_images == 0) {
+    return pool;
+  }
+  const std::size_t pool_size = std::max<std::size_t>(
+      1, std::min({std::max<std::size_t>(1, cli_options.num_threads),
+                   num_images, static_cast<std::size_t>(2)}));
+  pool.reserve(pool_size);
+  for (std::size_t i = 0; i < pool_size; ++i) {
+    pool.push_back(mvs::MakeCudaPatchMatchWorkspace());
+  }
+  return pool;
+}
+
+void FillOverlapSummary(double wall_time_ms,
+                        double sum_cuda_time_ms,
+                        double* wall_time_out,
+                        double* sum_cuda_time_out,
+                        double* overlap_saved_time_out,
+                        double* overlap_ratio_out) {
+  *wall_time_out = wall_time_ms;
+  *sum_cuda_time_out = sum_cuda_time_ms;
+  *overlap_saved_time_out = std::max(0.0, sum_cuda_time_ms - wall_time_ms);
+  *overlap_ratio_out =
+      sum_cuda_time_ms <= 0.0 ? 0.0
+                              : *overlap_saved_time_out / sum_cuda_time_ms;
+}
 
 void WriteConsistencyGraphText(const std::filesystem::path& path,
                                const mvs::ConsistencyGraph& graph) {
@@ -519,7 +872,12 @@ PatchMatchWorkspaceResult RunInitialPatchMatchForImage(
     const mvs::PatchMatchStereoOptions& patch_match_options,
     const ReconMvsControllerOptions& cli_options,
     bool binary_dense_maps,
-    bool run_geometric_refinement) {
+    bool run_geometric_refinement,
+    mvs::CudaPatchMatchWorkspace* cuda_workspace,
+    std::size_t cuda_workspace_pool_size,
+    std::size_t cuda_workspace_pool_slot) {
+  const ControllerClock::time_point source_setup_start =
+      ControllerClock::now();
   const mvs::MvsImage& reference_image = images.at(image_summary.image_id);
   const mvs::PatchMatchView& reference_view = views.at(image_summary.image_id);
 
@@ -531,25 +889,48 @@ PatchMatchWorkspaceResult RunInitialPatchMatchForImage(
     source_views.push_back(views.at(source.image_id));
     source_images.push_back(images.at(source.image_id));
   }
+  const double source_setup_time_ms =
+      std::chrono::duration<double, std::milli>(ControllerClock::now() -
+                                                source_setup_start)
+          .count();
 
-  mvs::PatchMatchStereoResult result = mvs::RunPatchMatchStereoForImage(
+  const ControllerClock::time_point stereo_run_start = ControllerClock::now();
+  mvs::PatchMatchStereoResult result =
+      mvs::RunPatchMatchStereoForImageWithCudaWorkspace(
       reference_view, source_views, reference_image, source_images,
       static_cast<float>(image_summary.min_depth),
-      static_cast<float>(image_summary.max_depth), patch_match_options);
-  mvs::PatchMatchPhotometricStats stats_before =
-      mvs::ComputePatchMatchPhotometricStats(result.cost_map);
+      static_cast<float>(image_summary.max_depth), cuda_workspace,
+      patch_match_options);
+  if (result.summary.actual_backend == mvs::PatchMatchBackend::kCuda &&
+      cuda_workspace_pool_size > 0) {
+    result.summary.cuda_workspace_pool_size = cuda_workspace_pool_size;
+    result.summary.cuda_workspace_pool_slot = cuda_workspace_pool_slot;
+  }
+  const double stereo_run_time_ms =
+      std::chrono::duration<double, std::milli>(ControllerClock::now() -
+                                                stereo_run_start)
+          .count();
+
+  const ControllerClock::time_point postprocess_start = ControllerClock::now();
   mvs::PatchMatchPhotometricFilterSummary filter_summary;
-  if (!run_geometric_refinement &&
-      cli_options.filter_photometric_max_cost >= 0.0F) {
-    filter_summary = mvs::FilterPatchMatchPhotometricResults(
-        cli_options.filter_photometric_max_cost, &result.depth_map,
-        &result.normal_map, &result.cost_map);
+  mvs::PatchMatchPhotometricStats stats_before;
+  mvs::PatchMatchPhotometricStats stats_after;
+  const bool defer_photometric_stats = run_geometric_refinement;
+  if (!defer_photometric_stats) {
+    stats_before = mvs::ComputePatchMatchPhotometricStats(result.cost_map);
+    if (cli_options.filter_photometric_max_cost >= 0.0F) {
+      filter_summary = mvs::FilterPatchMatchPhotometricResults(
+          cli_options.filter_photometric_max_cost, &result.depth_map,
+          &result.normal_map, &result.cost_map);
+    } else {
+      filter_summary.num_pixels = result.cost_map.NumPixels();
+      filter_summary.num_kept_pixels = result.cost_map.ValidPixelCount();
+    }
+    stats_after = mvs::ComputePatchMatchPhotometricStats(result.cost_map);
   } else {
     filter_summary.num_pixels = result.cost_map.NumPixels();
     filter_summary.num_kept_pixels = result.cost_map.ValidPixelCount();
   }
-  const mvs::PatchMatchPhotometricStats stats_after =
-      mvs::ComputePatchMatchPhotometricStats(result.cost_map);
 
   PatchMatchWorkspaceResult workspace_result;
   workspace_result.image_id = image_summary.image_id;
@@ -568,6 +949,13 @@ PatchMatchWorkspaceResult RunInitialPatchMatchForImage(
   workspace_result.stats_after_photometric_filter = stats_after;
   workspace_result.photometric_filtered_pixels =
       filter_summary.num_filtered_pixels;
+  workspace_result.photometric_stats_deferred = defer_photometric_stats;
+  workspace_result.initial_source_setup_time_ms = source_setup_time_ms;
+  workspace_result.initial_stereo_run_time_ms = stereo_run_time_ms;
+  workspace_result.initial_postprocess_time_ms =
+      std::chrono::duration<double, std::milli>(ControllerClock::now() -
+                                                postprocess_start)
+          .count();
   return workspace_result;
 }
 
@@ -578,16 +966,49 @@ std::vector<PatchMatchWorkspaceResult> RunInitialPatchMatchForWorkspace(
     const mvs::PatchMatchStereoOptions& patch_match_options,
     const ReconMvsControllerOptions& cli_options,
     bool binary_dense_maps,
-    bool run_geometric_refinement) {
+    bool run_geometric_refinement,
+    const std::vector<mvs::CudaPatchMatchWorkspace*>& cuda_workspace_pool,
+    PatchMatchSchedulingSummary* scheduling_summary) {
+  const ControllerClock::time_point batch_start = ControllerClock::now();
   std::vector<PatchMatchWorkspaceResult> results;
   results.reserve(image_summaries.size());
   const std::size_t num_threads =
       std::max<std::size_t>(1, cli_options.num_threads);
-  if (num_threads == 1 || image_summaries.size() <= 1) {
+  if (!cuda_workspace_pool.empty()) {
+    const std::size_t pool_size = cuda_workspace_pool.size();
+    std::vector<std::future<PatchMatchWorkspaceResult>> futures;
+    futures.reserve(pool_size);
+    std::size_t next_slot = 0;
+    const auto collect_oldest_future = [&results, &futures]() {
+      results.push_back(futures.front().get());
+      futures.erase(futures.begin());
+    };
+    for (const mvs::ImageMvsSummary* image_summary : image_summaries) {
+      if (futures.size() >= pool_size) {
+        collect_oldest_future();
+      }
+      const std::size_t slot = next_slot;
+      next_slot = (next_slot + 1) % pool_size;
+      futures.push_back(std::async(
+          std::launch::async,
+          [&images, &views, &patch_match_options, &cli_options,
+           binary_dense_maps, run_geometric_refinement, image_summary,
+           &cuda_workspace_pool, pool_size, slot]() {
+            return RunInitialPatchMatchForImage(
+                *image_summary, images, views, patch_match_options,
+                cli_options, binary_dense_maps, run_geometric_refinement,
+                cuda_workspace_pool[slot], pool_size, slot);
+          }));
+    }
+    while (!futures.empty()) {
+      collect_oldest_future();
+    }
+  } else if (num_threads == 1 ||
+      image_summaries.size() <= 1) {
     for (const mvs::ImageMvsSummary* image_summary : image_summaries) {
       results.push_back(RunInitialPatchMatchForImage(
           *image_summary, images, views, patch_match_options, cli_options,
-          binary_dense_maps, run_geometric_refinement));
+          binary_dense_maps, run_geometric_refinement, nullptr, 0, 0));
     }
   } else {
     std::vector<std::future<PatchMatchWorkspaceResult>> futures;
@@ -603,7 +1024,8 @@ std::vector<PatchMatchWorkspaceResult> RunInitialPatchMatchForWorkspace(
            binary_dense_maps, run_geometric_refinement, image_summary]() {
             return RunInitialPatchMatchForImage(
                 *image_summary, images, views, patch_match_options,
-                cli_options, binary_dense_maps, run_geometric_refinement);
+                cli_options, binary_dense_maps, run_geometric_refinement,
+                nullptr, 0, 0);
           }));
       if (futures.size() >= num_threads) {
         collect_oldest_future();
@@ -619,7 +1041,160 @@ std::vector<PatchMatchWorkspaceResult> RunInitialPatchMatchForWorkspace(
                const PatchMatchWorkspaceResult& rhs) {
               return lhs.image_id < rhs.image_id;
             });
+  if (scheduling_summary != nullptr) {
+    const double wall_time_ms =
+        std::chrono::duration<double, std::milli>(ControllerClock::now() -
+                                                  batch_start)
+            .count();
+    double sum_cuda_time_ms = 0.0;
+    for (const PatchMatchWorkspaceResult& result : results) {
+      if (result.result.summary.actual_backend == mvs::PatchMatchBackend::kCuda) {
+        sum_cuda_time_ms += result.result.summary.cuda_total_time_ms;
+        scheduling_summary->initial_stereo_wrapper_overhead_sum_time_ms +=
+            std::max(0.0, result.initial_stereo_run_time_ms -
+                              result.result.summary.cuda_total_time_ms);
+      }
+      scheduling_summary->initial_source_setup_sum_time_ms +=
+          result.initial_source_setup_time_ms;
+      scheduling_summary->initial_stereo_run_sum_time_ms +=
+          result.initial_stereo_run_time_ms;
+      scheduling_summary->initial_postprocess_sum_time_ms +=
+          result.initial_postprocess_time_ms;
+    }
+    FillOverlapSummary(
+        wall_time_ms, sum_cuda_time_ms,
+        &scheduling_summary->initial_wall_time_ms,
+        &scheduling_summary->initial_sum_cuda_time_ms,
+        &scheduling_summary->initial_overlap_saved_time_ms,
+        &scheduling_summary->initial_overlap_ratio);
+  }
   return results;
+}
+
+struct PatchMatchRefinementJob {
+  std::size_t result_index = 0;
+  mvs::PatchMatchView reference_view;
+  mvs::MvsImage reference_image;
+  std::vector<mvs::PatchMatchView> source_views;
+  std::vector<mvs::MvsImage> source_images;
+  std::vector<mvs::DenseDepthMap> source_depth_maps;
+  float min_depth = 0.0F;
+  float max_depth = 0.0F;
+};
+
+struct PatchMatchRefinementResult {
+  std::size_t result_index = 0;
+  mvs::PatchMatchStereoResult result;
+};
+
+PatchMatchRefinementResult RunPatchMatchRefinementJob(
+    const PatchMatchRefinementJob& job,
+    const mvs::PatchMatchStereoOptions& refinement_options,
+    mvs::CudaPatchMatchWorkspace* cuda_workspace,
+    std::size_t cuda_workspace_pool_size,
+    std::size_t cuda_workspace_pool_slot) {
+  PatchMatchRefinementResult output;
+  output.result_index = job.result_index;
+  output.result =
+      mvs::RunPatchMatchStereoForImageWithSourceDepthsAndCudaWorkspace(
+          job.reference_view, job.source_views, job.reference_image,
+          job.source_images, job.source_depth_maps, job.min_depth,
+          job.max_depth, cuda_workspace, refinement_options);
+  if (output.result.summary.actual_backend == mvs::PatchMatchBackend::kCuda &&
+      cuda_workspace_pool_size > 0) {
+    output.result.summary.cuda_workspace_pool_size =
+        cuda_workspace_pool_size;
+    output.result.summary.cuda_workspace_pool_slot =
+        cuda_workspace_pool_slot;
+  }
+  return output;
+}
+
+std::vector<PatchMatchRefinementResult> RunPatchMatchRefinementJobs(
+    const std::vector<PatchMatchRefinementJob>& jobs,
+    const mvs::PatchMatchStereoOptions& refinement_options,
+    const ReconMvsControllerOptions& cli_options,
+    const std::vector<mvs::CudaPatchMatchWorkspace*>& cuda_workspace_pool,
+    PatchMatchSchedulingSummary* scheduling_summary) {
+  const ControllerClock::time_point batch_start = ControllerClock::now();
+  std::vector<PatchMatchRefinementResult> outputs;
+  outputs.reserve(jobs.size());
+  const std::size_t num_threads =
+      std::max<std::size_t>(1, cli_options.num_threads);
+  const auto collect_oldest_future =
+      [&outputs](std::vector<std::future<PatchMatchRefinementResult>>*
+                     futures) {
+        outputs.push_back(futures->front().get());
+        futures->erase(futures->begin());
+      };
+
+  if (!cuda_workspace_pool.empty()) {
+    const std::size_t pool_size = cuda_workspace_pool.size();
+    std::vector<std::future<PatchMatchRefinementResult>> futures;
+    futures.reserve(pool_size);
+    std::size_t next_slot = 0;
+    for (const PatchMatchRefinementJob& job : jobs) {
+      if (futures.size() >= pool_size) {
+        collect_oldest_future(&futures);
+      }
+      const std::size_t slot = next_slot;
+      next_slot = (next_slot + 1) % pool_size;
+      const PatchMatchRefinementJob* job_ptr = &job;
+      futures.push_back(std::async(
+          std::launch::async,
+          [job_ptr, &refinement_options, &cuda_workspace_pool, pool_size,
+           slot]() {
+            return RunPatchMatchRefinementJob(
+                *job_ptr, refinement_options, cuda_workspace_pool[slot],
+                pool_size, slot);
+          }));
+    }
+    while (!futures.empty()) {
+      collect_oldest_future(&futures);
+    }
+  } else if (num_threads == 1 || jobs.size() <= 1) {
+    for (const PatchMatchRefinementJob& job : jobs) {
+      outputs.push_back(RunPatchMatchRefinementJob(
+          job, refinement_options, nullptr, 0, 0));
+    }
+  } else {
+    std::vector<std::future<PatchMatchRefinementResult>> futures;
+    futures.reserve(num_threads);
+    for (const PatchMatchRefinementJob& job : jobs) {
+      const PatchMatchRefinementJob* job_ptr = &job;
+      futures.push_back(std::async(
+          std::launch::async, [job_ptr, &refinement_options]() {
+            return RunPatchMatchRefinementJob(
+                *job_ptr, refinement_options, nullptr, 0, 0);
+          }));
+      if (futures.size() >= num_threads) {
+        collect_oldest_future(&futures);
+      }
+    }
+    while (!futures.empty()) {
+      collect_oldest_future(&futures);
+    }
+  }
+
+  if (scheduling_summary != nullptr) {
+    const double wall_time_ms =
+        std::chrono::duration<double, std::milli>(ControllerClock::now() -
+                                                  batch_start)
+            .count();
+    double sum_cuda_time_ms = 0.0;
+    for (const PatchMatchRefinementResult& output : outputs) {
+      if (output.result.summary.actual_backend == mvs::PatchMatchBackend::kCuda) {
+        sum_cuda_time_ms += output.result.summary.cuda_total_time_ms;
+      }
+    }
+    FillOverlapSummary(
+        wall_time_ms, sum_cuda_time_ms,
+        &scheduling_summary->refinement_wall_time_ms,
+        &scheduling_summary->refinement_sum_cuda_time_ms,
+        &scheduling_summary->refinement_overlap_saved_time_ms,
+        &scheduling_summary->refinement_overlap_ratio);
+  }
+  return outputs;
 }
 
 void WriteFusedPointCloudPly(const std::filesystem::path& path,
@@ -847,6 +1422,7 @@ std::size_t RunPatchMatchForWorkspace(
     std::size_t* num_normal_refined_pixels,
     std::size_t* num_geometric_consistent_pixels,
     std::size_t* num_geometric_filtered_pixels,
+    PatchMatchSchedulingSummary* scheduling_summary_out,
     mvs::StereoFusionSummary* fusion_summary_out) {
   mvs::MvsImageWorkspaceOptions workspace_options;
   workspace_options.image_path = cli_options.image_path;
@@ -863,6 +1439,25 @@ std::size_t RunPatchMatchForWorkspace(
   patch_match_options.num_iterations = cli_options.patch_match_iterations;
   patch_match_options.pyramid_levels = cli_options.patch_match_pyramid_levels;
   patch_match_options.cost.window_radius = cli_options.patch_match_window_radius;
+  patch_match_options.cost.bilateral_weighting =
+      cli_options.patch_match_bilateral_ncc;
+  patch_match_options.cost.sigma_spatial =
+      cli_options.patch_match_sigma_spatial;
+  patch_match_options.cost.sigma_color = cli_options.patch_match_sigma_color;
+  patch_match_options.source_selection.dynamic_probability =
+      cli_options.patch_match_dynamic_source_selection;
+  patch_match_options.source_selection.directional_hmm =
+      cli_options.patch_match_directional_hmm;
+  patch_match_options.source_selection.num_samples =
+      cli_options.patch_match_source_samples;
+  patch_match_options.source_selection.ncc_sigma =
+      cli_options.patch_match_ncc_sigma;
+  patch_match_options.source_selection.previous_probability_weight =
+      cli_options.patch_match_previous_selection_probability_weight;
+  patch_match_options.source_selection.min_probability =
+      cli_options.patch_match_min_selection_probability;
+  patch_match_options.source_selection.max_probability =
+      cli_options.patch_match_max_selection_probability;
   patch_match_options.perturbation.num_samples_per_pixel =
       cli_options.patch_match_perturbation_samples;
   patch_match_options.cost.min_num_valid_sources =
@@ -884,8 +1479,13 @@ std::size_t RunPatchMatchForWorkspace(
       cli_options.patch_match_geometric_refinement_iterations;
   refinement_options.cost.geometric_consistency_weight =
       cli_options.patch_match_geometric_consistency_weight;
+  refinement_options.cost.geometric_max_reprojection_error = 3.0F;
   refinement_options.cost.geometric_max_relative_depth_error =
       cli_options.patch_match_geometric_max_relative_depth_error;
+  // COLMAP treats geometry as a soft forward-backward reprojection cost. It
+  // does not reject every candidate with an occluded or conflicting source.
+  refinement_options.cost.geometric_reject_occluded_candidates = false;
+  refinement_options.cost.geometric_reject_depth_conflicts = false;
 
   const std::filesystem::path depth_dir =
       output_path / "stereo" / "depth_maps";
@@ -894,6 +1494,8 @@ std::size_t RunPatchMatchForWorkspace(
   const std::filesystem::path cost_dir = output_path / "stereo" / "cost_maps";
   const std::filesystem::path consistency_dir =
       output_path / "stereo" / "consistency_graphs";
+  const std::filesystem::path colmap_consistency_dir =
+      output_path / "stereo" / "consistency_graphs_colmap";
   std::filesystem::create_directories(output_path / "stereo");
   const bool binary_dense_maps = UseBinaryDenseMaps(cli_options);
 
@@ -908,11 +1510,34 @@ std::size_t RunPatchMatchForWorkspace(
       PreloadMvsImages(required_image_ids, &workspace);
   const std::unordered_map<ImageId, mvs::PatchMatchView> views =
       BuildPatchMatchViews(reconstruction, images);
+  CudaWorkspacePool cuda_workspaces =
+      CreateCudaWorkspacePool(patch_match_options, cli_options,
+                              image_summaries.size());
+  std::vector<mvs::CudaPatchMatchWorkspace*> cuda_workspace_ptrs;
+  cuda_workspace_ptrs.reserve(cuda_workspaces.size());
+  for (const mvs::CudaPatchMatchWorkspacePtr& workspace_ptr :
+       cuda_workspaces) {
+    cuda_workspace_ptrs.push_back(workspace_ptr.get());
+  }
+  if (scheduling_summary_out != nullptr &&
+      patch_match_options.backend != mvs::PatchMatchBackend::kCpu &&
+      !image_summaries.empty()) {
+    std::string unavailable_reason;
+    scheduling_summary_out->cuda_warmup_time_ms =
+        mvs::WarmupCudaPatchMatch(patch_match_options.cuda_gpu_index,
+                                  &unavailable_reason);
+    if (!unavailable_reason.empty() &&
+        patch_match_options.backend == mvs::PatchMatchBackend::kCuda) {
+      throw std::runtime_error(unavailable_reason);
+    }
+  }
 
   std::vector<PatchMatchWorkspaceResult> results =
       RunInitialPatchMatchForWorkspace(
           image_summaries, images, views, patch_match_options, cli_options,
-          binary_dense_maps, run_geometric_refinement);
+          binary_dense_maps, run_geometric_refinement, cuda_workspace_ptrs,
+          scheduling_summary_out);
+  WriteInitialPatchMatchDiagnostics(output_path, results);
   std::unordered_map<ImageId, std::size_t> result_index_by_image_id;
   for (std::size_t i = 0; i < results.size(); ++i) {
     total_photometric_filtered_pixels +=
@@ -920,31 +1545,58 @@ std::size_t RunPatchMatchForWorkspace(
     total_normal_refined_pixels +=
         results[i].result.summary.num_normal_refined_pixels;
     result_index_by_image_id[results[i].image_id] = i;
+    if (scheduling_summary_out != nullptr &&
+        results[i].photometric_stats_deferred) {
+      ++scheduling_summary_out->initial_deferred_photometric_stats_images;
+    }
   }
   num_patch_match_images = results.size();
+  std::vector<ImageId> image_ids_by_mvs_index;
+  image_ids_by_mvs_index.reserve(results.size());
+  for (const PatchMatchWorkspaceResult& result : results) {
+    image_ids_by_mvs_index.push_back(result.image_id);
+  }
 
   if (run_geometric_refinement) {
-    for (PatchMatchWorkspaceResult& result : results) {
-      std::vector<mvs::PatchMatchView> source_views;
-      std::vector<mvs::MvsImage> source_images;
-      std::vector<mvs::DenseDepthMap> source_depth_maps;
+    std::vector<mvs::DenseDepthMap> initial_depth_maps;
+    initial_depth_maps.reserve(results.size());
+    for (const PatchMatchWorkspaceResult& result : results) {
+      initial_depth_maps.push_back(result.result.depth_map);
+    }
+    std::vector<PatchMatchRefinementJob> refinement_jobs;
+    refinement_jobs.reserve(results.size());
+    for (std::size_t result_idx = 0; result_idx < results.size();
+         ++result_idx) {
+      const PatchMatchWorkspaceResult& result = results[result_idx];
+      PatchMatchRefinementJob job;
+      job.result_index = result_idx;
+      job.reference_view = result.view;
+      job.reference_image = result.image;
+      job.min_depth = result.min_depth;
+      job.max_depth = result.max_depth;
       for (const ImageId source_id : result.source_image_ids) {
         const auto it = result_index_by_image_id.find(source_id);
         if (it == result_index_by_image_id.end()) {
           continue;
         }
         const PatchMatchWorkspaceResult& source_result = results[it->second];
-        source_views.push_back(source_result.view);
-        source_images.push_back(source_result.image);
-        source_depth_maps.push_back(source_result.result.depth_map);
+        job.source_views.push_back(source_result.view);
+        job.source_images.push_back(source_result.image);
+        job.source_depth_maps.push_back(initial_depth_maps[it->second]);
       }
-      if (source_views.empty()) {
+      if (job.source_views.empty()) {
         continue;
       }
-      result.result = mvs::RunPatchMatchStereoForImageWithSourceDepths(
-          result.view, source_views, result.image, source_images,
-          source_depth_maps, result.min_depth, result.max_depth,
-          refinement_options);
+      refinement_jobs.push_back(std::move(job));
+    }
+    std::vector<PatchMatchRefinementResult> refinement_results =
+        RunPatchMatchRefinementJobs(refinement_jobs, refinement_options,
+                                    cli_options, cuda_workspace_ptrs,
+                                    scheduling_summary_out);
+    for (PatchMatchRefinementResult& refinement_result :
+         refinement_results) {
+      results[refinement_result.result_index].result =
+          std::move(refinement_result.result);
     }
 
     total_photometric_filtered_pixels = 0;
@@ -982,7 +1634,20 @@ std::size_t RunPatchMatchForWorkspace(
     geometric_options.max_relative_depth_error =
         cli_options.geometric_max_relative_depth_error;
 
-    for (PatchMatchWorkspaceResult& result : results) {
+    // Every consistency graph must observe the same unfiltered geometric
+    // refinement result. Filtering results in-place while iterating makes the
+    // output depend on image order and causes invalid pixels to cascade into
+    // later source-depth lookups.
+    std::vector<mvs::DenseDepthMap> geometric_source_depth_maps;
+    geometric_source_depth_maps.reserve(results.size());
+    for (const PatchMatchWorkspaceResult& result : results) {
+      geometric_source_depth_maps.push_back(result.result.depth_map);
+    }
+
+    std::vector<mvs::ConsistencyGraph> geometric_graphs;
+    geometric_graphs.reserve(results.size());
+
+    for (const PatchMatchWorkspaceResult& result : results) {
       std::vector<mvs::PatchMatchView> source_views;
       std::vector<mvs::DenseDepthMap> source_depth_maps;
       for (const ImageId source_id : result.source_image_ids) {
@@ -992,12 +1657,19 @@ std::size_t RunPatchMatchForWorkspace(
         }
         const PatchMatchWorkspaceResult& source_result = results[it->second];
         source_views.push_back(source_result.view);
-        source_depth_maps.push_back(source_result.result.depth_map);
+        source_depth_maps.push_back(geometric_source_depth_maps[it->second]);
       }
-      mvs::ConsistencyGraph graph =
-          mvs::ComputeGeometricConsistencyGraph(
-              result.view, source_views, result.result.depth_map,
-              source_depth_maps, geometric_options);
+      geometric_graphs.push_back(mvs::ComputeGeometricConsistencyGraph(
+          result.view, source_views,
+          geometric_source_depth_maps[result_index_by_image_id.at(
+              result.image_id)],
+          source_depth_maps, geometric_options));
+    }
+
+    for (std::size_t result_idx = 0; result_idx < results.size();
+         ++result_idx) {
+      PatchMatchWorkspaceResult& result = results[result_idx];
+      mvs::ConsistencyGraph& graph = geometric_graphs[result_idx];
       result.geometric_consistent_pixels = graph.NumConsistentPixels(1);
       total_geometric_consistent_pixels +=
           result.geometric_consistent_pixels;
@@ -1014,6 +1686,9 @@ std::size_t RunPatchMatchForWorkspace(
             result.geometric_filtered_pixels;
       }
       result.consistency_graph = graph;
+      mvs::WriteConsistencyGraphColmapBinary(
+          colmap_consistency_dir / result.dense_file_name, graph,
+          image_ids_by_mvs_index);
       if (binary_dense_maps) {
         mvs::WriteConsistencyGraphBinary(
             consistency_dir / result.dense_file_name, graph);
@@ -1074,6 +1749,9 @@ std::size_t RunPatchMatchForWorkspace(
     fusion_summary = fusion.summary;
     WriteFusedPointCloudPly(output_path / "dense" / "fused.ply",
                             fusion.points);
+    mvs::WritePointsVisibilityColmapBinary(
+        output_path / "dense" / "points_visibility.bin",
+        fusion.points_visibility);
     WriteFusionTracksDiagnostics(output_path / "dense" / "fusion_tracks.tsv",
                                   fusion.tracks);
     WriteFusionImagePairsDiagnostics(
@@ -1088,6 +1766,115 @@ std::size_t RunPatchMatchForWorkspace(
     mvs::WriteFusionTrackQualityStats(
         output_path / "dense" / "fusion_summary.txt",
         mvs::ComputeFusionTrackQualityStats(fusion.tracks));
+    mvs::MeshSimplificationOptions simplification_options;
+    simplification_options.target_ratio =
+        cli_options.mesh_simplification_ratio;
+    simplification_options.target_num_triangles =
+        cli_options.mesh_simplification_target_triangles;
+    simplification_options.max_error =
+        cli_options.mesh_simplification_max_error;
+    simplification_options.preserve_boundary =
+        cli_options.mesh_simplification_preserve_boundary;
+    simplification_options.max_normal_change_degrees =
+        cli_options.mesh_simplification_max_normal_change_degrees;
+    mvs::MeshTexturingOptions texturing_options;
+    texturing_options.atlas_size = cli_options.texture_atlas_size;
+    texturing_options.max_atlas_size = cli_options.texture_max_atlas_size;
+    texturing_options.atlas_patch_padding =
+        cli_options.texture_patch_padding;
+    texturing_options.inpaint_radius = cli_options.texture_inpaint_radius;
+    texturing_options.texture_scale = cli_options.texture_scale;
+    texturing_options.min_cos_normal_angle =
+        cli_options.texture_min_cos_normal_angle;
+    texturing_options.min_visible_vertices =
+        cli_options.texture_min_visible_vertices;
+    texturing_options.view_selection_smoothing_iterations =
+        cli_options.texture_view_smoothing_iterations;
+    texturing_options.visibility_resolution =
+        cli_options.texture_visibility_resolution;
+    texturing_options.occlusion_relative_tolerance =
+        cli_options.texture_occlusion_relative_tolerance;
+    texturing_options.apply_color_correction =
+        cli_options.texture_apply_color_correction;
+    texturing_options.color_correction_regularization =
+        cli_options.texture_color_correction_regularization;
+    texturing_options.num_threads = static_cast<int>(cli_options.num_threads);
+    std::vector<mvs::MeshTextureView> texture_views;
+    if (cli_options.mesh_texturer) {
+      texture_views = LoadMeshTextureViews(reconstruction, fusion_views,
+                                           cli_options.image_path);
+    }
+    const auto write_textured_mesh =
+        [&](const mvs::DenseTriangleMesh& mesh, const std::string& name) {
+          if (!cli_options.mesh_texturer) return;
+          const mvs::TexturedTriangleMesh textured =
+              mvs::TextureMesh(mesh, texture_views, texturing_options);
+          mvs::WriteTexturedTriangleMesh(
+              output_path / "dense" / ("textured-" + name), textured);
+        };
+    if (cli_options.poisson_mesher) {
+      mvs::PoissonMeshingOptions options;
+      options.point_weight = cli_options.poisson_point_weight;
+      options.depth = cli_options.poisson_depth;
+      options.color = cli_options.poisson_color;
+      options.trim = cli_options.poisson_trim;
+      options.num_threads = static_cast<int>(cli_options.num_threads);
+      if (!mvs::PoissonMeshing(options, output_path / "dense" / "fused.ply",
+                               output_path / "dense" /
+                                   "meshed-poisson.ply")) {
+        throw std::runtime_error("Poisson meshing failed.");
+      }
+      if (cli_options.mesh_simplifier || cli_options.mesh_texturer) {
+        mvs::DenseTriangleMesh output_mesh = mvs::ReadDenseTriangleMeshPly(
+            output_path / "dense" / "meshed-poisson.ply");
+        if (cli_options.mesh_simplifier) {
+          output_mesh =
+              mvs::SimplifyMesh(output_mesh, simplification_options);
+          mvs::WriteDenseTriangleMeshPly(
+              output_path / "dense" / "meshed-poisson-simplified.ply",
+              output_mesh);
+          mvs::WriteDenseTriangleMeshStats(
+              output_path / "dense" /
+                  "meshed-poisson-simplified-stats.txt",
+              mvs::ComputeDenseTriangleMeshStats(output_mesh));
+        }
+        write_textured_mesh(output_mesh, "poisson");
+      }
+    }
+    if (cli_options.delaunay_mesher) {
+      mvs::DelaunayMeshingOptions options;
+      options.max_proj_dist = cli_options.delaunay_max_proj_dist;
+      options.max_depth_dist = cli_options.delaunay_max_depth_dist;
+      options.visibility_sigma = cli_options.delaunay_visibility_sigma;
+      options.distance_sigma_factor =
+          cli_options.delaunay_distance_sigma_factor;
+      options.quality_regularization =
+          cli_options.delaunay_quality_regularization;
+      options.max_side_length_factor =
+          cli_options.delaunay_max_side_length_factor;
+      options.max_side_length_percentile =
+          cli_options.delaunay_max_side_length_percentile;
+      options.num_threads = static_cast<int>(cli_options.num_threads);
+      const mvs::DenseTriangleMesh mesh = mvs::DelaunayMeshing(
+          options, fusion.points, fusion.points_visibility, fusion_views);
+      mvs::WriteDenseTriangleMeshPly(
+          output_path / "dense" / "meshed-delaunay.ply", mesh);
+      mvs::WriteDenseTriangleMeshStats(
+          output_path / "dense" / "meshed-delaunay-stats.txt",
+          mvs::ComputeDenseTriangleMeshStats(mesh));
+      mvs::DenseTriangleMesh output_mesh = mesh;
+      if (cli_options.mesh_simplifier) {
+        output_mesh = mvs::SimplifyMesh(mesh, simplification_options);
+        mvs::WriteDenseTriangleMeshPly(
+            output_path / "dense" / "meshed-delaunay-simplified.ply",
+            output_mesh);
+        mvs::WriteDenseTriangleMeshStats(
+            output_path / "dense" /
+                "meshed-delaunay-simplified-stats.txt",
+            mvs::ComputeDenseTriangleMeshStats(output_mesh));
+      }
+      write_textured_mesh(output_mesh, "delaunay");
+    }
     if (cli_options.filter_dense_cloud) {
       mvs::DenseCloudFilterOptions filter_options;
       filter_options.min_track_observations =
@@ -1115,17 +1902,36 @@ std::size_t RunPatchMatchForWorkspace(
         mvs::WriteDenseTriangleMeshStats(
             output_path / "dense" / "mesh_stats.txt",
             mvs::ComputeDenseTriangleMeshStats(mesh));
+        mvs::DenseTriangleMesh output_mesh = mesh;
+        if (cli_options.mesh_simplifier) {
+          output_mesh = mvs::SimplifyMesh(mesh, simplification_options);
+          mvs::WriteDenseTriangleMeshPly(
+              output_path / "dense" / "mesh-simplified.ply", output_mesh);
+          mvs::WriteDenseTriangleMeshStats(
+              output_path / "dense" / "mesh-simplified-stats.txt",
+              mvs::ComputeDenseTriangleMeshStats(output_mesh));
+        }
+        write_textured_mesh(output_mesh, "mesh");
       }
     }
   }
 
   std::ofstream diagnostics(output_path / "stereo" / "patch_match.tsv");
   diagnostics << "image_id\trequested_backend\tactual_backend"
-              << "\tpyramid_levels\titerations\tvalid_cost_pixels\tcandidate_evaluations"
+              << "\tpyramid_levels\titerations"
+              << "\tbilateral_ncc\tsigma_spatial\tsigma_color"
+              << "\tdynamic_source_selection\tncc_sigma"
+              << "\tprevious_selection_probability_weight"
+              << "\tmin_selection_probability"
+              << "\tmax_selection_probability"
+              << "\tvalid_cost_pixels\tcandidate_evaluations"
+              << "\tplane_propagation_candidates"
+              << "\tperturbation_candidate_evaluations"
               << "\tpropagation_updates\tperturbation_updates"
               << "\tsource_selection_tests"
               << "\tsource_selection_acceptances"
               << "\tsource_selection_rejections"
+              << "\tsource_selection_probability_updates"
               << "\tperturbation_mean_abs_depth_update"
               << "\tperturbation_max_abs_depth_update"
               << "\tperturbation_mean_normal_angle_degrees"
@@ -1135,6 +1941,46 @@ std::size_t RunPatchMatchForWorkspace(
               << "\tforward_sweeps\tbackward_sweeps"
               << "\ttop_down_sweeps\tbottom_up_sweeps"
               << "\tcheckerboard_passes"
+              << "\tcuda_upload_time_ms"
+              << "\tcuda_initialization_time_ms"
+              << "\tcuda_evaluate_cost_time_ms"
+              << "\tcuda_propagation_time_ms"
+              << "\tcuda_perturbation_time_ms"
+              << "\tcuda_download_time_ms"
+              << "\tcuda_total_time_ms"
+              << "\tcuda_wrapper_total_time_ms"
+              << "\tcuda_request_validation_time_ms"
+              << "\tcuda_pyramid_resize_time_ms"
+              << "\tcuda_host_pack_time_ms"
+              << "\tcuda_single_scale_dispatch_time_ms"
+              << "\tcuda_result_materialization_time_ms"
+              << "\tcuda_output_to_vector_time_ms"
+              << "\tcuda_dense_map_fill_time_ms"
+              << "\tcuda_normal_refinement_time_ms"
+              << "\tcuda_valid_cost_count_time_ms"
+              << "\tcuda_host_initial_normal_upload_normalizations"
+              << "\tcuda_host_output_normalizations"
+              << "\tcuda_device_count_queries"
+              << "\tcuda_device_count_cache_hits"
+              << "\tcuda_shared_reference_tile_pixels"
+              << "\tcuda_workspace_texture_allocations"
+              << "\tcuda_workspace_texture_reuses"
+              << "\tcuda_workspace_buffer_allocations"
+              << "\tcuda_workspace_buffer_reuses"
+              << "\tcuda_iteration_counter_snapshots"
+              << "\tcuda_iteration_counter_readbacks"
+              << "\tcuda_packed_output_pixels"
+              << "\tcuda_output_map_readbacks"
+              << "\tcuda_async_host_uploads"
+              << "\tcuda_async_texture_uploads"
+              << "\tcuda_async_counter_readbacks"
+              << "\tcuda_async_output_readbacks"
+              << "\tcuda_pinned_host_upload_bytes"
+              << "\tcuda_pinned_texture_upload_bytes"
+              << "\tcuda_pinned_host_staging_bytes"
+              << "\tcuda_stream_kernel_launches"
+              << "\tcuda_workspace_pool_size"
+              << "\tcuda_workspace_pool_slot"
               << "\titeration_levels"
               << "\titeration_indices"
               << "\titeration_candidate_evaluations"
@@ -1143,6 +1989,8 @@ std::size_t RunPatchMatchForWorkspace(
               << "\titeration_source_selection_tests"
               << "\titeration_source_selection_acceptances"
               << "\titeration_source_selection_rejections"
+              << "\titeration_source_selection_probability_means"
+              << "\tfinal_source_selection_probability_means"
               << "\tnormal_refinement_pixels"
               << "\tnormal_refined_pixels"
               << "\tnormal_refinement_skipped_pixels"
@@ -1178,14 +2026,43 @@ std::size_t RunPatchMatchForWorkspace(
                 << "\t"
                 << result.result.summary.num_pyramid_levels << "\t"
                 << result.result.summary.num_iterations << "\t"
+                << (cli_options.patch_match_bilateral_ncc ? 1 : 0) << "\t"
+                << FormatStat(
+                       cli_options.patch_match_sigma_spatial > 0.0F
+                           ? cli_options.patch_match_sigma_spatial
+                           : static_cast<float>(std::max(
+                                 1, cli_options.patch_match_window_radius)))
+                << "\t"
+                << FormatStat(cli_options.patch_match_sigma_color) << "\t"
+                << (cli_options.patch_match_dynamic_source_selection ? 1 : 0)
+                << "\t"
+                << FormatStat(cli_options.patch_match_ncc_sigma) << "\t"
+                << FormatStat(
+                       cli_options
+                           .patch_match_previous_selection_probability_weight)
+                << "\t"
+                << FormatStat(
+                       cli_options.patch_match_min_selection_probability)
+                << "\t"
+                << FormatStat(
+                       cli_options.patch_match_max_selection_probability)
+                << "\t"
                 << result.result.summary.num_valid_cost_pixels << "\t"
                 << result.result.summary.num_candidate_evaluations << "\t"
+                << result.result.summary.num_plane_propagation_candidates
+                << "\t"
+                << result.result.summary
+                       .num_perturbation_candidate_evaluations
+                << "\t"
                 << result.result.summary.num_propagation_updates << "\t"
                 << result.result.summary.num_perturbation_updates << "\t"
                 << result.result.summary.num_source_selection_tests << "\t"
                 << result.result.summary.num_source_selection_acceptances
                 << "\t"
                 << result.result.summary.num_source_selection_rejections
+                << "\t"
+                << result.result.summary
+                       .num_source_selection_probability_updates
                 << "\t"
                 << FormatStat(
                        result.result.summary
@@ -1214,6 +2091,98 @@ std::size_t RunPatchMatchForWorkspace(
                 << result.result.summary.num_top_down_sweeps << "\t"
                 << result.result.summary.num_bottom_up_sweeps << "\t"
                 << result.result.summary.num_checkerboard_passes << "\t"
+                << FormatStat(result.result.summary.cuda_upload_time_ms)
+                << "\t"
+                << FormatStat(
+                       result.result.summary.cuda_initialization_time_ms)
+                << "\t"
+                << FormatStat(
+                       result.result.summary.cuda_evaluate_cost_time_ms)
+                << "\t"
+                << FormatStat(result.result.summary.cuda_propagation_time_ms)
+                << "\t"
+                << FormatStat(result.result.summary.cuda_perturbation_time_ms)
+                << "\t"
+                << FormatStat(result.result.summary.cuda_download_time_ms)
+                << "\t"
+                << FormatStat(result.result.summary.cuda_total_time_ms)
+                << "\t"
+                << FormatStat(
+                       result.result.summary.cuda_wrapper_total_time_ms)
+                << "\t"
+                << FormatStat(
+                       result.result.summary.cuda_request_validation_time_ms)
+                << "\t"
+                << FormatStat(
+                       result.result.summary.cuda_pyramid_resize_time_ms)
+                << "\t"
+                << FormatStat(result.result.summary.cuda_host_pack_time_ms)
+                << "\t"
+                << FormatStat(
+                       result.result.summary
+                           .cuda_single_scale_dispatch_time_ms)
+                << "\t"
+                << FormatStat(
+                       result.result.summary
+                           .cuda_result_materialization_time_ms)
+                << "\t"
+                << FormatStat(
+                       result.result.summary.cuda_output_to_vector_time_ms)
+                << "\t"
+                << FormatStat(
+                       result.result.summary.cuda_dense_map_fill_time_ms)
+                << "\t"
+                << FormatStat(
+                       result.result.summary.cuda_normal_refinement_time_ms)
+                << "\t"
+                << FormatStat(
+                       result.result.summary.cuda_valid_cost_count_time_ms)
+                << "\t"
+                << result.result.summary
+                       .cuda_host_initial_normal_upload_normalizations
+                << "\t"
+                << result.result.summary.cuda_host_output_normalizations
+                << "\t"
+                << result.result.summary.cuda_device_count_queries << "\t"
+                << result.result.summary.cuda_device_count_cache_hits
+                << "\t"
+                << result.result.summary.cuda_shared_reference_tile_pixels
+                << "\t"
+                << result.result.summary.cuda_workspace_texture_allocations
+                << "\t"
+                << result.result.summary.cuda_workspace_texture_reuses << "\t"
+                << result.result.summary.cuda_workspace_buffer_allocations
+                << "\t"
+                << result.result.summary.cuda_workspace_buffer_reuses
+                << "\t"
+                << result.result.summary.cuda_iteration_counter_snapshots
+                << "\t"
+                << result.result.summary.cuda_iteration_counter_readbacks
+                << "\t"
+                << result.result.summary.cuda_packed_output_pixels
+                << "\t"
+                << result.result.summary.cuda_output_map_readbacks
+                << "\t"
+                << result.result.summary.cuda_async_host_uploads
+                << "\t"
+                << result.result.summary.cuda_async_texture_uploads
+                << "\t"
+                << result.result.summary.cuda_async_counter_readbacks
+                << "\t"
+                << result.result.summary.cuda_async_output_readbacks
+                << "\t"
+                << result.result.summary.cuda_pinned_host_upload_bytes
+                << "\t"
+                << result.result.summary.cuda_pinned_texture_upload_bytes
+                << "\t"
+                << result.result.summary.cuda_pinned_host_staging_bytes
+                << "\t"
+                << result.result.summary.cuda_stream_kernel_launches
+                << "\t"
+                << result.result.summary.cuda_workspace_pool_size
+                << "\t"
+                << result.result.summary.cuda_workspace_pool_slot
+                << "\t"
                 << JoinDiagnosticVector(
                        result.result.summary.iteration_pyramid_levels)
                 << "\t"
@@ -1240,6 +2209,14 @@ std::size_t RunPatchMatchForWorkspace(
                 << JoinDiagnosticVector(
                        result.result.summary
                            .iteration_source_selection_rejections)
+                << "\t"
+                << JoinDiagnosticVector(
+                       result.result.summary
+                           .iteration_source_selection_probability_means)
+                << "\t"
+                << JoinDiagnosticVector(
+                       result.result.summary
+                           .final_source_selection_probability_means)
                 << "\t"
                 << result.result.summary.num_normal_refinement_pixels << "\t"
                 << result.result.summary.num_normal_refined_pixels << "\t"
@@ -1285,12 +2262,119 @@ std::size_t RunPatchMatchForWorkspace(
   return num_patch_match_images;
 }
 
+mvs::StereoFusionSummary FusePersistedStereoMaps(
+    const std::filesystem::path& output_path,
+    const ReconMvsControllerOptions& cli_options,
+    const Reconstruction& reconstruction,
+    const mvs::MvsPipelineSummary& summary) {
+  mvs::MvsImageWorkspaceOptions workspace_options;
+  workspace_options.image_path = cli_options.image_path;
+  workspace_options.max_cache_entries = cli_options.image_cache_size;
+  workspace_options.max_image_size = cli_options.max_image_size;
+  mvs::MvsImageWorkspace workspace(reconstruction, workspace_options);
+
+  const std::vector<const mvs::ImageMvsSummary*> image_summaries =
+      CollectPatchMatchSummaries(summary);
+  const std::vector<ImageId> required_image_ids =
+      CollectRequiredMvsImageIds(image_summaries);
+  const auto images = PreloadMvsImages(required_image_ids, &workspace);
+  const auto views = BuildPatchMatchViews(reconstruction, images);
+  const bool binary = UseBinaryDenseMaps(cli_options);
+
+  std::vector<mvs::PatchMatchView> fusion_views;
+  std::vector<mvs::MvsImage> fusion_images;
+  std::vector<mvs::DenseDepthMap> depth_maps;
+  std::vector<mvs::NormalMap> normal_maps;
+  std::vector<mvs::DenseCostMap> cost_maps;
+  std::vector<mvs::ConsistencyGraph> consistency_graphs;
+  std::vector<ImageId> image_ids;
+  for (const auto* image_summary : image_summaries) {
+    const mvs::MvsImage& image = images.at(image_summary->image_id);
+    const std::string dense_name =
+        DenseMapFileName(image.name, false, binary);
+    const auto depth_path = output_path / "stereo" / "depth_maps" / dense_name;
+    const auto normal_path = output_path / "stereo" / "normal_maps" / dense_name;
+    const auto cost_path = output_path / "stereo" / "cost_maps" /
+                           (image.name + ".txt");
+    fusion_views.push_back(views.at(image_summary->image_id));
+    fusion_images.push_back(image);
+    depth_maps.push_back(binary ? mvs::ReadDenseDepthMapBinary(depth_path)
+                                : mvs::ReadDenseDepthMapText(depth_path));
+    normal_maps.push_back(binary ? mvs::ReadNormalMapBinary(normal_path)
+                                 : mvs::ReadNormalMapText(normal_path));
+    cost_maps.push_back(mvs::ReadDenseCostMapText(cost_path));
+    image_ids.push_back(image_summary->image_id);
+  }
+  for (std::size_t i = 0; i < fusion_images.size(); ++i) {
+    const std::string dense_name =
+        DenseMapFileName(fusion_images[i].name, false, binary);
+    const auto native_path = output_path / "stereo" /
+                             "consistency_graphs" / dense_name;
+    const auto colmap_path = output_path / "stereo" /
+                             "consistency_graphs_colmap" / dense_name;
+    if (std::filesystem::exists(native_path) && binary) {
+      consistency_graphs.push_back(
+          mvs::ReadConsistencyGraphBinary(native_path));
+    } else if (std::filesystem::exists(colmap_path)) {
+      consistency_graphs.push_back(
+          mvs::ReadConsistencyGraphColmapBinary(colmap_path, image_ids));
+    } else {
+      consistency_graphs.emplace_back(depth_maps[i].Width(),
+                                      depth_maps[i].Height());
+    }
+  }
+
+  mvs::StereoFusionOptions options;
+  options.min_num_consistent_sources =
+      cli_options.filter_geometric_min_num_consistent_sources > 0
+          ? cli_options.filter_geometric_min_num_consistent_sources
+          : 1;
+  options.min_num_fused_observations = cli_options.fusion_min_num_observations;
+  options.max_num_fused_observations = cli_options.fusion_max_num_observations;
+  options.max_traversal_depth = cli_options.fusion_max_traversal_depth;
+  options.max_reprojection_error_pixels =
+      cli_options.fusion_max_reprojection_error_pixels;
+  options.max_relative_depth_error = cli_options.fusion_max_relative_depth_error;
+  options.max_normal_error_degrees = cli_options.fusion_max_normal_error_degrees;
+  options.max_view_angle_degrees = cli_options.fusion_max_view_angle_degrees;
+  options.source_pixel_search_radius =
+      cli_options.fusion_source_pixel_search_radius;
+  const mvs::StereoFusionResult fusion = mvs::FuseStereoDepthMaps(
+      fusion_views, fusion_images, depth_maps, normal_maps, cost_maps,
+      consistency_graphs, options);
+  WriteFusedPointCloudPly(output_path / "dense" / "fused.ply", fusion.points);
+  mvs::WritePointsVisibilityColmapBinary(
+      output_path / "dense" / "points_visibility.bin",
+      fusion.points_visibility);
+  WriteFusionTracksDiagnostics(output_path / "dense" / "fusion_tracks.tsv",
+                                fusion.tracks);
+  WriteFusionImagePairsDiagnostics(
+      output_path / "dense" / "fusion_image_pairs.tsv",
+      fusion.pair_diagnostics);
+  WriteFusionTrackLengthHistogram(
+      output_path / "dense" / "fusion_track_lengths.tsv", fusion.tracks);
+  WriteFusionErrorDistribution(
+      output_path / "dense" / "fusion_error_distribution.tsv",
+      fusion.error_samples);
+  mvs::WriteFusionTrackQualityStats(
+      output_path / "dense" / "fusion_summary.txt",
+      mvs::ComputeFusionTrackQualityStats(fusion.tracks));
+  return fusion.summary;
+}
+
 }  // namespace
 
 int ReconMvsController::Run(std::ostream& out) const {
-  const ReconMvsControllerOptions& cli_options = options_;
-  const Reconstruction reconstruction =
-      ReadColmapTextModel(cli_options.model_path);
+  ReconMvsControllerOptions cli_options = options_;
+  Reconstruction reconstruction = ReadColmapTextModel(cli_options.model_path);
+  const std::filesystem::path output_path(cli_options.output_path);
+  std::size_t num_undistorted_images = 0;
+  if (cli_options.image_undistorter) {
+    num_undistorted_images =
+        UndistortWorkspaceImages(cli_options, output_path, &reconstruction);
+    cli_options.image_path = output_path / "undistorted" / "images";
+    cli_options.max_image_size = -1;
+  }
 
   mvs::MvsPipelineOptions mvs_options;
   mvs_options.max_num_source_images = cli_options.max_num_source_images;
@@ -1310,7 +2394,6 @@ int ReconMvsController::Run(std::ostream& out) const {
   const mvs::MvsPipelineSummary summary =
       mvs::RunMvsPipeline(reconstruction, mvs_options);
 
-  const std::filesystem::path output_path(cli_options.output_path);
   std::size_t num_initialized_patch_match_images = 0;
   if (cli_options.initialize_patch_match) {
     num_initialized_patch_match_images = InitializePatchMatchMapsForWorkspace(
@@ -1321,23 +2404,30 @@ int ReconMvsController::Run(std::ostream& out) const {
   std::size_t num_normal_refined_pixels = 0;
   std::size_t num_geometric_consistent_pixels = 0;
   std::size_t num_geometric_filtered_pixels = 0;
+  PatchMatchSchedulingSummary scheduling_summary;
   mvs::StereoFusionSummary fusion_summary;
   if (cli_options.run_patch_match) {
     num_patch_match_images = RunPatchMatchForWorkspace(
         output_path, cli_options, reconstruction, summary,
         &num_photometric_filtered_pixels, &num_normal_refined_pixels,
         &num_geometric_consistent_pixels, &num_geometric_filtered_pixels,
-        &fusion_summary);
+        &scheduling_summary, &fusion_summary);
+  } else if (cli_options.fuse_stereo) {
+    fusion_summary = FusePersistedStereoMaps(
+        output_path, cli_options, reconstruction, summary);
   }
 
-  WriteMvsSummary(output_path, summary, num_initialized_patch_match_images,
-                  num_patch_match_images, num_photometric_filtered_pixels,
-                  num_normal_refined_pixels, num_geometric_consistent_pixels,
-                  num_geometric_filtered_pixels, fusion_summary);
+  WriteMvsSummary(output_path, summary, num_undistorted_images,
+                  num_initialized_patch_match_images, num_patch_match_images,
+                  num_photometric_filtered_pixels, num_normal_refined_pixels,
+                  num_geometric_consistent_pixels,
+                  num_geometric_filtered_pixels, scheduling_summary,
+                  fusion_summary);
   WriteSourceImages(output_path, summary);
   WriteSparseDepthSamples(output_path, summary);
 
   out << "Images: " << summary.num_images << "\n"
+      << "Undistorted images: " << num_undistorted_images << "\n"
       << "Sparse depth samples: " << summary.num_sparse_depth_samples << "\n"
       << "Initialized PatchMatch images: "
       << num_initialized_patch_match_images << "\n"

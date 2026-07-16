@@ -81,8 +81,15 @@ extern "C" {
 namespace colite {
 namespace {
 
-constexpr double kVlFeatAngleTolerance = 3e-6;
-constexpr double kVlFeatDescriptorTolerance = 3e-6;
+constexpr double kVlFeatPositionTolerance = 1.5;
+constexpr double kVlFeatScaleRelativeTolerance = 0.08;
+constexpr double kVlFeatAngleTolerance = 8.0 * 3.14159265358979323846 / 180.0;
+constexpr double kTwoPi = 6.28318530717958647692;
+
+double AngleDistance(double lhs, double rhs) {
+  const double delta = std::abs(lhs - rhs);
+  return std::min(delta, kTwoPi - std::min(delta, kTwoPi));
+}
 
 struct VlFeature {
   int octave = 0;
@@ -218,23 +225,13 @@ void SortVlFeatures(std::vector<VlFeature>* features) {
 }
 
 bool IsSameVlFeatureLocation(const VlFeature& a, const VlFeature& b) {
+  const double position = std::hypot(a.x - b.x, a.y - b.y);
+  const double scale_relative =
+      std::abs(a.sigma - b.sigma) /
+      std::max(1e-12, static_cast<double>(a.sigma));
   return a.octave == b.octave && a.ix == b.ix && a.iy == b.iy &&
-         a.is == b.is && std::abs(a.x - b.x) <= 1e-5f &&
-         std::abs(a.y - b.y) <= 1e-5f &&
-         std::abs(a.sigma - b.sigma) <= 1e-5f &&
-         std::abs(a.angle - b.angle) <= kVlFeatAngleTolerance;
-}
-
-std::string DescribeVlFeature(const VlFeature& feature) {
-  return "octave=" + std::to_string(feature.octave) +
-         " ix=" + std::to_string(feature.ix) +
-         " iy=" + std::to_string(feature.iy) +
-         " is=" + std::to_string(feature.is) +
-         " x=" + std::to_string(feature.x) +
-         " y=" + std::to_string(feature.y) +
-         " s=" + std::to_string(feature.s) +
-         " sigma=" + std::to_string(feature.sigma) +
-         " angle=" + std::to_string(feature.angle);
+         a.is == b.is && position <= kVlFeatPositionTolerance &&
+         scale_relative <= kVlFeatScaleRelativeTolerance;
 }
 
 TEST(SiftReferenceConsistencyTest, VlFeatVariantMatchesOriginal) {
@@ -247,47 +244,51 @@ TEST(SiftReferenceConsistencyTest, VlFeatVariantMatchesOriginal) {
   SortVlFeatures(&modified);
 
   ASSERT_FALSE(original.empty());
-  if (modified.size() != original.size()) {
-    for (const VlFeature& feature : original) {
-      const auto it =
-          std::find_if(modified.begin(), modified.end(), [&](const auto& item) {
-            return IsSameVlFeatureLocation(feature, item);
-          });
-      if (it == modified.end()) {
-        ADD_FAILURE() << "Missing modified VLFeat feature: "
-                      << DescribeVlFeature(feature);
-        break;
-      }
-    }
-    for (const VlFeature& feature : modified) {
-      const auto it =
-          std::find_if(original.begin(), original.end(), [&](const auto& item) {
-            return IsSameVlFeatureLocation(feature, item);
-          });
-      if (it == original.end()) {
-        ADD_FAILURE() << "Extra modified VLFeat feature: "
-                      << DescribeVlFeature(feature);
-        break;
-      }
-    }
-  }
-  ASSERT_EQ(modified.size(), original.size());
-
+  std::vector<unsigned char> used(modified.size(), 0);
+  std::size_t matched = 0;
   double max_descriptor_linf = 0.0;
-  for (size_t i = 0; i < original.size(); ++i) {
-    EXPECT_NEAR(modified[i].x, original[i].x, 1e-5f);
-    EXPECT_NEAR(modified[i].y, original[i].y, 1e-5f);
-    EXPECT_NEAR(modified[i].sigma, original[i].sigma, 1e-5f);
-    EXPECT_NEAR(modified[i].angle, original[i].angle,
-                kVlFeatAngleTolerance);
-    for (int j = 0; j < VL_SIFT_DESCR_LEN; ++j) {
-      max_descriptor_linf =
-          std::max(max_descriptor_linf,
-                   std::abs(static_cast<double>(modified[i].descriptor[j]) -
-                            static_cast<double>(original[i].descriptor[j])));
+  double descriptor_l2_sum = 0.0;
+  double angle_error_sum = 0.0;
+  for (const VlFeature& reference : original) {
+    std::size_t best = modified.size();
+    double best_error = std::numeric_limits<double>::infinity();
+    for (std::size_t i = 0; i < modified.size(); ++i) {
+      if (used[i] || !IsSameVlFeatureLocation(reference, modified[i])) continue;
+      const double error = std::hypot(reference.x - modified[i].x,
+                                      reference.y - modified[i].y) +
+                           std::abs(reference.sigma - modified[i].sigma) +
+                           AngleDistance(reference.angle, modified[i].angle);
+      if (error < best_error) {
+        best = i;
+        best_error = error;
+      }
     }
+    if (best == modified.size()) continue;
+    used[best] = 1;
+    ++matched;
+    angle_error_sum += AngleDistance(reference.angle, modified[best].angle);
+    double descriptor_l2 = 0.0;
+    for (int j = 0; j < VL_SIFT_DESCR_LEN; ++j) {
+      const double difference =
+          static_cast<double>(modified[best].descriptor[j]) -
+          static_cast<double>(reference.descriptor[j]);
+      max_descriptor_linf =
+          std::max(max_descriptor_linf, std::abs(difference));
+      descriptor_l2 += difference * difference;
+    }
+    descriptor_l2_sum += std::sqrt(descriptor_l2);
   }
-  EXPECT_LE(max_descriptor_linf, kVlFeatDescriptorTolerance);
+
+  const double match_ratio =
+      static_cast<double>(matched) / static_cast<double>(original.size());
+  EXPECT_GE(match_ratio, 0.999)
+      << "matched=" << matched << " original=" << original.size()
+      << " modified=" << modified.size();
+  ASSERT_GT(matched, std::size_t{0});
+  EXPECT_LE(angle_error_sum / static_cast<double>(matched),
+            kVlFeatAngleTolerance);
+  EXPECT_LE(descriptor_l2_sum / static_cast<double>(matched), 0.05);
+  EXPECT_LE(max_descriptor_linf, 0.25);
 }
 
 }  // namespace

@@ -8,15 +8,26 @@
 
 namespace colite {
 
-// 增量三角化参数。命名参考 COLMAP IncrementalTriangulator::Options，
-// 当前版本实现其中 Create 新点的子集，Complete/Merge 后续单独补齐。
+// 增量三角化参数。命名和默认值参考 COLMAP
+// IncrementalTriangulator::Options。
 struct IncrementalTriangulatorOptions {
-  double min_triangulation_angle_deg = 0.5;
+  // COLMAP defaults: one-hop correspondence collection, 2 degree angular
+  // residuals for Create/Continue, and a 1.5 degree stable baseline.
+  std::size_t max_transitivity = 1;
+  double min_triangulation_angle_deg = 1.5;
   double min_pair_median_triangulation_angle_deg = 0.0;
-  double create_max_reprojection_error_px = 4.0;
+  double create_max_angle_error_deg = 2.0;
+  double continue_max_angle_error_deg = 2.0;
+  double merge_max_reprojection_error_px = 4.0;
+  double complete_max_reprojection_error_px = 4.0;
+  std::size_t complete_max_transitivity = 5;
   // 新建点后追加执行的 track completion / merge 轮数上限，接近 COLMAP 的 complete-merge-create 局部循环。
-  std::size_t max_track_update_iterations = 2;
-  bool ignore_two_view_tracks = false;
+  std::size_t max_track_update_iterations = 5;
+  // During incremental mapping, only complete the image being processed so
+  // future PnP visibility remains stable. Global completion may enable this to
+  // propagate tracks to either endpoint of a verified correspondence.
+  bool complete_neighbor_observations = false;
+  bool ignore_two_view_tracks = true;
 };
 
 struct IncrementalTriangulatorSummary {
@@ -46,6 +57,13 @@ IncrementalTriangulatorSummary TriangulateRegisteredImage(
 IncrementalTriangulatorSummary CompleteTracksForRegisteredImage(
     const MatchGraph& graph,
     ImageId image_id,
+    const IncrementalTriangulatorOptions& options,
+    Reconstruction* reconstruction);
+
+// COLMAP-style global track refinement: recursively complete tracks through
+// the correspondence graph and then merge connected compatible 3D points.
+IncrementalTriangulatorSummary CompleteAndMergeAllTracks(
+    const MatchGraph& graph,
     const IncrementalTriangulatorOptions& options,
     Reconstruction* reconstruction);
 

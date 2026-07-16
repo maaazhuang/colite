@@ -69,7 +69,8 @@ TEST(ReconSfmExeTest, PrintsHelp) {
             std::string::npos);
   EXPECT_NE(out.str().find("--registration_retry_max_error"),
             std::string::npos);
-  EXPECT_NE(out.str().find("cudasift"), std::string::npos);
+  EXPECT_NE(out.str().find("cuda_opencv"), std::string::npos);
+  EXPECT_NE(out.str().find("cuda_vlfeat"), std::string::npos);
   EXPECT_TRUE(err.str().empty());
 }
 
@@ -332,6 +333,7 @@ TEST(ReconSfmExeTest, WritesRegistrationDiagnosticsForMappingRounds) {
   registration.registration_attempts_before_success = 1;
   registration.registration_max_reprojection_error_px = 3.5;
   registration.registration.num_correspondences = 140;
+  registration.registration.num_ransac_inliers = 118;
   registration.registration.num_inliers = 120;
   registration.track_completion.num_completed_observations = 11;
   registration.track_completion.num_merged_points = 2;
@@ -366,6 +368,9 @@ TEST(ReconSfmExeTest, WritesRegistrationDiagnosticsForMappingRounds) {
   failure.candidate_num_verified_inliers_to_registered_images = 180;
   failure.candidate_score = 64200.0;
   failure.registration_max_reprojection_error_px = 6.0;
+  failure.registration_num_correspondences = 72;
+  failure.registration_num_ransac_inliers = 10;
+  failure.registration_num_inliers = 10;
   failure.message = "Not enough inliers";
   summary.failed_registrations.push_back(failure);
 
@@ -381,7 +386,7 @@ TEST(ReconSfmExeTest, WritesRegistrationDiagnosticsForMappingRounds) {
                 "\tcandidate_registered_neighbors"),
             std::string::npos);
   EXPECT_NE(diagnostics.find(
-                "2\t7\t128\t256\t2\t4\t512\t128500\t1\t3.5\t140\t120\t11\t2"
+                "2\t7\t128\t256\t2\t4\t512\t128500\t1\t3.5\t140\t118\t120\t11\t2"
                 "\t3\t23\t46\t5\t10\t1\t2\t2\t3\t2\t2\t6\t80\t260"
                 "\t1.25\t0.75\t3\t1"),
             std::string::npos);
@@ -392,7 +397,7 @@ TEST(ReconSfmExeTest, WritesRegistrationDiagnosticsForMappingRounds) {
                 "image_id\tattempt\tcandidate_visible_points"
                 "\tcandidate_visible_observations\tcandidate_mean_track_length"),
             std::string::npos);
-  EXPECT_NE(failures.find("9\t2\t64\t96\t1.5\t2\t180\t64200\t6\tNot enough inliers"),
+  EXPECT_NE(failures.find("9\t2\t64\t96\t1.5\t2\t180\t64200\t6\t72\t10\t10\tNot enough inliers"),
             std::string::npos);
 }
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <vector>
 
 #include "colite/core/feature.h"
@@ -27,6 +28,32 @@ struct DescriptorMatchingOptions {
   // 是否启用互检。启用后要求 A->B 的最佳匹配和 B->A 的最佳匹配互相一致。
   bool mutual_check = true;
 };
+
+// Pre-quantizes descriptors and, for FLANN, builds the search index once per
+// image so a batch matcher does not repeat this work for every image pair.
+class PreparedFeatureMatcher {
+ public:
+  PreparedFeatureMatcher(const FeatureSet& features,
+                         DescriptorMatcherBackend backend);
+  ~PreparedFeatureMatcher();
+  PreparedFeatureMatcher(PreparedFeatureMatcher&&) noexcept;
+  PreparedFeatureMatcher& operator=(PreparedFeatureMatcher&&) noexcept;
+  PreparedFeatureMatcher(const PreparedFeatureMatcher&) = delete;
+  PreparedFeatureMatcher& operator=(const PreparedFeatureMatcher&) = delete;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+  friend std::vector<FeatureMatch> MatchPreparedFeatureSets(
+      const PreparedFeatureMatcher&,
+      const PreparedFeatureMatcher&,
+      const DescriptorMatchingOptions&);
+};
+
+std::vector<FeatureMatch> MatchPreparedFeatureSets(
+    const PreparedFeatureMatcher& features1,
+    const PreparedFeatureMatcher& features2,
+    const DescriptorMatchingOptions& options = {});
 
 // 匹配两个 FeatureSet 的描述子，输出特征索引对。
 std::vector<FeatureMatch> MatchFeatureSets(

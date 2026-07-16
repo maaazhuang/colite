@@ -17,6 +17,8 @@
 
 namespace colite::mvs {
 
+class CudaPatchMatchWorkspace;
+
 struct PatchMatchInitializationOptions {
   std::uint32_t random_seed = 42;
   float sparse_depth_min_percentile = 0.01F;
@@ -43,12 +45,25 @@ struct PatchMatchView {
 struct PatchMatchCostOptions {
   int window_radius = 2;
   int window_step = 1;
+  // 当前小窗口流程默认保留普通 ZNCC；启用后使用 COLMAP 风格双边加权统计。
+  bool bilateral_weighting = false;
+  // 双边权重的空间标准差。非正值表示跟随窗口半径。
+  float sigma_spatial = -1.0F;
+  // 双边权重的灰度标准差，输入灰度范围为 [0, 1]。
+  float sigma_color = 0.2F;
   float invalid_cost = 1.0F;
   float min_variance = 1e-8F;
   // 几何一致性软约束权重。为 0 时保持纯光度 PatchMatch 行为。
   float geometric_consistency_weight = 0.0F;
+  // Truncation in pixels for the COLMAP-style forward-backward geometric
+  // reprojection cost used during the second PatchMatch pass.
+  float geometric_max_reprojection_error = 3.0F;
   // source depth 与当前候选深度的相对误差归一化阈值。
   float geometric_max_relative_depth_error = 0.01F;
+  // 几何 pre-cost gate：source depth 明显更近时视为遮挡并拒绝候选。
+  bool geometric_reject_occluded_candidates = true;
+  // 几何 pre-cost gate：冲突 source 数不小于一致 source 数时拒绝候选。
+  bool geometric_reject_depth_conflicts = true;
 
   // 多源聚合时使用最低 cost 的前 K 个源图。0 表示使用全部有效源图。
   std::size_t max_num_aggregated_costs = 3;
@@ -99,6 +114,8 @@ struct PatchMatchSweepSummary {
   std::size_t num_pixels_visited = 0;
   std::size_t num_candidate_evaluations = 0;
   std::size_t num_updates = 0;
+  std::size_t num_geometric_candidate_rejections = 0;
+  std::size_t num_geometric_candidate_acceptances = 0;
 };
 
 struct PatchMatchPerturbationOptions {
@@ -133,14 +150,27 @@ struct PatchMatchNormalRefinementSummary {
   std::size_t num_skipped_pixels = 0;
 };
 
+struct PatchMatchSourceSelectionOptions {
+  bool dynamic_probability = false;
+  bool directional_hmm = false;
+  // COLMAP-style Monte Carlo samples drawn from the per-pixel source CDF.
+  // Zero keeps the legacy best-K aggregation path.
+  std::size_t num_samples = 0;
+  float ncc_sigma = 0.6F;
+  float previous_probability_weight = 0.5F;
+  float min_probability = 0.05F;
+  float max_probability = 0.999F;
+};
+
 struct PatchMatchStereoOptions {
   PatchMatchBackend backend = PatchMatchBackend::kAuto;
   int cuda_gpu_index = -1;
   PatchMatchInitializationOptions initialization;
   PatchMatchCostOptions cost;
   PatchMatchPerturbationOptions perturbation;
+  PatchMatchSourceSelectionOptions source_selection;
   PatchMatchPropagationSchedule propagation_schedule =
-      PatchMatchPropagationSchedule::kForwardBackward;
+      PatchMatchPropagationSchedule::kCheckerboard;
   std::size_t num_iterations = 3;
   float initial_depth_perturbation_factor = 0.5F;
   float perturbation_shrink = 0.5F;
@@ -164,11 +194,14 @@ struct PatchMatchStereoSummary {
   std::size_t num_checkerboard_passes = 0;
   std::size_t num_perturbation_passes = 0;
   std::size_t num_candidate_evaluations = 0;
+  std::size_t num_plane_propagation_candidates = 0;
+  std::size_t num_perturbation_candidate_evaluations = 0;
   std::size_t num_propagation_updates = 0;
   std::size_t num_perturbation_updates = 0;
   std::size_t num_source_selection_tests = 0;
   std::size_t num_source_selection_acceptances = 0;
   std::size_t num_source_selection_rejections = 0;
+  std::size_t num_source_selection_probability_updates = 0;
   double perturbation_total_abs_depth_update = 0.0;
   double perturbation_max_abs_depth_update = 0.0;
   double perturbation_mean_abs_depth_update = 0.0;
@@ -181,6 +214,47 @@ struct PatchMatchStereoSummary {
   std::size_t num_normal_refinement_pixels = 0;
   std::size_t num_normal_refined_pixels = 0;
   std::size_t num_normal_refinement_skipped_pixels = 0;
+  // CUDA PatchMatch 各阶段耗时，用于定位 host-device 往返和 kernel 热点。
+  double cuda_upload_time_ms = 0.0;
+  double cuda_initialization_time_ms = 0.0;
+  double cuda_evaluate_cost_time_ms = 0.0;
+  double cuda_propagation_time_ms = 0.0;
+  double cuda_perturbation_time_ms = 0.0;
+  double cuda_download_time_ms = 0.0;
+  double cuda_total_time_ms = 0.0;
+  double cuda_wrapper_total_time_ms = 0.0;
+  double cuda_request_validation_time_ms = 0.0;
+  double cuda_pyramid_resize_time_ms = 0.0;
+  double cuda_host_pack_time_ms = 0.0;
+  double cuda_single_scale_dispatch_time_ms = 0.0;
+  double cuda_result_materialization_time_ms = 0.0;
+  double cuda_output_to_vector_time_ms = 0.0;
+  double cuda_dense_map_fill_time_ms = 0.0;
+  double cuda_normal_refinement_time_ms = 0.0;
+  double cuda_valid_cost_count_time_ms = 0.0;
+  std::size_t cuda_host_initial_normal_upload_normalizations = 0;
+  std::size_t cuda_host_output_normalizations = 0;
+  std::size_t cuda_device_count_queries = 0;
+  std::size_t cuda_device_count_cache_hits = 0;
+  std::size_t cuda_shared_reference_tile_pixels = 0;
+  std::size_t cuda_workspace_texture_allocations = 0;
+  std::size_t cuda_workspace_texture_reuses = 0;
+  std::size_t cuda_workspace_buffer_allocations = 0;
+  std::size_t cuda_workspace_buffer_reuses = 0;
+  std::size_t cuda_iteration_counter_snapshots = 0;
+  std::size_t cuda_iteration_counter_readbacks = 0;
+  std::size_t cuda_packed_output_pixels = 0;
+  std::size_t cuda_output_map_readbacks = 0;
+  std::size_t cuda_async_host_uploads = 0;
+  std::size_t cuda_async_texture_uploads = 0;
+  std::size_t cuda_async_counter_readbacks = 0;
+  std::size_t cuda_async_output_readbacks = 0;
+  std::size_t cuda_pinned_host_upload_bytes = 0;
+  std::size_t cuda_pinned_texture_upload_bytes = 0;
+  std::size_t cuda_pinned_host_staging_bytes = 0;
+  std::size_t cuda_stream_kernel_launches = 0;
+  std::size_t cuda_workspace_pool_size = 0;
+  std::size_t cuda_workspace_pool_slot = 0;
   std::vector<double> update_ratios;
   std::vector<float> depth_radii;
   std::vector<float> normal_radii_degrees;
@@ -192,6 +266,8 @@ struct PatchMatchStereoSummary {
   std::vector<std::size_t> iteration_source_selection_tests;
   std::vector<std::size_t> iteration_source_selection_acceptances;
   std::vector<std::size_t> iteration_source_selection_rejections;
+  std::vector<float> iteration_source_selection_probability_means;
+  std::vector<float> final_source_selection_probability_means;
 };
 
 struct PatchMatchStereoResult {
@@ -219,8 +295,10 @@ struct PatchMatchPhotometricFilterSummary {
 };
 
 struct PatchMatchGeometricConsistencyOptions {
-  float max_reprojection_error_pixels = 2.0F;
-  float max_relative_depth_error = 0.01F;
+  float max_reprojection_error_pixels = 1.0F;
+  // Zero disables the additional relative-depth gate, matching COLMAP's
+  // consistency-mask semantics (forward-backward reprojection cost only).
+  float max_relative_depth_error = 0.0F;
 };
 
 class ConsistencyGraph {
@@ -238,6 +316,13 @@ class ConsistencyGraph {
                                              std::size_t col) const;
   std::size_t Count(std::size_t row, std::size_t col) const;
   std::size_t NumConsistentPixels(std::size_t min_num_sources) const;
+  std::vector<int> ToColmapData(
+      const std::vector<ImageId>& image_ids_by_index) const;
+  static ConsistencyGraph FromColmapData(
+      std::size_t width,
+      std::size_t height,
+      const std::vector<int>& data,
+      const std::vector<ImageId>& image_ids_by_index);
 
  private:
   std::size_t Offset(std::size_t row, std::size_t col) const;
@@ -334,6 +419,7 @@ struct StereoFusionErrorSamples {
 struct StereoFusionResult {
   std::vector<FusedPoint> points;
   std::vector<StereoFusionTrack> tracks;
+  std::vector<std::vector<std::uint32_t>> points_visibility;
   std::vector<StereoFusionPairDiagnostics> pair_diagnostics;
   StereoFusionErrorSamples error_samples;
   StereoFusionSummary summary;
@@ -353,6 +439,8 @@ PatchMatchMaps InitializePatchMatchMaps(
 std::optional<float> SampleGrayBilinear(const MvsImage& image,
                                         float x,
                                         float y);
+
+float ComputePatchMatchNccLikelihood(float cost, float ncc_sigma);
 
 PatchMatchCost ComputePatchZncc(
     const MvsImage& reference_image,
@@ -467,6 +555,16 @@ PatchMatchStereoResult RunPatchMatchStereoForImage(
     float depth_max,
     const PatchMatchStereoOptions& options = {});
 
+PatchMatchStereoResult RunPatchMatchStereoForImageWithCudaWorkspace(
+    const PatchMatchView& reference_view,
+    const std::vector<PatchMatchView>& source_views,
+    const MvsImage& reference_image,
+    const std::vector<MvsImage>& source_images,
+    float depth_min,
+    float depth_max,
+    CudaPatchMatchWorkspace* cuda_workspace,
+    const PatchMatchStereoOptions& options = {});
+
 PatchMatchStereoResult RunPatchMatchStereoForImageWithSourceDepths(
     const PatchMatchView& reference_view,
     const std::vector<PatchMatchView>& source_views,
@@ -475,6 +573,18 @@ PatchMatchStereoResult RunPatchMatchStereoForImageWithSourceDepths(
     const std::vector<DenseDepthMap>& source_depth_maps,
     float depth_min,
     float depth_max,
+    const PatchMatchStereoOptions& options = {});
+
+PatchMatchStereoResult
+RunPatchMatchStereoForImageWithSourceDepthsAndCudaWorkspace(
+    const PatchMatchView& reference_view,
+    const std::vector<PatchMatchView>& source_views,
+    const MvsImage& reference_image,
+    const std::vector<MvsImage>& source_images,
+    const std::vector<DenseDepthMap>& source_depth_maps,
+    float depth_min,
+    float depth_max,
+    CudaPatchMatchWorkspace* cuda_workspace,
     const PatchMatchStereoOptions& options = {});
 
 PatchMatchPhotometricStats ComputePatchMatchPhotometricStats(
@@ -496,6 +606,18 @@ ConsistencyGraph ComputeGeometricConsistencyGraph(
 void WriteConsistencyGraphBinary(const std::filesystem::path& path,
                                  const ConsistencyGraph& consistency_graph);
 ConsistencyGraph ReadConsistencyGraphBinary(const std::filesystem::path& path);
+void WriteConsistencyGraphColmapBinary(
+    const std::filesystem::path& path,
+    const ConsistencyGraph& consistency_graph,
+    const std::vector<ImageId>& image_ids_by_index);
+ConsistencyGraph ReadConsistencyGraphColmapBinary(
+    const std::filesystem::path& path,
+    const std::vector<ImageId>& image_ids_by_index);
+void WritePointsVisibilityColmapBinary(
+    const std::filesystem::path& path,
+    const std::vector<std::vector<std::uint32_t>>& points_visibility);
+std::vector<std::vector<std::uint32_t>> ReadPointsVisibilityColmapBinary(
+    const std::filesystem::path& path);
 
 PatchMatchGeometricFilterSummary FilterPatchMatchGeometricResults(
     const ConsistencyGraph& consistency_graph,

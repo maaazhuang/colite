@@ -39,6 +39,7 @@ class DenseDepthMap {
   bool RecomputeDepthRange();
 
   const std::vector<float>& Data() const;
+  std::vector<float>& MutableData();
 
  private:
   std::size_t Offset(std::size_t row, std::size_t col) const;
@@ -73,6 +74,7 @@ class NormalMap {
   std::size_t ValidPixelCount() const;
 
   const std::vector<Eigen::Vector3f>& Data() const;
+  std::vector<Eigen::Vector3f>& MutableData();
 
  private:
   std::size_t Offset(std::size_t row, std::size_t col) const;
@@ -106,6 +108,7 @@ class DenseCostMap {
   std::size_t ValidPixelCount() const;
 
   const std::vector<float>& Data() const;
+  std::vector<float>& MutableData();
 
  private:
   std::size_t Offset(std::size_t row, std::size_t col) const;
@@ -133,5 +136,6 @@ NormalMap ReadNormalMapBinary(const std::filesystem::path& path);
 
 void WriteDenseCostMapText(const std::filesystem::path& path,
                            const DenseCostMap& cost_map);
+DenseCostMap ReadDenseCostMapText(const std::filesystem::path& path);
 
 }  // namespace colite::mvs

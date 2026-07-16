@@ -11,6 +11,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include "colite/core/parallel.h"
 #include "backends/cuda_sift_extractor.h"
 #include "backends/sift_opencv.hpp"
 #include "sift_descriptor_conversion.h"
@@ -24,6 +25,11 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kDefaultOpenCvContrastThreshold = 0.04;
+#if defined(COLITE_ENABLE_AVX2)
+constexpr bool kUseAvx2 = true;
+#else
+constexpr bool kUseAvx2 = false;
+#endif
 
 std::string LowerExtension(const std::filesystem::path& path) {
   std::string ext = path.extension().string();
@@ -107,7 +113,9 @@ FeatureSet ExtractCvSiftFeatures(const cv::Mat& gray,
                                        options.num_octave_layers,
                                        options.contrast_threshold,
                                        options.edge_threshold,
-                                       options.sigma);
+                                       options.sigma,
+                                       false,
+                                       kUseAvx2);
   std::vector<features::backends::KeyPoint> keypoints;
   std::vector<float> descriptors;
   sift.detectAndCompute(image.data(), gray.cols, gray.rows, keypoints,
@@ -151,47 +159,85 @@ FeatureSet ExtractVlSiftFeatures(const cv::Mat& gray,
     vl_sift_detect(filter);
     const VlSiftKeypoint* keypoints = vl_sift_get_keypoints(filter);
     const int num_keypoints = vl_sift_get_nkeypoints(filter);
+    vl_sift_update_gradient_for_detected_keypoints(filter);
+
+    std::vector<std::array<double, 4>> angles(
+        static_cast<std::size_t>(num_keypoints));
+    std::vector<int> orientation_counts(
+        static_cast<std::size_t>(num_keypoints), 0);
+    parallel::parallel_for_(
+        parallel::Range(0, num_keypoints), [&](const parallel::Range& range) {
+          for (int i = range.start; i < range.end; ++i) {
+            orientation_counts[static_cast<std::size_t>(i)] = std::min(
+                vl_sift_calc_keypoint_orientations(
+                    filter, angles[static_cast<std::size_t>(i)].data(),
+                    keypoints + i),
+                options.max_num_orientations);
+          }
+        });
+
+    const std::size_t first_new_level = levels.size();
+    std::vector<std::size_t> keypoint_levels(
+        static_cast<std::size_t>(num_keypoints));
     int previous_level = -1;
-    VlSiftLevelFeatures* current_level = nullptr;
     for (int i = 0; i < num_keypoints; ++i) {
       if (keypoints[i].is != previous_level) {
         levels.push_back({});
-        current_level = &levels.back();
-        current_level->dog_level = keypoints[i].is;
+        levels.back().dog_level = keypoints[i].is;
         previous_level = keypoints[i].is;
       }
-      if (current_level == nullptr) {
-        throw std::runtime_error("Invalid VL SIFT level state.");
-      }
-      ++current_level->num_base_keypoints;
-
-      double angles[4] = {};
-      const int num_orientations =
-          vl_sift_calc_keypoint_orientations(filter, angles, keypoints + i);
-      const int num_used_orientations =
-          std::min(num_orientations, options.max_num_orientations);
-      for (int orientation_idx = 0; orientation_idx < num_used_orientations;
-           ++orientation_idx) {
-        FeatureKeypoint converted;
-        converted.x = keypoints[i].x + 0.5F;
-        converted.y = keypoints[i].y + 0.5F;
-        converted.scale = keypoints[i].sigma;
-        converted.response = 0.0F;
-        converted.orientation =
-            static_cast<float>(angles[orientation_idx] * 180.0 / kPi);
-        if (converted.orientation < 0.0F) {
-          converted.orientation += 360.0F;
-        }
-        current_level->keypoints.push_back(converted);
-
-        const std::size_t offset = current_level->descriptors.size();
-        current_level->descriptors.resize(offset + VL_SIFT_DESCR_LEN);
-        float* descriptor = current_level->descriptors.data() + offset;
-        vl_sift_calc_keypoint_descriptor(filter, descriptor, keypoints + i,
-                                         angles[orientation_idx]);
-        TransformVlFeatDescriptorToUbc(descriptor);
-      }
+      keypoint_levels[static_cast<std::size_t>(i)] = levels.size() - 1;
+      ++levels.back().num_base_keypoints;
     }
+
+    std::vector<std::size_t> level_feature_counts(levels.size(), 0);
+    std::vector<std::size_t> keypoint_offsets(
+        static_cast<std::size_t>(num_keypoints), 0);
+    for (int i = 0; i < num_keypoints; ++i) {
+      const std::size_t level = keypoint_levels[static_cast<std::size_t>(i)];
+      keypoint_offsets[static_cast<std::size_t>(i)] =
+          level_feature_counts[level];
+      level_feature_counts[level] += static_cast<std::size_t>(
+          orientation_counts[static_cast<std::size_t>(i)]);
+    }
+    for (std::size_t level = first_new_level; level < levels.size(); ++level) {
+      levels[level].keypoints.resize(level_feature_counts[level]);
+      levels[level].descriptors.resize(level_feature_counts[level] *
+                                        VL_SIFT_DESCR_LEN);
+    }
+
+    parallel::parallel_for_(
+        parallel::Range(0, num_keypoints), [&](const parallel::Range& range) {
+          for (int i = range.start; i < range.end; ++i) {
+            const std::size_t keypoint_index = static_cast<std::size_t>(i);
+            VlSiftLevelFeatures& level = levels[keypoint_levels[keypoint_index]];
+            for (int orientation_idx = 0;
+                 orientation_idx < orientation_counts[keypoint_index];
+                 ++orientation_idx) {
+              const std::size_t output_index =
+                  keypoint_offsets[keypoint_index] +
+                  static_cast<std::size_t>(orientation_idx);
+              const double angle = angles[keypoint_index]
+                                           [static_cast<std::size_t>(
+                                               orientation_idx)];
+              FeatureKeypoint& converted = level.keypoints[output_index];
+              converted.x = keypoints[i].x + 0.5F;
+              converted.y = keypoints[i].y + 0.5F;
+              converted.scale = keypoints[i].sigma;
+              converted.response = 0.0F;
+              converted.orientation = static_cast<float>(angle * 180.0 / kPi);
+              if (converted.orientation < 0.0F) {
+                converted.orientation += 360.0F;
+              }
+
+              float* descriptor =
+                  level.descriptors.data() + output_index * VL_SIFT_DESCR_LEN;
+              vl_sift_calc_keypoint_descriptor(filter, descriptor,
+                                               keypoints + i, angle);
+              TransformVlFeatDescriptorToUbc(descriptor);
+            }
+          }
+        });
     err = vl_sift_process_next_octave(filter);
   }
 
@@ -233,12 +279,16 @@ FeatureSet ExtractVlSiftFeatures(const cv::Mat& gray,
 
 const char* SiftBackendName(const SiftBackend backend) {
   switch (backend) {
+    case SiftBackend::kAuto:
+      return "auto";
     case SiftBackend::kVlSift:
       return "vlsift";
     case SiftBackend::kCvSift:
       return "cvsift";
     case SiftBackend::kCudaSift:
-      return "cudasift";
+      return "cuda_opencv";
+    case SiftBackend::kCudaVlSift:
+      return "cuda_vlfeat";
   }
   return "unknown";
 }
@@ -250,6 +300,9 @@ SiftBackend SiftBackendFromName(std::string_view name) {
                    return static_cast<char>(std::tolower(ch));
                  });
 
+  if (normalized == "auto") {
+    return SiftBackend::kAuto;
+  }
   if (normalized == "vlsift" || normalized == "vl_sift" ||
       normalized == "vlfeat") {
     return SiftBackend::kVlSift;
@@ -258,21 +311,37 @@ SiftBackend SiftBackendFromName(std::string_view name) {
     return SiftBackend::kCvSift;
   }
   if (normalized == "cudasift" || normalized == "cuda_sift" ||
-      normalized == "cuda") {
+      normalized == "cuda" || normalized == "cuda_opencv") {
     return SiftBackend::kCudaSift;
   }
+  if (normalized == "cuda_vlsift" || normalized == "cuda_vl_sift" ||
+      normalized == "cuda_vlfeat") {
+    return SiftBackend::kCudaVlSift;
+  }
   throw std::invalid_argument("Unsupported SIFT backend: " + normalized);
+}
+
+SiftBackend ResolveSiftBackend(const SiftBackend requested) {
+  if (requested != SiftBackend::kAuto) {
+    return requested;
+  }
+  return IsCudaSiftAvailable() ? SiftBackend::kCudaSift
+                               : SiftBackend::kCvSift;
 }
 
 FeatureSet ExtractSiftFeatures(const cv::Mat& image,
                                const SiftExtractionOptions& options) {
   const cv::Mat gray = ToGrayImage(image);
-  switch (options.backend) {
+  const SiftBackend backend = ResolveSiftBackend(options.backend);
+  switch (backend) {
+    case SiftBackend::kAuto:
+      break;
     case SiftBackend::kVlSift:
       return ExtractVlSiftFeatures(gray, options);
     case SiftBackend::kCvSift:
       return ExtractCvSiftFeatures(gray, options);
     case SiftBackend::kCudaSift:
+    case SiftBackend::kCudaVlSift:
       return ExtractCudaSiftFeatures(gray, options);
   }
   throw std::invalid_argument("Unsupported SIFT backend.");
