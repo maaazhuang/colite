@@ -171,6 +171,13 @@ struct PatchMatchStereoOptions {
   PatchMatchSourceSelectionOptions source_selection;
   PatchMatchPropagationSchedule propagation_schedule =
       PatchMatchPropagationSchedule::kCheckerboard;
+  // One round updates both checkerboard parities once. The former hard-coded
+  // schedule repeated this four times and dominated high-resolution runtime.
+  std::size_t checkerboard_propagation_rounds = 1;
+  // Detailed CUDA counters use global atomics in the per-source hot path.
+  // The low-level API preserves its diagnostic behavior; production
+  // controllers explicitly disable this unless requested by the CLI.
+  bool collect_diagnostics = true;
   std::size_t num_iterations = 3;
   float initial_depth_perturbation_factor = 0.5F;
   float perturbation_shrink = 0.5F;

@@ -46,6 +46,12 @@ void WriteGrayImage(const std::filesystem::path& path, std::uint8_t value) {
   ASSERT_TRUE(cv::imwrite(path.string(), image));
 }
 
+void WriteColorImage(const std::filesystem::path& path,
+                     const cv::Scalar& bgr) {
+  cv::Mat image(2, 4, CV_8UC3, bgr);
+  ASSERT_TRUE(cv::imwrite(path.string(), image));
+}
+
 TEST(MvsImageWorkspaceTest, LoadsGrayFloatImageFromRegisteredView) {
   const std::filesystem::path root =
       std::filesystem::temp_directory_path() / "colite_mvs_workspace_test";
@@ -68,6 +74,26 @@ TEST(MvsImageWorkspaceTest, LoadsGrayFloatImageFromRegisteredView) {
   EXPECT_NEAR(image.gray.at<float>(0, 0), 128.0F / 255.0F, 1e-6F);
   EXPECT_EQ(workspace.NumCachedImages(), 1U);
   EXPECT_TRUE(workspace.IsCached(1));
+}
+
+TEST(MvsImageWorkspaceTest, LoadsRgbImageForDenseFusion) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() / "colite_mvs_rgb_test";
+  std::filesystem::create_directories(root);
+  WriteColorImage(root / "image1.png", cv::Scalar(56, 34, 12));
+  WriteColorImage(root / "image2.png", cv::Scalar(3, 2, 1));
+
+  MvsImageWorkspaceOptions options;
+  options.image_path = root;
+  MvsImageWorkspace workspace(MakeWorkspaceReconstruction(), options);
+  const MvsImage& image = workspace.GetImage(1);
+
+  ASSERT_EQ(image.color.type(), CV_8UC3);
+  ASSERT_EQ(image.color.size(), image.gray.size());
+  const cv::Vec3b rgb = image.color.at<cv::Vec3b>(0, 0);
+  EXPECT_EQ(rgb[0], 12);
+  EXPECT_EQ(rgb[1], 34);
+  EXPECT_EQ(rgb[2], 56);
 }
 
 TEST(MvsImageWorkspaceTest, EvictsLeastRecentlyUsedImage) {
@@ -106,6 +132,25 @@ TEST(MvsImageWorkspaceTest, DownsizesLoadedImageByMaxDimension) {
 
   const MvsImage& image = workspace.GetImage(1);
 
+  EXPECT_EQ(image.Width(), 2U);
+  EXPECT_EQ(image.Height(), 1U);
+  EXPECT_DOUBLE_EQ(image.scale, 0.5);
+}
+
+TEST(MvsImageWorkspaceTest, DownsizesLoadedImageByResolutionLevel) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() /
+      "colite_mvs_workspace_resolution_level_test";
+  std::filesystem::create_directories(root);
+  WriteGrayImage(root / "image1.png", 255);
+  WriteGrayImage(root / "image2.png", 32);
+
+  MvsImageWorkspaceOptions options;
+  options.image_path = root;
+  options.resolution_level = 1;
+  MvsImageWorkspace workspace(MakeWorkspaceReconstruction(), options);
+
+  const MvsImage& image = workspace.GetImage(1);
   EXPECT_EQ(image.Width(), 2U);
   EXPECT_EQ(image.Height(), 1U);
   EXPECT_DOUBLE_EQ(image.scale, 0.5);

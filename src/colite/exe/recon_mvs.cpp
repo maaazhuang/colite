@@ -107,6 +107,10 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --patch_match_propagation_schedule <name> Propagation schedule: "
          "forward_backward, four_direction, or checkerboard; default "
          "checkerboard.\n"
+      << "  --patch_match_checkerboard_rounds <n> Red-black propagation "
+         "rounds per iteration, default 1; use 4 for the legacy schedule.\n"
+      << "  --patch_match_diagnostics Collect detailed CUDA PatchMatch "
+         "counters; disabled by default because hot-path atomics are costly.\n"
       << "  --patch_match_geometric_refinement_iterations <n> PatchMatch "
          "second-pass geometric refinement iterations, default 0.\n"
       << "  --patch_match_geometric_consistency_weight <w> Source-depth "
@@ -195,6 +199,8 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --num_threads <n>        Number of PatchMatch worker threads, "
          "default 1.\n"
       << "  --image_cache_size <n>      LRU image cache size, default 16.\n"
+      << "  --resolution_level <n>      Halving levels before MVS, default "
+         "1; use 0 for full resolution.\n"
       << "  --max_image_size <n>        Resize longest image side before MVS.\n"
       << "  --random_seed <n>           PatchMatch initialization seed, "
          "default 42.\n";
@@ -326,6 +332,11 @@ ReconMvsCliOptions ParseOptions(const std::vector<std::string>& args) {
           static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
     } else if (arg == "--patch_match_propagation_schedule") {
       options.patch_match_propagation_schedule = RequireValue(args, &i, arg);
+    } else if (arg == "--patch_match_checkerboard_rounds") {
+      options.patch_match_checkerboard_rounds =
+          static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
+    } else if (arg == "--patch_match_diagnostics") {
+      options.patch_match_diagnostics = true;
     } else if (arg == "--patch_match_geometric_refinement_iterations") {
       options.patch_match_geometric_refinement_iterations =
           static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
@@ -497,6 +508,9 @@ ReconMvsCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--image_cache_size") {
       options.image_cache_size =
           static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
+    } else if (arg == "--resolution_level") {
+      options.resolution_level =
+          static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
     } else if (arg == "--max_image_size") {
       options.max_image_size = std::stoi(RequireValue(args, &i, arg));
     } else if (arg == "--random_seed") {
@@ -546,6 +560,9 @@ void ValidateOptions(const ReconMvsCliOptions& options) {
   if (options.source_coverage_grid_size == 0) {
     throw std::invalid_argument(
         "--source_coverage_grid_size must be positive");
+  }
+  if (options.resolution_level > 30) {
+    throw std::invalid_argument("--resolution_level must be between 0 and 30");
   }
   if (options.initialize_patch_match && options.image_path.empty()) {
     throw std::invalid_argument(
@@ -628,6 +645,10 @@ void ValidateOptions(const ReconMvsCliOptions& options) {
     throw std::invalid_argument(
         "Invalid PatchMatch propagation schedule: " +
         options.patch_match_propagation_schedule);
+  }
+  if (options.patch_match_checkerboard_rounds == 0) {
+    throw std::invalid_argument(
+        "--patch_match_checkerboard_rounds must be positive");
   }
   if (!std::isfinite(options.patch_match_geometric_consistency_weight) ||
       options.patch_match_geometric_consistency_weight < 0.0F) {

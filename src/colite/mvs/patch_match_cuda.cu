@@ -84,6 +84,7 @@ struct DevicePatchMatchOptions {
   float previous_selection_probability_weight = 0.5F;
   float min_selection_probability = 0.05F;
   float max_selection_probability = 0.999F;
+  bool collect_diagnostics = false;
 };
 
 struct DeviceCounters {
@@ -1621,20 +1622,24 @@ __global__ void UpdatePerturbationRadiusStateKernel(
     float* radius_state,
     const DeviceCounters* counters,
     float perturbation_shrink,
-    float adaptive_min_update_ratio) {
+    float adaptive_min_update_ratio,
+    bool use_adaptive_counters) {
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
   }
-  const double candidate_evaluations =
-      static_cast<double>(counters[0].candidate_evaluations);
-  const double total_updates =
-      static_cast<double>(counters[0].propagation_updates +
-                          counters[0].perturbation_updates);
-  const double update_ratio =
-      candidate_evaluations <= 0.0 ? 0.0 : total_updates / candidate_evaluations;
   float shrink = perturbation_shrink;
-  if (update_ratio < static_cast<double>(adaptive_min_update_ratio)) {
-    shrink *= perturbation_shrink;
+  if (use_adaptive_counters) {
+    const double candidate_evaluations =
+        static_cast<double>(counters[0].candidate_evaluations);
+    const double total_updates =
+        static_cast<double>(counters[0].propagation_updates +
+                            counters[0].perturbation_updates);
+    const double update_ratio = candidate_evaluations <= 0.0
+                                    ? 0.0
+                                    : total_updates / candidate_evaluations;
+    if (update_ratio < static_cast<double>(adaptive_min_update_ratio)) {
+      shrink *= perturbation_shrink;
+    }
   }
   radius_state[0] *= shrink;
   radius_state[1] *= shrink;
@@ -1780,8 +1785,10 @@ __device__ void TryUpdateFromNeighbor(cudaTextureObject_t reference_texture,
       candidate_depth < options.depth_min || candidate_depth > options.depth_max) {
     return;
   }
-  atomicAdd(&counters->plane_propagation_candidates, 1ULL);
-  atomicAdd(&counters->candidate_evaluations, 1ULL);
+  if (counters != nullptr) {
+    atomicAdd(&counters->plane_propagation_candidates, 1ULL);
+    atomicAdd(&counters->candidate_evaluations, 1ULL);
+  }
   if (!PassesGeometricCandidateFilter(options, poses_texture,
                                       source_depth_maps_texture,
                                       source_images, col, row,
@@ -1804,7 +1811,9 @@ __device__ void TryUpdateFromNeighbor(cudaTextureObject_t reference_texture,
     normal_map[idx * 3 + 1] = candidate_normal.y;
     normal_map[idx * 3 + 2] = candidate_normal.z;
     cost_map[idx] = candidate_cost;
-    atomicAdd(&counters->propagation_updates, 1ULL);
+    if (counters != nullptr) {
+      atomicAdd(&counters->propagation_updates, 1ULL);
+    }
   }
 }
 
@@ -1923,8 +1932,10 @@ __device__ void TryUpdatePerturbationCandidate(
     float3* best_normal,
     float* best_cost,
     bool* updated) {
-  atomicAdd(&counters->candidate_evaluations, 1ULL);
-  atomicAdd(&counters->perturbation_candidate_evaluations, 1ULL);
+  if (counters != nullptr) {
+    atomicAdd(&counters->candidate_evaluations, 1ULL);
+    atomicAdd(&counters->perturbation_candidate_evaluations, 1ULL);
+  }
   if (!PassesGeometricCandidateFilter(
           options, poses_texture, source_depth_maps_texture, source_images,
           col, row, candidate_depth, counters)) {
@@ -2024,13 +2035,15 @@ __global__ void PerturbationKernel(cudaTextureObject_t reference_texture,
     normal_map[idx * 3 + 1] = best_normal.y;
     normal_map[idx * 3 + 2] = best_normal.z;
     cost_map[idx] = best_cost;
-    atomicAdd(&counters->perturbation_updates, 1ULL);
-    atomicAdd(&counters->total_abs_depth_update,
-              static_cast<double>(fabsf(best_depth - current_depth)));
-    const double normal_angle =
-        static_cast<double>(AngleDegreesBetween(current_normal, best_normal));
-    atomicAdd(&counters->total_normal_angle_degrees, normal_angle);
-    AtomicMaxDouble(&counters->max_normal_angle_degrees, normal_angle);
+    if (counters != nullptr) {
+      atomicAdd(&counters->perturbation_updates, 1ULL);
+      atomicAdd(&counters->total_abs_depth_update,
+                static_cast<double>(fabsf(best_depth - current_depth)));
+      const double normal_angle =
+          static_cast<double>(AngleDegreesBetween(current_normal, best_normal));
+      atomicAdd(&counters->total_normal_angle_degrees, normal_angle);
+      AtomicMaxDouble(&counters->max_normal_angle_degrees, normal_angle);
+    }
   }
 }
 
@@ -2775,6 +2788,7 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
         request.options.source_selection.min_probability;
     device_options.max_selection_probability =
         request.options.source_selection.max_probability;
+    device_options.collect_diagnostics = request.options.collect_diagnostics;
     device_options.cost.window_radius = request.options.cost.window_radius;
     device_options.cost.window_step = request.options.cost.window_step;
     device_options.cost.bilateral_weighting =
@@ -3086,9 +3100,13 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
     iteration_normal_radii.reserve(request.options.num_iterations);
     for (std::size_t iteration = 0; iteration < request.options.num_iterations;
          ++iteration) {
-      ResetCountersKernel<<<1, 1, 0, stream>>>(d_counters.get());
-      ++cuda_stream_kernel_launches;
-      CudaCheck(cudaGetLastError());
+      DeviceCounters* const active_counters =
+          request.options.collect_diagnostics ? d_counters.get() : nullptr;
+      if (active_counters != nullptr) {
+        ResetCountersKernel<<<1, 1, 0, stream>>>(active_counters);
+        ++cuda_stream_kernel_launches;
+        CudaCheck(cudaGetLastError());
+      }
       const auto run_direction = [&](int direction) {
         PropagationKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
             reference_texture.get(), source_images_texture.get(),
@@ -3099,7 +3117,7 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
             dynamic_selection_probabilities_ptr,
             d_source_images_info.get(),
             d_depth_map.get(), d_normal_map.get(), d_cost_map.get(),
-            device_options, direction, d_counters.get());
+            device_options, direction, active_counters);
         ++cuda_stream_kernel_launches;
         CudaCheck(cudaGetLastError());
       };
@@ -3112,7 +3130,7 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
                                            : 0,
             dynamic_selection_probabilities_ptr,
             d_source_images_info.get(), d_depth_map.get(), d_normal_map.get(),
-            d_cost_map.get(), device_options, parity, d_counters.get());
+            d_cost_map.get(), device_options, parity, active_counters);
         ++cuda_stream_kernel_launches;
         CudaCheck(cudaGetLastError());
       };
@@ -3131,8 +3149,11 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
           run_direction(3);
           break;
         case PatchMatchPropagationSchedule::kCheckerboard:
-          for (const int parity : {0, 1, 1, 0, 0, 1, 1, 0}) {
-            run_checkerboard(parity);
+          for (std::size_t round = 0;
+               round < request.options.checkerboard_propagation_rounds;
+               ++round) {
+            run_checkerboard(0);
+            run_checkerboard(1);
           }
           break;
       }
@@ -3161,7 +3182,7 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
           d_iteration_depth_radii.get(), d_iteration_normal_radii.get(),
           static_cast<int>(iteration),
           static_cast<int>(request.options.perturbation.num_samples_per_pixel),
-          d_counters.get());
+          active_counters);
       ++cuda_stream_kernel_launches;
       CudaCheck(cudaGetLastError());
       perturbation_timers.back().Stop(stream);
@@ -3179,7 +3200,7 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
             request.options.source_selection.directional_hmm
                 ? d_source_selection_emission_map.get()
                 : nullptr,
-            device_options, d_counters.get());
+            device_options, active_counters);
         ++cuda_stream_kernel_launches;
         CudaCheck(cudaGetLastError());
         if (request.options.source_selection.directional_hmm) {
@@ -3206,20 +3227,24 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
           CudaCheck(cudaGetLastError());
         }
       }
-      StoreIterationCountersKernel<<<1, 1, 0, stream>>>(
-          d_counters.get(), d_iteration_counters.get(),
-          static_cast<int>(iteration));
-      ++cuda_stream_kernel_launches;
-      CudaCheck(cudaGetLastError());
+      if (active_counters != nullptr) {
+        StoreIterationCountersKernel<<<1, 1, 0, stream>>>(
+            active_counters, d_iteration_counters.get(),
+            static_cast<int>(iteration));
+        ++cuda_stream_kernel_launches;
+        CudaCheck(cudaGetLastError());
+      }
       UpdatePerturbationRadiusStateKernel<<<1, 1, 0, stream>>>(
           d_perturbation_radius_state.get(), d_counters.get(),
           request.options.perturbation_shrink,
-          request.options.adaptive_perturbation_min_update_ratio);
+          request.options.adaptive_perturbation_min_update_ratio,
+          request.options.collect_diagnostics);
       ++cuda_stream_kernel_launches;
       CudaCheck(cudaGetLastError());
     }
     const SteadyClock::time_point download_start = SteadyClock::now();
-    if (request.options.num_iterations > 0) {
+    if (request.options.num_iterations > 0 &&
+        request.options.collect_diagnostics) {
       d_iteration_counters.CopyToHostAsync(h_iteration_counters.data(),
                                            stream);
       d_iteration_depth_radii.CopyToHostAsync(h_iteration_depth_radii.data(),
@@ -3227,6 +3252,11 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
       d_iteration_normal_radii.CopyToHostAsync(h_iteration_normal_radii.data(),
                                                stream);
       ++cuda_async_counter_readbacks;
+    } else if (request.options.num_iterations > 0) {
+      d_iteration_depth_radii.CopyToHostAsync(h_iteration_depth_radii.data(),
+                                              stream);
+      d_iteration_normal_radii.CopyToHostAsync(h_iteration_normal_radii.data(),
+                                               stream);
     }
     PackOutputMapsKernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
         d_depth_map.get(), d_normal_map.get(), d_cost_map.get(),
@@ -3250,7 +3280,9 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
       cuda_perturbation_time_ms += timer.ElapsedMilliseconds();
     }
     if (request.options.num_iterations > 0) {
-      iteration_counters = h_iteration_counters.ToVector();
+      if (request.options.collect_diagnostics) {
+        iteration_counters = h_iteration_counters.ToVector();
+      }
       iteration_depth_radii = h_iteration_depth_radii.ToVector();
       iteration_normal_radii = h_iteration_normal_radii.ToVector();
     }
@@ -3348,7 +3380,8 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
         break;
       case PatchMatchPropagationSchedule::kCheckerboard:
         result.summary.num_checkerboard_passes =
-            request.options.num_iterations * 8;
+            request.options.num_iterations *
+            request.options.checkerboard_propagation_rounds * 2;
         break;
     }
     result.summary.num_perturbation_passes = request.options.num_iterations;

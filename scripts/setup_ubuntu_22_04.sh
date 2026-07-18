@@ -24,6 +24,6 @@ Suggested build commands:
   cmake -S . -B build-wsl -G Ninja -DCMAKE_BUILD_TYPE=Debug
   cmake --build build-wsl
   ctest --test-dir build-wsl --output-on-failure
-  ./build-wsl/app/recon_sfm/recon_sfm --version
+  ./build-wsl-colite-cuda/src/colite/exe/recon_sfm --version
 
 EOF

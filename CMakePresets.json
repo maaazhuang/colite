@@ -20,6 +20,24 @@
         "CMAKE_BUILD_TYPE": "Release",
         "COLITE_BUILD_TESTS": "ON"
       }
+    },
+    {
+      "name": "wsl-colite-cuda",
+      "displayName": "WSL Colite CUDA Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-wsl-colite-cuda",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CUDA_COMPILER": "/usr/local/cuda-13.2/bin/nvcc",
+        "CMAKE_CUDA_ARCHITECTURES": "89",
+        "COLITE_BUILD_TESTS": "ON",
+        "COLITE_ENABLE_AVX2": "ON",
+        "COLITE_ENABLE_SIFT_PARALLEL": "ON",
+        "COLITE_ENABLE_CUDA_SIFT": "ON",
+        "COLITE_ENABLE_CUDA_MVS": "ON",
+        "COLITE_ENABLE_POISSON_MESHING": "ON",
+        "COLITE_ENABLE_DELAUNAY_MESHING": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -30,12 +48,23 @@
     {
       "name": "wsl-release",
       "configurePreset": "wsl-release"
+    },
+    {
+      "name": "wsl-colite-cuda",
+      "configurePreset": "wsl-colite-cuda"
     }
   ],
   "testPresets": [
     {
       "name": "wsl-debug",
       "configurePreset": "wsl-debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "wsl-colite-cuda",
+      "configurePreset": "wsl-colite-cuda",
       "output": {
         "outputOnFailure": true
       }

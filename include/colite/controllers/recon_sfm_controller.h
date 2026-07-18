@@ -72,6 +72,11 @@ int EffectiveFeatureExtractionThreads(int requested_threads);
 ReconstructionQualityStats ComputeReconstructionQualityStats(
     const Reconstruction& reconstruction);
 
+// Sample every registered observation from its source image and assign the
+// multi-view mean RGB value to each sparse point, matching COLMAP's
+// ExtractColorsForAllImages convention.
+void ExtractPointColors(Reconstruction* reconstruction);
+
 void WriteRunSummary(const std::filesystem::path& output_path,
                      const Reconstruction& reconstruction,
                      const IncrementalMappingSummary& summary,

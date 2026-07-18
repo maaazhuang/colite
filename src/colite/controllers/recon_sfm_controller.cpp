@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -15,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -104,6 +106,46 @@ Image MakeImage(ImageId image_id,
   return image;
 }
 
+std::optional<Eigen::Vector3d> SampleRgbBilinear(const cv::Mat& image_bgr,
+                                                  double x,
+                                                  double y) {
+  if (image_bgr.empty() || image_bgr.type() != CV_8UC3 ||
+      !std::isfinite(x) || !std::isfinite(y)) {
+    return std::nullopt;
+  }
+
+  // COLMAP defines the upper-left pixel center as (0.5, 0.5), whereas OpenCV
+  // addresses the same pixel center as (0, 0).
+  x -= 0.5;
+  y -= 0.5;
+  if (x < 0.0 || y < 0.0 || x > image_bgr.cols - 1.0 ||
+      y > image_bgr.rows - 1.0) {
+    return std::nullopt;
+  }
+
+  const int x0 = static_cast<int>(std::floor(x));
+  const int y0 = static_cast<int>(std::floor(y));
+  const int x1 = std::min(x0 + 1, image_bgr.cols - 1);
+  const int y1 = std::min(y0 + 1, image_bgr.rows - 1);
+  const double dx = x - x0;
+  const double dy = y - y0;
+  const cv::Vec3b p00 = image_bgr.at<cv::Vec3b>(y0, x0);
+  const cv::Vec3b p01 = image_bgr.at<cv::Vec3b>(y0, x1);
+  const cv::Vec3b p10 = image_bgr.at<cv::Vec3b>(y1, x0);
+  const cv::Vec3b p11 = image_bgr.at<cv::Vec3b>(y1, x1);
+
+  Eigen::Vector3d rgb;
+  for (int rgb_channel = 0; rgb_channel < 3; ++rgb_channel) {
+    const int bgr_channel = 2 - rgb_channel;
+    const double top = (1.0 - dx) * p00[bgr_channel] +
+                       dx * p01[bgr_channel];
+    const double bottom = (1.0 - dx) * p10[bgr_channel] +
+                          dx * p11[bgr_channel];
+    rgb[rgb_channel] = (1.0 - dy) * top + dy * bottom;
+  }
+  return rgb;
+}
+
 std::string Point3DIdForColmap(Point3DId point3d_id) {
   if (point3d_id == kInvalidPoint3DId) {
     return "-1";
@@ -132,6 +174,64 @@ std::string TwoViewGeometryTypeName(const TwoViewGeometry& geometry) {
 }
 
 }  // namespace
+
+void ExtractPointColors(Reconstruction* reconstruction) {
+  if (reconstruction == nullptr) {
+    throw std::invalid_argument("reconstruction must not be null");
+  }
+
+  std::unordered_map<Point3DId, Eigen::Vector3d> color_sums;
+  std::unordered_map<Point3DId, std::size_t> color_counts;
+  color_sums.reserve(reconstruction->Points3D().size());
+  color_counts.reserve(reconstruction->Points3D().size());
+
+  for (const ImageId image_id : reconstruction->RegisteredImageIds()) {
+    const Image& image = reconstruction->GetImage(image_id);
+    if (image.file_path.empty()) {
+      continue;
+    }
+    const cv::Mat pixels =
+        cv::imread(image.file_path, cv::IMREAD_COLOR);
+    if (pixels.empty()) {
+      continue;
+    }
+    for (const Point2D& point2d : image.points2d) {
+      if (!point2d.HasPoint3D() ||
+          !reconstruction->ExistsPoint3D(point2d.point3d_id)) {
+        continue;
+      }
+      const std::optional<Eigen::Vector3d> rgb =
+          SampleRgbBilinear(pixels, point2d.xy.x(), point2d.xy.y());
+      if (!rgb.has_value()) {
+        continue;
+      }
+      const auto sum_it = color_sums.find(point2d.point3d_id);
+      if (sum_it == color_sums.end()) {
+        color_sums.emplace(point2d.point3d_id, *rgb);
+        color_counts.emplace(point2d.point3d_id, 1);
+      } else {
+        sum_it->second += *rgb;
+        ++color_counts.at(point2d.point3d_id);
+      }
+    }
+  }
+
+  for (const auto& [point3d_id, point3d] : reconstruction->Points3D()) {
+    (void)point3d;
+    Point3D& mutable_point = reconstruction->GetPoint3D(point3d_id);
+    const auto count_it = color_counts.find(point3d_id);
+    if (count_it == color_counts.end() || count_it->second == 0) {
+      mutable_point.color.setZero();
+      continue;
+    }
+    Eigen::Vector3d color = color_sums.at(point3d_id) /
+                            static_cast<double>(count_it->second);
+    for (int channel = 0; channel < 3; ++channel) {
+      mutable_point.color[channel] = static_cast<std::uint8_t>(
+          std::lround(std::clamp(color[channel], 0.0, 255.0)));
+    }
+  }
+}
 
 void MatchAllImagePairs(
     const std::vector<ImageId>& image_ids,
@@ -308,7 +408,10 @@ void WriteColmapTextModel(const std::filesystem::path& output_path,
         Point3DTrackReprojectionError(reconstruction, point3d).value_or(-1.0);
     points_file << point3d_id << " " << std::setprecision(17)
                 << point3d.xyz.x() << " " << point3d.xyz.y() << " "
-                << point3d.xyz.z() << " 255 255 255 "
+                << point3d.xyz.z() << " "
+                << static_cast<int>(point3d.color.x()) << " "
+                << static_cast<int>(point3d.color.y()) << " "
+                << static_cast<int>(point3d.color.z()) << " "
                 << track_error;
     for (const TrackElement& element : point3d.track.elements) {
       points_file << " " << element.image_id << " " << element.point2d_idx;
@@ -468,8 +571,10 @@ void WritePlyPointCloud(const std::filesystem::path& ply_path,
   for (const auto& [point3d_id, point3d] : reconstruction.Points3D()) {
     (void)point3d_id;
     ply_file << std::setprecision(17) << point3d.xyz.x() << " "
-             << point3d.xyz.y() << " " << point3d.xyz.z()
-             << " 255 255 255\n";
+             << point3d.xyz.y() << " " << point3d.xyz.z() << " "
+             << static_cast<int>(point3d.color.x()) << " "
+             << static_cast<int>(point3d.color.y()) << " "
+             << static_cast<int>(point3d.color.z()) << "\n";
   }
 }
 
@@ -670,6 +775,7 @@ int ReconSfmController::Run(std::ostream& out) const {
       options.registration_retry_max_reprojection_error_px;
   IncrementalMappingSummary summary =
       RunIncrementalMapping(graph, mapping_options, &reconstruction);
+  ExtractPointColors(&reconstruction);
   std::filesystem::create_directories(output_dir);
   WriteRunSummary(output_dir, reconstruction, summary,
                   feature_extraction_seconds);

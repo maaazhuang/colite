@@ -246,6 +246,8 @@ TEST(ReconMvsExeTest, InitializesPatchMatchMapsWhenImagePathIsProvided) {
                       model_path.string(),
                       "--image_path",
                       image_path.string(),
+                      "--resolution_level",
+                      "0",
                       "--output_path",
                       output_path.string(),
                       "--initialize_patch_match"},
@@ -284,6 +286,8 @@ TEST(ReconMvsExeTest, RunsPatchMatchStereoWhenRequested) {
                       "--output_path",
                       output_path.string(),
                       "--run_patch_match",
+                      "--resolution_level",
+                      "0",
                       "--patch_match_iterations",
                       "1",
                       "--patch_match_pyramid_levels",
@@ -865,6 +869,7 @@ TEST(ReconMvsExeTest, WritesUndistortedWorkspaceWhenRequested) {
   const int exit_code = RunReconMvs(
       {"recon_mvs", "--model_path", model_path.string(), "--image_path",
        image_path.string(), "--output_path", output_path.string(),
+       "--resolution_level", "0",
        "--image_undistorter", "--undistort_max_image_size", "64",
        "--initialize_patch_match"},
       out, err);

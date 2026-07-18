@@ -581,6 +581,37 @@ struct FusionTaskResult {
   std::vector<std::uint8_t> pair_diagnostics_seen;
 };
 
+std::optional<Eigen::Vector3d> SampleColorBilinear(const MvsImage& image,
+                                                    float x,
+                                                    float y) {
+  if (image.color.empty() || image.color.type() != CV_8UC3 ||
+      image.color.cols != image.gray.cols ||
+      image.color.rows != image.gray.rows || !std::isfinite(x) ||
+      !std::isfinite(y) || x < 0.0F || y < 0.0F ||
+      x > static_cast<float>(image.color.cols - 1) ||
+      y > static_cast<float>(image.color.rows - 1)) {
+    return std::nullopt;
+  }
+  const int x0 = static_cast<int>(std::floor(x));
+  const int y0 = static_cast<int>(std::floor(y));
+  const int x1 = std::min(x0 + 1, image.color.cols - 1);
+  const int y1 = std::min(y0 + 1, image.color.rows - 1);
+  const double dx = x - x0;
+  const double dy = y - y0;
+  const cv::Vec3b p00 = image.color.at<cv::Vec3b>(y0, x0);
+  const cv::Vec3b p01 = image.color.at<cv::Vec3b>(y0, x1);
+  const cv::Vec3b p10 = image.color.at<cv::Vec3b>(y1, x0);
+  const cv::Vec3b p11 = image.color.at<cv::Vec3b>(y1, x1);
+  Eigen::Vector3d color;
+  for (int channel = 0; channel < 3; ++channel) {
+    const double top = (1.0 - dx) * p00[channel] + dx * p01[channel];
+    const double bottom =
+        (1.0 - dx) * p10[channel] + dx * p11[channel];
+    color[channel] = (1.0 - dy) * top + dy * bottom;
+  }
+  return color;
+}
+
 enum class FusionRejectReason {
   kNone,
   kProjection,
@@ -723,16 +754,22 @@ std::optional<FusionPixelData> MakeFusionPixelData(
     }
     normal_world.normalize();
 
-    const std::optional<float> gray = SampleGrayBilinear(
-        images[image_idx], static_cast<float>(col), static_cast<float>(row));
-    const float clamped_gray = ClampFloat(gray.value_or(1.0F), 0.0F, 1.0F);
-    const double color_value =
-        static_cast<double>(std::lround(clamped_gray * 255.0F));
-
     FusionPixelData data;
     data.xyz = point_world;
     data.normal = normal_world;
-    data.color = Eigen::Vector3d(color_value, color_value, color_value);
+    const std::optional<Eigen::Vector3d> color = SampleColorBilinear(
+        images[image_idx], static_cast<float>(col), static_cast<float>(row));
+    if (color.has_value()) {
+      data.color = *color;
+    } else {
+      const std::optional<float> gray = SampleGrayBilinear(
+          images[image_idx], static_cast<float>(col), static_cast<float>(row));
+      const float clamped_gray =
+          ClampFloat(gray.value_or(1.0F), 0.0F, 1.0F);
+      const double color_value =
+          static_cast<double>(std::lround(clamped_gray * 255.0F));
+      data.color = Eigen::Vector3d(color_value, color_value, color_value);
+    }
     return data;
   } catch (const std::exception&) {
     return std::nullopt;
@@ -2396,7 +2433,9 @@ PatchMatchStereoResult RunPatchMatchStereoForImageSingleScale(
       case PatchMatchPropagationSchedule::kCheckerboard: {
         // 单组红黑只会让候选传播一格；四组红黑让一次用户迭代的
         // 等效访问量接近四方向传播，同时仍保留棋盘格更新结构。
-        for (const int parity : {0, 1, 1, 0, 0, 1, 1, 0}) {
+        for (std::size_t round = 0;
+             round < options.checkerboard_propagation_rounds; ++round) {
+          for (const int parity : {0, 1}) {
           const PatchMatchSweepSummary checkerboard =
               RunPatchMatchCheckerboardPropagation(
                   reference_view, source_views, reference_image,
@@ -2409,7 +2448,8 @@ PatchMatchStereoResult RunPatchMatchStereoForImageSingleScale(
               checkerboard.num_geometric_candidate_rejections;
           propagation_summary.num_geometric_candidate_acceptances +=
               checkerboard.num_geometric_candidate_acceptances;
-          result.summary.num_checkerboard_passes++;
+            result.summary.num_checkerboard_passes++;
+          }
         }
         break;
       }

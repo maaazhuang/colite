@@ -61,7 +61,7 @@ if(COLITE_ENABLE_DELAUNAY_MESHING)
 endif()
 
 if(COLITE_ENABLE_POISSON_MESHING)
-  add_subdirectory(src/thirdparty/PoissonRecon)
+  add_subdirectory(thirdparty/PoissonRecon)
 endif()
 
 add_subdirectory(src/colite)

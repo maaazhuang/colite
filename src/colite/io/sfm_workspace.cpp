@@ -542,7 +542,10 @@ void WriteWorkspaceSparseReconstruction(
         Point3DTrackReprojectionError(reconstruction, point3d).value_or(-1.0);
     points_file << point3d_id << " " << std::setprecision(17)
                 << point3d.xyz.x() << " " << point3d.xyz.y() << " "
-                << point3d.xyz.z() << " 255 255 255 "
+                << point3d.xyz.z() << " "
+                << static_cast<int>(point3d.color.x()) << " "
+                << static_cast<int>(point3d.color.y()) << " "
+                << static_cast<int>(point3d.color.z()) << " "
                 << track_error;
     for (const TrackElement& element : point3d.track.elements) {
       points_file << " " << element.image_id << " " << element.point2d_idx;
@@ -559,8 +562,10 @@ void WriteWorkspaceSparseReconstruction(
   for (const auto& [point3d_id, point3d] : reconstruction.Points3D()) {
     (void)point3d_id;
     ply_file << std::setprecision(17) << point3d.xyz.x() << " "
-             << point3d.xyz.y() << " " << point3d.xyz.z()
-             << " 255 255 255\n";
+             << point3d.xyz.y() << " " << point3d.xyz.z() << " "
+             << static_cast<int>(point3d.color.x()) << " "
+             << static_cast<int>(point3d.color.y()) << " "
+             << static_cast<int>(point3d.color.z()) << "\n";
   }
 }
 

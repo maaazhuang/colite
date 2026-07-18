@@ -42,6 +42,8 @@ struct ReconMvsControllerOptions {
   std::size_t patch_match_min_num_valid_sources = 1;
   std::size_t patch_match_max_num_aggregated_costs = 3;
   std::string patch_match_propagation_schedule = "checkerboard";
+  std::size_t patch_match_checkerboard_rounds = 1;
+  bool patch_match_diagnostics = false;
   std::size_t patch_match_geometric_refinement_iterations = 0;
   float patch_match_geometric_consistency_weight = 0.0F;
   float patch_match_geometric_max_relative_depth_error = 0.01F;
@@ -102,6 +104,8 @@ struct ReconMvsControllerOptions {
   std::string dense_map_format = "text";
   std::size_t num_threads = 1;
   std::size_t image_cache_size = 16;
+  // Level 1 (half width and height) is the default MVS working resolution.
+  std::size_t resolution_level = 1;
   int max_image_size = -1;
   std::uint32_t random_seed = 42;
   bool image_undistorter = false;

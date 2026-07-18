@@ -227,6 +227,7 @@ std::size_t UndistortWorkspaceImages(
   options.min_scale = cli_options.undistort_min_scale;
   options.max_scale = cli_options.undistort_max_scale;
   options.max_image_size = cli_options.undistort_max_image_size;
+  options.resolution_level = cli_options.resolution_level;
   const auto original_cameras = reconstruction->Cameras();
   const std::filesystem::path image_output =
       output_path / "undistorted" / "images";
@@ -465,6 +466,7 @@ std::size_t InitializePatchMatchMapsForWorkspace(
   workspace_options.image_path = cli_options.image_path;
   workspace_options.max_cache_entries = cli_options.image_cache_size;
   workspace_options.max_image_size = cli_options.max_image_size;
+  workspace_options.resolution_level = cli_options.resolution_level;
   mvs::MvsImageWorkspace workspace(reconstruction, workspace_options);
 
   mvs::PatchMatchInitializationOptions init_options;
@@ -1077,7 +1079,7 @@ struct PatchMatchRefinementJob {
   mvs::MvsImage reference_image;
   std::vector<mvs::PatchMatchView> source_views;
   std::vector<mvs::MvsImage> source_images;
-  std::vector<mvs::DenseDepthMap> source_depth_maps;
+  std::vector<std::size_t> source_result_indices;
   float min_depth = 0.0F;
   float max_depth = 0.0F;
 };
@@ -1089,16 +1091,22 @@ struct PatchMatchRefinementResult {
 
 PatchMatchRefinementResult RunPatchMatchRefinementJob(
     const PatchMatchRefinementJob& job,
+    const std::vector<mvs::DenseDepthMap>& initial_depth_maps,
     const mvs::PatchMatchStereoOptions& refinement_options,
     mvs::CudaPatchMatchWorkspace* cuda_workspace,
     std::size_t cuda_workspace_pool_size,
     std::size_t cuda_workspace_pool_slot) {
   PatchMatchRefinementResult output;
   output.result_index = job.result_index;
+  std::vector<mvs::DenseDepthMap> source_depth_maps;
+  source_depth_maps.reserve(job.source_result_indices.size());
+  for (const std::size_t source_result_index : job.source_result_indices) {
+    source_depth_maps.push_back(initial_depth_maps.at(source_result_index));
+  }
   output.result =
       mvs::RunPatchMatchStereoForImageWithSourceDepthsAndCudaWorkspace(
           job.reference_view, job.source_views, job.reference_image,
-          job.source_images, job.source_depth_maps, job.min_depth,
+          job.source_images, source_depth_maps, job.min_depth,
           job.max_depth, cuda_workspace, refinement_options);
   if (output.result.summary.actual_backend == mvs::PatchMatchBackend::kCuda &&
       cuda_workspace_pool_size > 0) {
@@ -1112,6 +1120,7 @@ PatchMatchRefinementResult RunPatchMatchRefinementJob(
 
 std::vector<PatchMatchRefinementResult> RunPatchMatchRefinementJobs(
     const std::vector<PatchMatchRefinementJob>& jobs,
+    const std::vector<mvs::DenseDepthMap>& initial_depth_maps,
     const mvs::PatchMatchStereoOptions& refinement_options,
     const ReconMvsControllerOptions& cli_options,
     const std::vector<mvs::CudaPatchMatchWorkspace*>& cuda_workspace_pool,
@@ -1142,11 +1151,11 @@ std::vector<PatchMatchRefinementResult> RunPatchMatchRefinementJobs(
       const PatchMatchRefinementJob* job_ptr = &job;
       futures.push_back(std::async(
           std::launch::async,
-          [job_ptr, &refinement_options, &cuda_workspace_pool, pool_size,
-           slot]() {
+          [job_ptr, &initial_depth_maps, &refinement_options,
+           &cuda_workspace_pool, pool_size, slot]() {
             return RunPatchMatchRefinementJob(
-                *job_ptr, refinement_options, cuda_workspace_pool[slot],
-                pool_size, slot);
+                *job_ptr, initial_depth_maps, refinement_options,
+                cuda_workspace_pool[slot], pool_size, slot);
           }));
     }
     while (!futures.empty()) {
@@ -1155,7 +1164,7 @@ std::vector<PatchMatchRefinementResult> RunPatchMatchRefinementJobs(
   } else if (num_threads == 1 || jobs.size() <= 1) {
     for (const PatchMatchRefinementJob& job : jobs) {
       outputs.push_back(RunPatchMatchRefinementJob(
-          job, refinement_options, nullptr, 0, 0));
+          job, initial_depth_maps, refinement_options, nullptr, 0, 0));
     }
   } else {
     std::vector<std::future<PatchMatchRefinementResult>> futures;
@@ -1163,9 +1172,11 @@ std::vector<PatchMatchRefinementResult> RunPatchMatchRefinementJobs(
     for (const PatchMatchRefinementJob& job : jobs) {
       const PatchMatchRefinementJob* job_ptr = &job;
       futures.push_back(std::async(
-          std::launch::async, [job_ptr, &refinement_options]() {
+          std::launch::async,
+          [job_ptr, &initial_depth_maps, &refinement_options]() {
             return RunPatchMatchRefinementJob(
-                *job_ptr, refinement_options, nullptr, 0, 0);
+                *job_ptr, initial_depth_maps, refinement_options, nullptr, 0,
+                0);
           }));
       if (futures.size() >= num_threads) {
         collect_oldest_future(&futures);
@@ -1428,6 +1439,7 @@ std::size_t RunPatchMatchForWorkspace(
   workspace_options.image_path = cli_options.image_path;
   workspace_options.max_cache_entries = cli_options.image_cache_size;
   workspace_options.max_image_size = cli_options.max_image_size;
+  workspace_options.resolution_level = cli_options.resolution_level;
   mvs::MvsImageWorkspace workspace(reconstruction, workspace_options);
 
   mvs::PatchMatchStereoOptions patch_match_options;
@@ -1471,6 +1483,10 @@ std::size_t RunPatchMatchForWorkspace(
   patch_match_options.propagation_schedule =
       ParsePatchMatchPropagationSchedule(
           cli_options.patch_match_propagation_schedule);
+  patch_match_options.checkerboard_propagation_rounds =
+      cli_options.patch_match_checkerboard_rounds;
+  patch_match_options.collect_diagnostics =
+      cli_options.patch_match_diagnostics;
   const bool run_geometric_refinement =
       cli_options.patch_match_geometric_refinement_iterations > 0 &&
       cli_options.patch_match_geometric_consistency_weight > 0.0F;
@@ -1582,7 +1598,7 @@ std::size_t RunPatchMatchForWorkspace(
         const PatchMatchWorkspaceResult& source_result = results[it->second];
         job.source_views.push_back(source_result.view);
         job.source_images.push_back(source_result.image);
-        job.source_depth_maps.push_back(initial_depth_maps[it->second]);
+        job.source_result_indices.push_back(it->second);
       }
       if (job.source_views.empty()) {
         continue;
@@ -1590,9 +1606,9 @@ std::size_t RunPatchMatchForWorkspace(
       refinement_jobs.push_back(std::move(job));
     }
     std::vector<PatchMatchRefinementResult> refinement_results =
-        RunPatchMatchRefinementJobs(refinement_jobs, refinement_options,
-                                    cli_options, cuda_workspace_ptrs,
-                                    scheduling_summary_out);
+        RunPatchMatchRefinementJobs(
+            refinement_jobs, initial_depth_maps, refinement_options,
+            cli_options, cuda_workspace_ptrs, scheduling_summary_out);
     for (PatchMatchRefinementResult& refinement_result :
          refinement_results) {
       results[refinement_result.result_index].result =
@@ -2271,6 +2287,7 @@ mvs::StereoFusionSummary FusePersistedStereoMaps(
   workspace_options.image_path = cli_options.image_path;
   workspace_options.max_cache_entries = cli_options.image_cache_size;
   workspace_options.max_image_size = cli_options.max_image_size;
+  workspace_options.resolution_level = cli_options.resolution_level;
   mvs::MvsImageWorkspace workspace(reconstruction, workspace_options);
 
   const std::vector<const mvs::ImageMvsSummary*> image_summaries =
@@ -2374,6 +2391,7 @@ int ReconMvsController::Run(std::ostream& out) const {
         UndistortWorkspaceImages(cli_options, output_path, &reconstruction);
     cli_options.image_path = output_path / "undistorted" / "images";
     cli_options.max_image_size = -1;
+    cli_options.resolution_level = 0;
   }
 
   mvs::MvsPipelineOptions mvs_options;

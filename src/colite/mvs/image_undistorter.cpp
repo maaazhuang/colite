@@ -51,7 +51,8 @@ bool ImageUndistortionOptions::Check() const {
   return std::isfinite(blank_pixels) && blank_pixels >= 0.0 &&
          blank_pixels <= 1.0 && std::isfinite(min_scale) &&
          std::isfinite(max_scale) && min_scale > 0.0 &&
-         min_scale <= max_scale && max_image_size != 0;
+         min_scale <= max_scale && max_image_size != 0 &&
+         resolution_level <= 30;
 }
 
 Camera ComputeUndistortedCamera(const Camera& camera,
@@ -142,6 +143,10 @@ Camera ComputeUndistortedCamera(const Camera& camera,
         1.0, scale_y * static_cast<double>(original_height)));
     output.params[2] *= static_cast<double>(output.width) / original_width;
     output.params[3] *= static_cast<double>(output.height) / original_height;
+  }
+  if (options.resolution_level > 0) {
+    RescaleCamera(std::ldexp(1.0, -static_cast<int>(options.resolution_level)),
+                  &output);
   }
   if (options.max_image_size > 0) {
     const double scale =

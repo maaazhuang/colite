@@ -29,7 +29,7 @@ std::string MapperConfigHash(const std::filesystem::path& workspace_path) {
   return StableConfigHash(
       {{"stage", "sparse"},
        {"geometry_hash", CurrentStageHash(workspace_path, "geometry")},
-       {"algorithm_version", "colmap_multiview_create_continue_v14"},
+       {"algorithm_version", "colmap_multiview_create_continue_rgb_v15"},
        {"min_pair_median_triangulation_angle_deg", "1"},
        {"local_retriangulation_min_angle_deg", "1"}});
 }
@@ -100,6 +100,7 @@ MapperControllerSummary MapperController::Run() const {
   const IncrementalMappingSummary mapping_summary =
       RunIncrementalMapping(graph, mapping_options, &reconstruction);
 
+  ExtractPointColors(&reconstruction);
   WriteWorkspaceSparseReconstruction(options_.workspace_path, reconstruction);
   WriteRegistrationDiagnostics(WorkspaceSparsePath(options_.workspace_path),
                                mapping_summary);

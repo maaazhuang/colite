@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <opencv2/imgcodecs.hpp>
 
 #include "colite/controllers/recon_sfm_controller.h"
 #include "colite/core/camera.h"
@@ -183,7 +184,9 @@ TEST(ReconSfmExeTest, WritesColmapTextModel) {
   Track track;
   track.AddElement(1, 0);
   track.AddElement(2, 0);
-  reconstruction.AddPoint3D(Eigen::Vector3d(0.0, 0.0, 5.0), track);
+  const Point3DId point3d_id =
+      reconstruction.AddPoint3D(Eigen::Vector3d(0.0, 0.0, 5.0), track);
+  reconstruction.GetPoint3D(point3d_id).color = {12, 34, 56};
 
   const std::filesystem::path output_path =
       std::filesystem::temp_directory_path() / "colite_colmap_export_test";
@@ -200,7 +203,7 @@ TEST(ReconSfmExeTest, WritesColmapTextModel) {
             std::string::npos);
   EXPECT_NE(images.find("100 120 1"), std::string::npos);
   EXPECT_NE(points.find("# 3D point list"), std::string::npos);
-  EXPECT_NE(points.find("1 0 0 5 255 255 255"), std::string::npos);
+  EXPECT_NE(points.find("1 0 0 5 12 34 56"), std::string::npos);
   EXPECT_NE(points.find("1 0 2 0"), std::string::npos);
 }
 
@@ -237,7 +240,9 @@ TEST(ReconSfmExeTest, WritesQualitySummaryAndPlyPointCloud) {
   Track track;
   track.AddElement(1, 0);
   track.AddElement(2, 0);
-  reconstruction.AddPoint3D(Eigen::Vector3d(0.0, 0.0, 5.0), track);
+  const Point3DId point3d_id =
+      reconstruction.AddPoint3D(Eigen::Vector3d(0.0, 0.0, 5.0), track);
+  reconstruction.GetPoint3D(point3d_id).color = {12, 34, 56};
 
   const controllers::ReconstructionQualityStats stats =
       controllers::ComputeReconstructionQualityStats(reconstruction);
@@ -266,7 +271,50 @@ TEST(ReconSfmExeTest, WritesQualitySummaryAndPlyPointCloud) {
   EXPECT_NE(summary_text.find("max_reprojection_error 0"), std::string::npos);
   EXPECT_NE(ply_text.find("ply"), std::string::npos);
   EXPECT_NE(ply_text.find("element vertex 1"), std::string::npos);
-  EXPECT_NE(ply_text.find("0 0 5 255 255 255"), std::string::npos);
+  EXPECT_NE(ply_text.find("0 0 5 12 34 56"), std::string::npos);
+}
+
+TEST(ReconSfmExeTest, ExtractsMeanRgbFromAllTrackObservations) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() / "colite_sparse_rgb_test";
+  std::filesystem::create_directories(root);
+  ASSERT_TRUE(cv::imwrite((root / "image1.png").string(),
+                          cv::Mat(2, 2, CV_8UC3, cv::Scalar(30, 20, 10))));
+  ASSERT_TRUE(cv::imwrite((root / "image2.png").string(),
+                          cv::Mat(2, 2, CV_8UC3, cv::Scalar(50, 40, 30))));
+
+  Reconstruction reconstruction;
+  Camera camera;
+  camera.id = 1;
+  camera.model_id = CameraModelId::kPinhole;
+  camera.width = 2;
+  camera.height = 2;
+  camera.params = {10.0, 10.0, 1.0, 1.0};
+  reconstruction.AddCamera(camera);
+  for (ImageId image_id = 1; image_id <= 2; ++image_id) {
+    Image image;
+    image.id = image_id;
+    image.camera_id = 1;
+    image.name = "image" + std::to_string(image_id) + ".png";
+    image.file_path = (root / image.name).string();
+    image.registered = true;
+    image.cam_from_world = Pose3{};
+    image.points2d.push_back({{0.5, 0.5}, 0, kInvalidPoint3DId});
+    reconstruction.AddImage(image);
+    reconstruction.RegisterImage(image_id);
+  }
+  Track track;
+  track.AddElement(1, 0);
+  track.AddElement(2, 0);
+  const Point3DId point3d_id =
+      reconstruction.AddPoint3D(Eigen::Vector3d(0.0, 0.0, 5.0), track);
+
+  controllers::ExtractPointColors(&reconstruction);
+
+  const auto& color = reconstruction.GetPoint3D(point3d_id).color;
+  EXPECT_EQ(color.x(), 20);
+  EXPECT_EQ(color.y(), 30);
+  EXPECT_EQ(color.z(), 40);
 }
 
 TEST(ReconSfmExeTest, WritesPairDiagnosticsForVerifiedMatches) {

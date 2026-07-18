@@ -1722,6 +1722,7 @@ TEST(PatchMatchBackendTest, CudaBackendRunsExplicitRedBlackCheckerboard) {
   const MvsImage reference = MakeGradientImage(8, 8);
   PatchMatchStereoOptions options;
   options.backend = PatchMatchBackend::kCuda;
+  options.collect_diagnostics = true;
   options.num_iterations = 1;
   options.propagation_schedule = PatchMatchPropagationSchedule::kCheckerboard;
   options.cost.window_radius = 1;
@@ -1732,7 +1733,7 @@ TEST(PatchMatchBackendTest, CudaBackendRunsExplicitRedBlackCheckerboard) {
                                   {reference}, 2.0F, 6.0F, options);
 
   EXPECT_EQ(result.summary.actual_backend, PatchMatchBackend::kCuda);
-  EXPECT_EQ(result.summary.num_checkerboard_passes, 8U);
+  EXPECT_EQ(result.summary.num_checkerboard_passes, 2U);
   EXPECT_EQ(result.summary.num_forward_sweeps, 0U);
   EXPECT_EQ(result.summary.num_backward_sweeps, 0U);
   EXPECT_EQ(result.summary.num_top_down_sweeps, 0U);
@@ -1908,6 +1909,7 @@ TEST(CpuPatchMatchStereoTest, CheckerboardScheduleRunsFourRedBlackRounds) {
   options.cost.window_radius = 1;
   options.propagation_schedule =
       PatchMatchPropagationSchedule::kCheckerboard;
+  options.checkerboard_propagation_rounds = 4;
 
   const PatchMatchStereoResult result =
       RunPatchMatchStereoForImage(MakeView(1), {MakeView(2)}, reference,
@@ -2223,6 +2225,28 @@ TEST(CpuStereoFusionTest, FusesConsistentDepthPixelsIntoWorldPoints) {
   EXPECT_EQ(point.color.x(), static_cast<std::uint8_t>(31));
   EXPECT_EQ(point.color.y(), static_cast<std::uint8_t>(31));
   EXPECT_EQ(point.color.z(), static_cast<std::uint8_t>(31));
+}
+
+TEST(CpuStereoFusionTest, PreservesRgbSourceColor) {
+  MvsImage reference = MakeGradientImage(5, 5);
+  reference.color = cv::Mat(5, 5, CV_8UC3, cv::Scalar(12, 34, 56));
+  DenseDepthMap depth_map(5, 5, 1.0F, 5.0F);
+  depth_map.Set(2, 2, 3.0F);
+  NormalMap normal_map(5, 5);
+  normal_map.Set(2, 2, Eigen::Vector3f(0.0F, 0.0F, 1.0F));
+  DenseCostMap cost_map(5, 5);
+  cost_map.Set(2, 2, 0.1F);
+  ConsistencyGraph graph(5, 5);
+  graph.Add(2, 2, 2);
+
+  const StereoFusionResult result =
+      FuseStereoDepthMaps({MakeView(1)}, {reference}, {depth_map},
+                          {normal_map}, {cost_map}, {graph});
+
+  ASSERT_EQ(result.points.size(), 1U);
+  EXPECT_EQ(result.points[0].color.x(), 12);
+  EXPECT_EQ(result.points[0].color.y(), 34);
+  EXPECT_EQ(result.points[0].color.z(), 56);
 }
 
 TEST(CpuStereoFusionTest, MergesReciprocalConsistentPixelsIntoSingleTrack) {

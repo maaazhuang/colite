@@ -63,25 +63,32 @@ MvsImage MvsImageWorkspace::LoadImage(ImageId image_id) const {
   const std::filesystem::path image_path = ResolveImagePath(image);
 
   cv::Mat gray_u8 = cv::imread(image_path.string(), cv::IMREAD_GRAYSCALE);
-  if (gray_u8.empty()) {
+  cv::Mat color_bgr = cv::imread(image_path.string(), cv::IMREAD_COLOR);
+  if (gray_u8.empty() || color_bgr.empty()) {
     throw std::runtime_error("Failed to read MVS image: " +
                              image_path.string());
   }
 
-  double scale = 1.0;
+  double scale = std::ldexp(
+      1.0, -static_cast<int>(
+               std::min<std::size_t>(options_.resolution_level, 30)));
   cv::Mat resized_u8 = gray_u8;
+  cv::Mat resized_color_bgr = color_bgr;
   if (options_.max_image_size > 0) {
     const int max_dimension = std::max(gray_u8.cols, gray_u8.rows);
-    if (max_dimension > options_.max_image_size) {
-      scale = static_cast<double>(options_.max_image_size) /
-              static_cast<double>(max_dimension);
-      const int new_width =
-          std::max(1, static_cast<int>(std::round(gray_u8.cols * scale)));
-      const int new_height =
-          std::max(1, static_cast<int>(std::round(gray_u8.rows * scale)));
-      cv::resize(gray_u8, resized_u8, cv::Size(new_width, new_height),
-                 0.0, 0.0, cv::INTER_AREA);
-    }
+    scale = std::min(scale,
+                     static_cast<double>(options_.max_image_size) /
+                         static_cast<double>(max_dimension));
+  }
+  if (scale < 1.0) {
+    const int new_width =
+        std::max(1, static_cast<int>(std::round(gray_u8.cols * scale)));
+    const int new_height =
+        std::max(1, static_cast<int>(std::round(gray_u8.rows * scale)));
+    cv::resize(gray_u8, resized_u8, cv::Size(new_width, new_height), 0.0, 0.0,
+               cv::INTER_AREA);
+    cv::resize(color_bgr, resized_color_bgr,
+               cv::Size(new_width, new_height), 0.0, 0.0, cv::INTER_AREA);
   }
 
   MvsImage result;
@@ -89,6 +96,7 @@ MvsImage MvsImageWorkspace::LoadImage(ImageId image_id) const {
   result.name = image.name;
   result.scale = scale;
   resized_u8.convertTo(result.gray, CV_32FC1, 1.0 / 255.0);
+  cv::cvtColor(resized_color_bgr, result.color, cv::COLOR_BGR2RGB);
   return result;
 }
 

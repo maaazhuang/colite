@@ -17,6 +17,9 @@ struct MvsImage {
   ImageId image_id = kInvalidImageId;
   std::string name;
   cv::Mat gray;
+  // CV_8UC3 in RGB channel order. PatchMatch continues to use gray; fusion
+  // samples this image to preserve the source colors in the dense cloud.
+  cv::Mat color;
   double scale = 1.0;
 
   std::size_t Width() const;
@@ -33,6 +36,8 @@ struct MvsImageWorkspaceOptions {
 
   // 大于 0 时按最长边缩放图像，保持宽高比。
   int max_image_size = -1;
+  // Each level halves width and height before applying max_image_size.
+  std::size_t resolution_level = 0;
 };
 
 // MVS 图像 workspace。它只负责图像加载、尺度变换和 LRU 缓存，不负责深度估计。

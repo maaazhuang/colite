@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <optional>
 
 #include <opencv2/core.hpp>
@@ -14,6 +15,7 @@ struct ImageUndistortionOptions {
   double min_scale = 0.2;
   double max_scale = 2.0;
   int max_image_size = -1;
+  std::size_t resolution_level = 0;
 
   bool Check() const;
 };
