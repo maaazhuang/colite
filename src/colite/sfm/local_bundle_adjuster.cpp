@@ -12,6 +12,7 @@
 #include <ceres/local_parameterization.h>
 
 #include "colite/core/geometry.h"
+#include "colite/core/parallel.h"
 
 namespace colite {
 namespace {
@@ -279,6 +280,19 @@ std::set<ImageId> UnionImageIds(const std::set<ImageId>& local_image_ids,
   return image_ids;
 }
 
+bool ContainsAllRegisteredImagesForCamera(
+    const Reconstruction& reconstruction,
+    CameraId camera_id,
+    const std::set<ImageId>& bundle_image_ids) {
+  for (const auto& [image_id, image] : reconstruction.Images()) {
+    if (image.registered && image.camera_id == camera_id &&
+        bundle_image_ids.find(image_id) == bundle_image_ids.end()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::vector<Observation> CollectObservations(
     const Reconstruction& reconstruction,
     const std::set<ImageId>& image_ids,
@@ -472,8 +486,17 @@ LocalBundleAdjustmentSummary AdjustLocalBundle(
     const std::vector<int> constant_indices =
         ConstantCameraParameterIndices(camera, options.refine_camera_params,
                                        options.refine_camera_param_names);
-    if (constant_indices.size() == params.size()) {
+    // A shared camera parameter block affects every image that references it.
+    // Refining it from only a local subset makes observations outside the
+    // objective inconsistent and the following filter can delete valid global
+    // tracks. Keep intrinsics constant unless all registered images using this
+    // camera are represented in the local bundle; global BA will still refine
+    // the camera from the complete reconstruction.
+    const bool bundle_covers_camera = ContainsAllRegisteredImagesForCamera(
+        *reconstruction, camera_id, image_ids);
+    if (constant_indices.size() == params.size() || !bundle_covers_camera) {
       problem.SetParameterBlockConstant(params.data());
+      ++summary.num_constant_cameras;
     } else {
       ++summary.num_variable_cameras;
       if (!constant_indices.empty()) {
@@ -505,7 +528,7 @@ LocalBundleAdjustmentSummary AdjustLocalBundle(
   solver_options.max_num_iterations = options.max_num_iterations;
   solver_options.linear_solver_type = ceres::DENSE_SCHUR;
   solver_options.minimizer_progress_to_stdout = false;
-  solver_options.num_threads = 1;
+  solver_options.num_threads = parallel::getNumThreads();
 
   ceres::Solver::Summary solver_summary;
   ceres::Solve(solver_options, &problem, &solver_summary);

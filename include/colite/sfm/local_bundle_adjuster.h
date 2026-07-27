@@ -40,6 +40,7 @@ struct LocalBundleAdjustmentSummary {
   std::size_t num_constant_images = 0;
   std::size_t num_variable_images = 0;
   std::size_t num_variable_points = 0;
+  std::size_t num_constant_cameras = 0;
   std::size_t num_variable_cameras = 0;
   std::size_t num_gauge_constant_translation_images = 0;
   std::size_t num_residuals = 0;

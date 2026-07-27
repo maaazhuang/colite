@@ -687,5 +687,50 @@ TEST(IncrementalMapperTest, CompletesTracksAcrossAllRegisteredImagesAtEnd) {
   EXPECT_EQ(reconstruction.GetPoint3D(merged_id).track.Length(), 2U);
 }
 
+TEST(IncrementalMapperTest,
+     RetriangulatesAllRegisteredImagesBeforeGlobalBundleAdjustment) {
+  const Camera camera = MakeCamera(1);
+  const std::vector<Eigen::Vector3d> points = MakeScenePoints();
+  const Pose3 pose1 = CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0));
+  const Pose3 pose2 = CameraAt(Eigen::Vector3d(1.0, 0.0, 0.0));
+  const FeatureSet features1 = ProjectFeatures(camera, pose1, points);
+  const FeatureSet features2 = ProjectFeatures(camera, pose2, points);
+  const std::vector<FeatureMatch> matches = IdentityMatches(0, points.size());
+
+  MatchGraph graph;
+  SetFeatures(&graph, 1, features1);
+  SetFeatures(&graph, 2, features2);
+  SetMatches(&graph, 1, 2, matches);
+  SetVerifiedGeometry(&graph, 1, 2, MakeVerifiedGeometry(matches));
+
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  Image image1 = MakeImage(1, 1);
+  Image image2 = MakeImage(2, 1);
+  image1.cam_from_world = pose1;
+  image2.cam_from_world = pose2;
+  image1.registered = true;
+  image2.registered = true;
+  for (std::size_t i = 0; i < points.size(); ++i) {
+    image1.points2d.push_back(
+        {Eigen::Vector2d(features1.keypoints[i].x, features1.keypoints[i].y),
+         static_cast<Point2DIdx>(i), kInvalidPoint3DId});
+    image2.points2d.push_back(
+        {Eigen::Vector2d(features2.keypoints[i].x, features2.keypoints[i].y),
+         static_cast<Point2DIdx>(i), kInvalidPoint3DId});
+  }
+  reconstruction.AddImage(image1);
+  reconstruction.AddImage(image2);
+
+  IncrementalTriangulatorOptions options;
+  options.ignore_two_view_tracks = false;
+  options.min_triangulation_angle_deg = 0.1;
+  const IncrementalTriangulatorSummary summary =
+      RetriangulateAllRegisteredImages(graph, options, &reconstruction);
+
+  EXPECT_EQ(summary.num_created_points, points.size());
+  EXPECT_EQ(reconstruction.Points3D().size(), points.size());
+}
+
 }  // namespace
 }  // namespace colite

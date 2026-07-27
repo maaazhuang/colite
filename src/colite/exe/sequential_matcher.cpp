@@ -84,7 +84,7 @@ void PrintHelp(std::string_view executable,
          "of building one in memory.\n"
       << "  --vocab_tree_sequential_overlap <n> Merge next-n temporal pairs; "
          "0 disables, default 2.\n"
-      << "  --matcher <bf|flann>     Descriptor matcher backend, default flann.\n"
+      << "  --matcher <bf|flann|cuda> Descriptor matcher backend, default flann.\n"
       << "  --max_ratio <r>          Lowe ratio, default 0.8.\n";
 }
 
@@ -159,6 +159,8 @@ int RunMatcherCommand(const std::vector<std::string>& args,
           options.matcher_backend = DescriptorMatcherBackend::kBruteForce;
         } else if (matcher == "flann") {
           options.matcher_backend = DescriptorMatcherBackend::kFlann;
+        } else if (matcher == "cuda") {
+          options.matcher_backend = DescriptorMatcherBackend::kCudaBruteForce;
         } else {
           throw std::invalid_argument("Unsupported matcher: " + matcher);
         }

@@ -3,6 +3,8 @@
 #include <memory>
 #include <vector>
 
+#include <Eigen/Core>
+
 #include "colite/core/feature.h"
 
 namespace colite {
@@ -14,7 +16,10 @@ enum class DescriptorMatcherBackend {
   kBruteForce,
   kOpenCVBruteForce = kBruteForce,  // 兼容旧命名，内部已不再依赖 OpenCV matcher。
   kFlann,
+  kCudaBruteForce,
 };
+
+bool IsCudaDescriptorMatcherAvailable();
 
 struct DescriptorMatchingOptions {
   DescriptorMatcherBackend backend = DescriptorMatcherBackend::kBruteForce;
@@ -27,6 +32,11 @@ struct DescriptorMatchingOptions {
 
   // 是否启用互检。启用后要求 A->B 的最佳匹配和 B->A 的最佳匹配互相一致。
   bool mutual_check = true;
+};
+
+struct GuidedDescriptorMatchingStats {
+  double candidate_generation_seconds = 0.0;
+  double descriptor_search_seconds = 0.0;
 };
 
 // Pre-quantizes descriptors and, for FLANN, builds the search index once per
@@ -48,6 +58,14 @@ class PreparedFeatureMatcher {
       const PreparedFeatureMatcher&,
       const PreparedFeatureMatcher&,
       const DescriptorMatchingOptions&);
+  friend std::vector<FeatureMatch>
+  MatchPreparedFeatureSetsGuidedFundamental(
+      const PreparedFeatureMatcher&,
+      const PreparedFeatureMatcher&,
+      const Eigen::Matrix3d&,
+      double,
+      const DescriptorMatchingOptions&,
+      GuidedDescriptorMatchingStats*);
 };
 
 std::vector<FeatureMatch> MatchPreparedFeatureSets(
@@ -55,10 +73,27 @@ std::vector<FeatureMatch> MatchPreparedFeatureSets(
     const PreparedFeatureMatcher& features2,
     const DescriptorMatchingOptions& options = {});
 
+std::vector<FeatureMatch> MatchPreparedFeatureSetsGuidedFundamental(
+    const PreparedFeatureMatcher& features1,
+    const PreparedFeatureMatcher& features2,
+    const Eigen::Matrix3d& fundamental_matrix,
+    double max_sampson_error_px,
+    const DescriptorMatchingOptions& options = {},
+    GuidedDescriptorMatchingStats* stats = nullptr);
+
 // 匹配两个 FeatureSet 的描述子，输出特征索引对。
 std::vector<FeatureMatch> MatchFeatureSets(
     const FeatureSet& features1,
     const FeatureSet& features2,
+    const DescriptorMatchingOptions& options = {});
+
+// Re-search descriptors inside an epipolar corridor. This can recover a
+// geometrically valid match hidden by an off-epipolar global distractor.
+std::vector<FeatureMatch> MatchFeatureSetsGuidedFundamental(
+    const FeatureSet& features1,
+    const FeatureSet& features2,
+    const Eigen::Matrix3d& fundamental_matrix,
+    double max_sampson_error_px,
     const DescriptorMatchingOptions& options = {});
 
 // 直接匹配两组描述子。描述子矩阵每一行对应一个特征点。

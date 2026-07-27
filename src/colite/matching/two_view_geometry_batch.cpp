@@ -1,6 +1,9 @@
 #include "colite/matching/two_view_geometry_batch.h"
 
 #include <stdexcept>
+#include <vector>
+
+#include "colite/core/parallel.h"
 
 namespace colite {
 namespace {
@@ -37,17 +40,38 @@ TwoViewGeometryBatchSummary VerifyMatchGraphGeometries(
   TwoViewGeometryBatchSummary summary;
   graph->verified_geometries.clear();
 
-  for (const auto& [pair, matches] : graph->matches) {
-    ++summary.num_input_pairs;
+  using MatchEntry =
+      std::pair<const ImagePair, std::vector<FeatureMatch>>;
+  std::vector<const MatchEntry*> match_entries;
+  match_entries.reserve(graph->matches.size());
+  for (const auto& entry : graph->matches) {
+    match_entries.push_back(&entry);
+  }
+  std::vector<TwoViewGeometry> geometries(match_entries.size());
 
-    const Camera& camera1 = RequireCamera(cameras_by_image, pair.image_id1);
-    const Camera& camera2 = RequireCamera(cameras_by_image, pair.image_id2);
-    const FeatureSet& features1 = RequireFeatures(*graph, pair.image_id1);
-    const FeatureSet& features2 = RequireFeatures(*graph, pair.image_id2);
+  parallel::parallel_for_(
+      parallel::Range(0, static_cast<int>(match_entries.size())),
+      [&](const parallel::Range& range) {
+        for (int index = range.start; index < range.end; ++index) {
+          const auto& [pair, matches] = *match_entries[index];
+          const Camera& camera1 =
+              RequireCamera(cameras_by_image, pair.image_id1);
+          const Camera& camera2 =
+              RequireCamera(cameras_by_image, pair.image_id2);
+          const FeatureSet& features1 =
+              RequireFeatures(*graph, pair.image_id1);
+          const FeatureSet& features2 =
+              RequireFeatures(*graph, pair.image_id2);
+          geometries[index] = EstimateTwoViewGeometry(
+              camera1, features1, camera2, features2, matches,
+              options.geometry_options);
+        }
+      });
 
-    const TwoViewGeometry geometry =
-        EstimateTwoViewGeometry(camera1, features1, camera2, features2,
-                                matches, options.geometry_options);
+  summary.num_input_pairs = match_entries.size();
+  for (std::size_t index = 0; index < match_entries.size(); ++index) {
+    const ImagePair& pair = match_entries[index]->first;
+    const TwoViewGeometry& geometry = geometries[index];
     if (IsVerifiedGeometryUsable(geometry)) {
       graph->verified_geometries[pair] = geometry;
       ++summary.num_verified_pairs;

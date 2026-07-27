@@ -87,7 +87,7 @@ namespace {
 
 constexpr char kConsistencyGraphBinaryMagic[] =
     "COLITE_CONSISTENCY_GRAPH_BINARY";
-constexpr int kConsistencyGraphBinaryVersion = 1;
+constexpr int kConsistencyGraphBinaryVersion = 2;
 
 void RequireValidDepthRange(float depth_min, float depth_max) {
   if (!std::isfinite(depth_min) || !std::isfinite(depth_max) ||
@@ -262,10 +262,21 @@ void RequireCompatiblePatchMatchMaps(const MvsImage& reference_image,
 void RequireCompatibleFusionMaps(const MvsImage& reference_image,
                                  const DenseDepthMap& depth_map,
                                  const NormalMap& normal_map,
-                                 const DenseCostMap& cost_map,
+                                 const DenseCostMap* cost_map,
                                  const ConsistencyGraph* graph) {
-  RequireCompatiblePatchMatchMaps(reference_image, depth_map, normal_map,
-                                  cost_map);
+  if (depth_map.Width() != normal_map.Width() ||
+      depth_map.Height() != normal_map.Height() ||
+      depth_map.Width() != reference_image.Width() ||
+      depth_map.Height() != reference_image.Height()) {
+    throw std::invalid_argument(
+        "Reference image, depth map and normal map must have identical sizes.");
+  }
+  if (cost_map != nullptr &&
+      (cost_map->Width() != depth_map.Width() ||
+       cost_map->Height() != depth_map.Height())) {
+    throw std::invalid_argument(
+        "Cost map and fusion maps must have identical sizes.");
+  }
   if (graph != nullptr &&
       (graph->Width() != depth_map.Width() ||
        graph->Height() != depth_map.Height())) {
@@ -560,60 +571,83 @@ PatchMatchMaps ResizePatchMatchMapsNearest(const PatchMatchMaps& source,
   return resized;
 }
 
+struct FusionPixelData {
+  Eigen::Vector3d xyz = Eigen::Vector3d::Zero();
+  Eigen::Vector3f normal = Eigen::Vector3f::Zero();
+  Eigen::Matrix<std::uint8_t, 3, 1> color =
+      Eigen::Matrix<std::uint8_t, 3, 1>(255, 255, 255);
+};
+
+struct FusionViewGeometry {
+  bool pinhole = false;
+  double fx = 1.0;
+  double fy = 1.0;
+  double cx = 0.0;
+  double cy = 0.0;
+  Eigen::Matrix3d cam_from_world_rotation = Eigen::Matrix3d::Identity();
+  Eigen::Matrix3d world_from_cam_rotation = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d cam_from_world_translation = Eigen::Vector3d::Zero();
+  Eigen::Vector3d camera_center = Eigen::Vector3d::Zero();
+};
+
+FusionViewGeometry MakeFusionViewGeometry(const PatchMatchView& view) {
+  FusionViewGeometry geometry;
+  geometry.cam_from_world_rotation =
+      view.cam_from_world.q_cw.toRotationMatrix();
+  geometry.world_from_cam_rotation =
+      geometry.cam_from_world_rotation.transpose();
+  geometry.cam_from_world_translation = view.cam_from_world.t_cw;
+  geometry.camera_center = view.cam_from_world.CameraCenter();
+  if (view.camera.model_id == CameraModelId::kPinhole &&
+      view.camera.params.size() >= 4) {
+    geometry.pinhole = true;
+    geometry.fx = view.camera.params[0];
+    geometry.fy = view.camera.params[1];
+    geometry.cx = view.camera.params[2];
+    geometry.cy = view.camera.params[3];
+  } else if (view.camera.model_id == CameraModelId::kSimplePinhole &&
+             view.camera.params.size() >= 3) {
+    geometry.pinhole = true;
+    geometry.fx = view.camera.params[0];
+    geometry.fy = view.camera.params[0];
+    geometry.cx = view.camera.params[1];
+    geometry.cy = view.camera.params[2];
+  }
+  return geometry;
+}
+
 struct FusionObservation {
   std::size_t image_idx = 0;
   std::size_t row = 0;
   std::size_t col = 0;
   std::size_t traversal_depth = 0;
-  double normal_angle_degrees = 0.0;
-  double view_angle_degrees = 0.0;
-};
-
-struct FusionPixelData {
-  Eigen::Vector3d xyz = Eigen::Vector3d::Zero();
-  Eigen::Vector3d normal = Eigen::Vector3d::Zero();
-  Eigen::Vector3d color = Eigen::Vector3d::Zero();
+  double normal_cosine = 1.0;
+  double view_cosine = 1.0;
+  FusionPixelData data;
 };
 
 struct FusionTaskResult {
   StereoFusionResult result;
   std::vector<StereoFusionPairDiagnostics> pair_diagnostics;
   std::vector<std::uint8_t> pair_diagnostics_seen;
+  // A worker processes only one stripe at a time. Reuse its temporary storage
+  // across seed pixels instead of allocating one BFS track and nine median
+  // vectors for every candidate point.
+  std::vector<FusionObservation> track_scratch;
+  std::vector<double> median_scratch;
+  // Direct weak index avoids a linear hot-set scan and reuses views retained
+  // by another worker without entering the persisted-view LRU mutex. Keep a
+  // bounded strong hot set so this acceleration does not pin every dense map.
+  std::vector<std::weak_ptr<const StereoFusionViewData>> view_index;
+  std::vector<
+      std::pair<std::size_t,
+                std::shared_ptr<const StereoFusionViewData>>>
+      view_hot_cache;
 };
-
-std::optional<Eigen::Vector3d> SampleColorBilinear(const MvsImage& image,
-                                                    float x,
-                                                    float y) {
-  if (image.color.empty() || image.color.type() != CV_8UC3 ||
-      image.color.cols != image.gray.cols ||
-      image.color.rows != image.gray.rows || !std::isfinite(x) ||
-      !std::isfinite(y) || x < 0.0F || y < 0.0F ||
-      x > static_cast<float>(image.color.cols - 1) ||
-      y > static_cast<float>(image.color.rows - 1)) {
-    return std::nullopt;
-  }
-  const int x0 = static_cast<int>(std::floor(x));
-  const int y0 = static_cast<int>(std::floor(y));
-  const int x1 = std::min(x0 + 1, image.color.cols - 1);
-  const int y1 = std::min(y0 + 1, image.color.rows - 1);
-  const double dx = x - x0;
-  const double dy = y - y0;
-  const cv::Vec3b p00 = image.color.at<cv::Vec3b>(y0, x0);
-  const cv::Vec3b p01 = image.color.at<cv::Vec3b>(y0, x1);
-  const cv::Vec3b p10 = image.color.at<cv::Vec3b>(y1, x0);
-  const cv::Vec3b p11 = image.color.at<cv::Vec3b>(y1, x1);
-  Eigen::Vector3d color;
-  for (int channel = 0; channel < 3; ++channel) {
-    const double top = (1.0 - dx) * p00[channel] + dx * p01[channel];
-    const double bottom =
-        (1.0 - dx) * p10[channel] + dx * p11[channel];
-    color[channel] = (1.0 - dy) * top + dy * bottom;
-  }
-  return color;
-}
 
 enum class FusionRejectReason {
   kNone,
+  kVisited,
   kProjection,
   kDepth,
   kMutualConsistency,
@@ -626,17 +660,19 @@ int FusionRejectReasonPriority(FusionRejectReason reason) {
   switch (reason) {
     case FusionRejectReason::kNone:
       return 0;
-    case FusionRejectReason::kProjection:
+    case FusionRejectReason::kVisited:
       return 1;
-    case FusionRejectReason::kInvalid:
+    case FusionRejectReason::kProjection:
       return 2;
-    case FusionRejectReason::kMutualConsistency:
+    case FusionRejectReason::kInvalid:
       return 3;
-    case FusionRejectReason::kDepth:
+    case FusionRejectReason::kMutualConsistency:
       return 4;
+    case FusionRejectReason::kDepth:
+      return 5;
     case FusionRejectReason::kNormal:
     case FusionRejectReason::kView:
-      return 5;
+      return 6;
   }
   return 0;
 }
@@ -667,16 +703,21 @@ double FusionMedian(std::vector<double>* values) {
   if (values == nullptr || values->empty()) {
     return 0.0;
   }
-  std::sort(values->begin(), values->end());
-  const std::size_t middle = values->size() / 2;
+  // Match COLMAP's percentile implementation without fully sorting every
+  // coordinate, normal, and color component of every fusion track.
+  const std::size_t right = values->size() / 2;
+  std::nth_element(values->begin(), values->begin() + right, values->end());
+  const double right_value = (*values)[right];
   if (values->size() % 2 != 0) {
-    return (*values)[middle];
+    return right_value;
   }
-  return 0.5 * ((*values)[middle - 1] + (*values)[middle]);
+  const double left_value =
+      *std::max_element(values->begin(), values->begin() + right);
+  return 0.5 * (left_value + right_value);
 }
 
-bool ContainsImageId(const std::vector<ImageId>& image_ids,
-                     ImageId image_id) {
+template <typename ImageIds>
+bool ContainsImageId(const ImageIds& image_ids, ImageId image_id) {
   return std::find(image_ids.begin(), image_ids.end(), image_id) !=
          image_ids.end();
 }
@@ -693,82 +734,105 @@ double AngleDegreesBetween(const Eigen::Vector3d& lhs,
   return std::acos(cosine) * kRadiansToDegrees;
 }
 
-double ViewAngleDegrees(const PatchMatchView& reference_view,
-                        const PatchMatchView& source_view,
-                        const Eigen::Vector3d& point_world) {
-  const Eigen::Vector3d reference_ray =
-      point_world - reference_view.cam_from_world.CameraCenter();
-  const Eigen::Vector3d source_ray =
-      point_world - source_view.cam_from_world.CameraCenter();
-  return AngleDegreesBetween(reference_ray, source_ray);
+double CosineBetween(const Eigen::Vector3d& lhs,
+                     const Eigen::Vector3d& rhs) {
+  if (!lhs.allFinite() || !rhs.allFinite() || lhs.squaredNorm() <= 0.0 ||
+      rhs.squaredNorm() <= 0.0) {
+    return -1.0;
+  }
+  return std::max(-1.0, std::min(1.0, lhs.dot(rhs) /
+      std::sqrt(lhs.squaredNorm() * rhs.squaredNorm())));
 }
 
-bool IsCompleteFusionPixel(const std::vector<MvsImage>& images,
-                           const std::vector<DenseDepthMap>& depth_maps,
-                           const std::vector<NormalMap>& normal_maps,
-                           const std::vector<DenseCostMap>& cost_maps,
-                           const std::vector<ConsistencyGraph>& graphs,
+double DegreesFromCosine(double cosine) {
+  constexpr double kRadiansToDegrees = 180.0 / 3.14159265358979323846;
+  return std::acos(std::max(-1.0, std::min(1.0, cosine))) *
+         kRadiansToDegrees;
+}
+
+bool IsCompleteFusionPixel(const StereoFusionViewData& view_data,
                            const StereoFusionOptions& options,
-                           std::size_t image_idx,
                            std::size_t row,
                            std::size_t col) {
-  if (image_idx >= depth_maps.size() ||
-      !depth_maps[image_idx].IsValid(row, col) ||
-      !normal_maps[image_idx].IsValid(row, col) ||
-      !cost_maps[image_idx].IsValid(row, col)) {
+  if (!view_data.depth_map.IsValid(row, col) ||
+      !view_data.normal_map.IsValid(row, col) ||
+      (options.require_cost_map &&
+       !view_data.cost_map.IsValid(row, col))) {
     return false;
   }
-  if (options.require_consistency_graph || !graphs.empty()) {
-    if (image_idx >= graphs.size() ||
-        graphs[image_idx].Count(row, col) <
-            options.min_num_consistent_sources) {
+  if (options.require_consistency_graph ||
+      !view_data.consistency_graph.Empty()) {
+    if (view_data.consistency_graph.Count(row, col) <
+        options.min_num_consistent_sources) {
       return false;
     }
   }
-  return images[image_idx].Width() == depth_maps[image_idx].Width() &&
-         images[image_idx].Height() == depth_maps[image_idx].Height();
+  return view_data.image.Width() == view_data.depth_map.Width() &&
+         view_data.image.Height() == view_data.depth_map.Height();
 }
 
 std::optional<FusionPixelData> MakeFusionPixelData(
-    const std::vector<PatchMatchView>& views,
-    const std::vector<MvsImage>& images,
-    const std::vector<DenseDepthMap>& depth_maps,
-    const std::vector<NormalMap>& normal_maps,
-    std::size_t image_idx,
+    const PatchMatchView& view,
+    const FusionViewGeometry& geometry,
+    const StereoFusionViewData& view_data,
     std::size_t row,
-    std::size_t col) {
+    std::size_t col,
+    const Eigen::Vector3f* precomputed_normal_world = nullptr) {
   try {
-    const float depth = depth_maps[image_idx].Get(row, col);
-    const Eigen::Vector2d xy(static_cast<double>(col),
-                             static_cast<double>(row));
-    const Eigen::Vector3d point_camera =
-        UnprojectPixel(views[image_idx].camera, xy, static_cast<double>(depth));
+    const float depth = view_data.depth_map.Get(row, col);
+    Eigen::Vector3d point_camera;
+    if (geometry.pinhole) {
+      point_camera =
+          Eigen::Vector3d((static_cast<double>(col) - geometry.cx) /
+                              geometry.fx * depth,
+                          (static_cast<double>(row) - geometry.cy) /
+                              geometry.fy * depth,
+                          depth);
+    } else {
+      const Eigen::Vector2d xy(static_cast<double>(col),
+                               static_cast<double>(row));
+      point_camera =
+          UnprojectPixel(view.camera, xy, static_cast<double>(depth));
+    }
     const Eigen::Vector3d point_world =
-        views[image_idx].cam_from_world.Inverse().TransformPoint(point_camera);
+        geometry.world_from_cam_rotation * point_camera +
+        geometry.camera_center;
 
-    Eigen::Vector3d normal_world =
-        views[image_idx].cam_from_world.q_cw.conjugate() *
-        normal_maps[image_idx].Get(row, col).cast<double>();
+    Eigen::Vector3d normal_world;
+    if (precomputed_normal_world == nullptr) {
+      normal_world = geometry.world_from_cam_rotation *
+                     view_data.normal_map.Get(row, col).cast<double>();
+    } else {
+      normal_world = precomputed_normal_world->cast<double>();
+    }
     if (!normal_world.allFinite() || normal_world.squaredNorm() <= 0.0) {
       return std::nullopt;
     }
-    normal_world.normalize();
+    const double normal_squared_norm = normal_world.squaredNorm();
+    if (std::abs(normal_squared_norm - 1.0) > 1e-4) {
+      normal_world /= std::sqrt(normal_squared_norm);
+    }
 
     FusionPixelData data;
     data.xyz = point_world;
-    data.normal = normal_world;
-    const std::optional<Eigen::Vector3d> color = SampleColorBilinear(
-        images[image_idx], static_cast<float>(col), static_cast<float>(row));
-    if (color.has_value()) {
-      data.color = *color;
+    data.normal = normal_world.cast<float>();
+    if (!view_data.image.color.empty() &&
+        view_data.image.color.type() == CV_8UC3) {
+      const cv::Vec3b color = view_data.image.color.at<cv::Vec3b>(
+          static_cast<int>(row), static_cast<int>(col));
+      data.color = Eigen::Matrix<std::uint8_t, 3, 1>(
+          color[0], color[1], color[2]);
     } else {
       const std::optional<float> gray = SampleGrayBilinear(
-          images[image_idx], static_cast<float>(col), static_cast<float>(row));
+          view_data.image, static_cast<float>(col), static_cast<float>(row));
       const float clamped_gray =
           ClampFloat(gray.value_or(1.0F), 0.0F, 1.0F);
       const double color_value =
           static_cast<double>(std::lround(clamped_gray * 255.0F));
-      data.color = Eigen::Vector3d(color_value, color_value, color_value);
+      const std::uint8_t packed_color =
+          static_cast<std::uint8_t>(color_value);
+      data.color = Eigen::Matrix<std::uint8_t, 3, 1>(
+          packed_color, packed_color, packed_color);
     }
     return data;
   } catch (const std::exception&) {
@@ -778,10 +842,8 @@ std::optional<FusionPixelData> MakeFusionPixelData(
 
 std::optional<FusionObservation> ProjectFusionObservationToSource(
     const std::vector<PatchMatchView>& views,
-    const std::vector<DenseDepthMap>& depth_maps,
-    const std::vector<NormalMap>& normal_maps,
-    const std::vector<DenseCostMap>& cost_maps,
-    const std::vector<ConsistencyGraph>& graphs,
+    const std::vector<FusionViewGeometry>& geometries,
+    const StereoFusionViewData& source_data,
     const StereoFusionOptions& options,
     const FusionObservation& reference,
     std::size_t source_idx,
@@ -789,14 +851,19 @@ std::optional<FusionObservation> ProjectFusionObservationToSource(
     const Eigen::Vector3d& seed_point_world,
     const Eigen::Vector3d& seed_normal_world,
     std::size_t seed_image_idx,
+    double min_normal_cosine,
+    double min_view_cosine,
+    const std::atomic<std::uint8_t>* source_visited,
     StereoFusionErrorSamples* error_samples,
     FusionRejectReason* reject_reason) {
   if (reject_reason != nullptr) {
     *reject_reason = FusionRejectReason::kNone;
   }
   try {
+    const FusionViewGeometry& source_geometry = geometries[source_idx];
     const Eigen::Vector3d source_point_camera =
-        views[source_idx].cam_from_world.TransformPoint(reference_point_world);
+        source_geometry.cam_from_world_rotation * reference_point_world +
+        source_geometry.cam_from_world_translation;
     if (source_point_camera.z() <= 0.0) {
       if (reject_reason != nullptr) {
         *reject_reason = FusionRejectReason::kProjection;
@@ -805,34 +872,71 @@ std::optional<FusionObservation> ProjectFusionObservationToSource(
     }
 
     const Eigen::Vector2d source_xy =
-        ProjectPoint(views[source_idx].camera, source_point_camera);
+        source_geometry.pinhole
+            ? Eigen::Vector2d(
+                  source_geometry.fx * source_point_camera.x() /
+                          source_point_camera.z() +
+                      source_geometry.cx,
+                  source_geometry.fy * source_point_camera.y() /
+                          source_point_camera.z() +
+                      source_geometry.cy)
+            : ProjectPoint(views[source_idx].camera, source_point_camera);
+    const Eigen::Vector3d seed_source_point_camera =
+        source_geometry.cam_from_world_rotation * seed_point_world +
+        source_geometry.cam_from_world_translation;
+    if (seed_source_point_camera.z() <= 0.0) {
+      if (reject_reason != nullptr) {
+        *reject_reason = FusionRejectReason::kProjection;
+      }
+      return std::nullopt;
+    }
+    const Eigen::Vector2d seed_source_xy =
+        source_geometry.pinhole
+            ? Eigen::Vector2d(
+                  source_geometry.fx * seed_source_point_camera.x() /
+                          seed_source_point_camera.z() +
+                      source_geometry.cx,
+                  source_geometry.fy * seed_source_point_camera.y() /
+                          seed_source_point_camera.z() +
+                      source_geometry.cy)
+            : ProjectPoint(views[source_idx].camera,
+                           seed_source_point_camera);
     const int rounded_source_col =
         static_cast<int>(std::lround(source_xy.x()));
     const int rounded_source_row =
         static_cast<int>(std::lround(source_xy.y()));
     if (rounded_source_row < 0 || rounded_source_col < 0 ||
         rounded_source_row >=
-            static_cast<int>(depth_maps[source_idx].Height()) ||
+            static_cast<int>(source_data.depth_map.Height()) ||
         rounded_source_col >=
-            static_cast<int>(depth_maps[source_idx].Width())) {
+            static_cast<int>(source_data.depth_map.Width())) {
       if (reject_reason != nullptr) {
         *reject_reason = FusionRejectReason::kProjection;
       }
       return std::nullopt;
     }
 
-    const double view_angle =
-        ViewAngleDegrees(views[seed_image_idx], views[source_idx],
-                         seed_point_world);
-    AddFusionErrorSample(static_cast<float>(view_angle),
-                         error_samples == nullptr
-                             ? nullptr
-                             : &error_samples->view_angles_degrees);
-    if (view_angle > static_cast<double>(options.max_view_angle_degrees)) {
-      if (reject_reason != nullptr) {
-        *reject_reason = FusionRejectReason::kView;
+    std::optional<double> view_cosine;
+    // Preserve the original rejection/diagnostic ordering when the view-angle
+    // gate is active or samples are requested. With the production default of
+    // 180 degrees and diagnostics disabled, defer this relatively expensive
+    // normalization until a candidate has passed the cheaper checks.
+    if (min_view_cosine > -1.0 + 1e-12 || error_samples != nullptr) {
+      view_cosine =
+          CosineBetween(
+              seed_point_world - geometries[seed_image_idx].camera_center,
+              seed_point_world - source_geometry.camera_center);
+      if (error_samples != nullptr) {
+        AddFusionErrorSample(
+            static_cast<float>(DegreesFromCosine(*view_cosine)),
+            &error_samples->view_angles_degrees);
       }
-      return std::nullopt;
+      if (*view_cosine < min_view_cosine) {
+        if (reject_reason != nullptr) {
+          *reject_reason = FusionRejectReason::kView;
+        }
+        return std::nullopt;
+      }
     }
 
     thread_local std::vector<std::pair<double, std::pair<int, int>>>
@@ -843,42 +947,99 @@ std::optional<FusionObservation> ProjectFusionObservationToSource(
     const int search_diameter = 2 * search_radius + 1;
     candidates.reserve(static_cast<std::size_t>(search_diameter) *
                        static_cast<std::size_t>(search_diameter));
-    for (int row_offset = -search_radius; row_offset <= search_radius;
-         ++row_offset) {
-      for (int col_offset = -search_radius; col_offset <= search_radius;
-           ++col_offset) {
-        const int candidate_row = rounded_source_row + row_offset;
-        const int candidate_col = rounded_source_col + col_offset;
-        if (candidate_row < 0 || candidate_col < 0 ||
-            candidate_row >=
-                static_cast<int>(depth_maps[source_idx].Height()) ||
-            candidate_col >=
-                static_cast<int>(depth_maps[source_idx].Width())) {
-          continue;
-        }
-        const Eigen::Vector2d candidate_xy(
-            static_cast<double>(candidate_col),
-            static_cast<double>(candidate_row));
-        candidates.emplace_back((source_xy - candidate_xy).squaredNorm(),
-                                std::make_pair(candidate_row, candidate_col));
+    const auto candidate_less = [](const auto& lhs, const auto& rhs) {
+      if (lhs.first == rhs.first) {
+        return lhs.second < rhs.second;
       }
+      return lhs.first < rhs.first;
+    };
+    const Eigen::Vector2d rounded_source_xy(
+        static_cast<double>(rounded_source_col),
+        static_cast<double>(rounded_source_row));
+    const double rounded_squared_distance =
+        (source_xy - rounded_source_xy).squaredNorm();
+    const double fractional_col_distance =
+        std::abs(source_xy.x() - rounded_source_xy.x());
+    const double fractional_row_distance =
+        std::abs(source_xy.y() - rounded_source_xy.y());
+    const bool has_nearest_tie =
+        std::abs(fractional_col_distance - 0.5) <= 1e-12 ||
+        std::abs(fractional_row_distance - 0.5) <= 1e-12;
+    candidates.emplace_back(
+        rounded_squared_distance,
+        std::make_pair(rounded_source_row, rounded_source_col));
+    bool remaining_candidates_generated = false;
+    const auto generate_remaining_candidates = [&]() {
+      if (remaining_candidates_generated) {
+        return;
+      }
+      for (int row_offset = -search_radius; row_offset <= search_radius;
+           ++row_offset) {
+        for (int col_offset = -search_radius; col_offset <= search_radius;
+             ++col_offset) {
+          if (row_offset == 0 && col_offset == 0) {
+            continue;
+          }
+          const int candidate_row = rounded_source_row + row_offset;
+          const int candidate_col = rounded_source_col + col_offset;
+          if (candidate_row < 0 || candidate_col < 0 ||
+              candidate_row >=
+                  static_cast<int>(source_data.depth_map.Height()) ||
+              candidate_col >=
+                  static_cast<int>(source_data.depth_map.Width())) {
+            continue;
+          }
+          const Eigen::Vector2d candidate_xy(
+              static_cast<double>(candidate_col),
+              static_cast<double>(candidate_row));
+          candidates.emplace_back(
+              (source_xy - candidate_xy).squaredNorm(),
+              std::make_pair(candidate_row, candidate_col));
+        }
+      }
+      std::sort(candidates.begin() + (has_nearest_tie ? 0 : 1),
+                candidates.end(), candidate_less);
+      remaining_candidates_generated = true;
+    };
+    if (has_nearest_tie) {
+      generate_remaining_candidates();
     }
-    std::sort(candidates.begin(), candidates.end(),
-              [](const auto& lhs, const auto& rhs) {
-                if (lhs.first == rhs.first) {
-                  return lhs.second < rhs.second;
-                }
-                return lhs.first < rhs.first;
-              });
+    bool projected_source_depth_sampled = false;
+    std::optional<float> projected_source_depth;
 
     FusionRejectReason candidate_reject_reason = FusionRejectReason::kNone;
-    for (const auto& candidate : candidates) {
-      const double reprojection_error = std::sqrt(candidate.first);
-      AddFusionErrorSample(static_cast<float>(reprojection_error),
-                           error_samples == nullptr
-                               ? nullptr
-                               : &error_samples->reprojection_errors_pixels);
-      if (reprojection_error > options.max_reprojection_error_pixels) {
+    for (std::size_t candidate_idx = 0;; ++candidate_idx) {
+      if (candidate_idx >= candidates.size()) {
+        if (remaining_candidates_generated) {
+          break;
+        }
+        generate_remaining_candidates();
+        if (candidate_idx >= candidates.size()) {
+          break;
+        }
+      }
+      const auto& candidate = candidates[candidate_idx];
+      const Eigen::Vector2d candidate_xy(
+          static_cast<double>(candidate.second.second),
+          static_cast<double>(candidate.second.first));
+      const double seed_squared_reprojection_error =
+          (seed_source_xy - candidate_xy).squaredNorm();
+      const double max_squared_reprojection_error =
+          static_cast<double>(options.max_reprojection_error_pixels) *
+          static_cast<double>(options.max_reprojection_error_pixels);
+      if (error_samples != nullptr) {
+        AddFusionErrorSample(
+            static_cast<float>(
+                std::sqrt(seed_squared_reprojection_error)),
+            &error_samples->reprojection_errors_pixels);
+      }
+      // Match COLMAP's fusion invariant: source candidates may be discovered
+      // by walking from the current cursor, but every accepted observation
+      // must still reproject close to the original seed point. Comparing only
+      // with the cursor permits small errors to accumulate over graph hops and
+      // merges a planar neighborhood into one oversized, bumpy track.
+      if (seed_squared_reprojection_error >
+          max_squared_reprojection_error) {
         KeepMoreSpecificRejectReason(FusionRejectReason::kProjection,
                                      &candidate_reject_reason);
         continue;
@@ -888,9 +1049,19 @@ std::optional<FusionObservation> ProjectFusionObservationToSource(
           static_cast<std::size_t>(candidate.second.first);
       const std::size_t col =
           static_cast<std::size_t>(candidate.second.second);
-      if (!depth_maps[source_idx].IsValid(row, col) ||
-          !normal_maps[source_idx].IsValid(row, col) ||
-          !cost_maps[source_idx].IsValid(row, col)) {
+      if (source_visited != nullptr &&
+          source_visited[
+              row * source_data.depth_map.Width() + col].load(
+                  std::memory_order_relaxed) != 0) {
+        if (reject_reason != nullptr) {
+          *reject_reason = FusionRejectReason::kVisited;
+        }
+        return std::nullopt;
+      }
+      if (!source_data.depth_map.IsValid(row, col) ||
+          !source_data.normal_map.IsValid(row, col) ||
+          (options.require_cost_map &&
+           !source_data.cost_map.IsValid(row, col))) {
         KeepMoreSpecificRejectReason(FusionRejectReason::kInvalid,
                                      &candidate_reject_reason);
         continue;
@@ -899,16 +1070,19 @@ std::optional<FusionObservation> ProjectFusionObservationToSource(
       // 与几何一致性图保持一致：优先在真实投影位置做双线性深度采样。
       // 若投影落在边界或邻域深度不完整，则回退到候选离散像素深度。
       double source_depth =
-          static_cast<double>(depth_maps[source_idx].Get(row, col));
-      const std::optional<float> projected_source_depth = SampleDepthBilinear(
-          depth_maps[source_idx], static_cast<float>(source_xy.x()),
-          static_cast<float>(source_xy.y()));
+          static_cast<double>(source_data.depth_map.Get(row, col));
+      if (!projected_source_depth_sampled) {
+        projected_source_depth = SampleDepthBilinear(
+            source_data.depth_map, static_cast<float>(seed_source_xy.x()),
+            static_cast<float>(seed_source_xy.y()));
+        projected_source_depth_sampled = true;
+      }
       if (projected_source_depth.has_value()) {
         source_depth = static_cast<double>(*projected_source_depth);
       }
       const double relative_depth_error =
-          std::abs(source_depth - source_point_camera.z()) /
-          source_point_camera.z();
+          std::abs(seed_source_point_camera.z() - source_depth) /
+          source_depth;
       AddFusionErrorSample(static_cast<float>(relative_depth_error),
                            error_samples == nullptr
                                ? nullptr
@@ -919,38 +1093,58 @@ std::optional<FusionObservation> ProjectFusionObservationToSource(
         continue;
       }
 
-      if (options.require_mutual_consistency && !graphs.empty() &&
-          source_idx < graphs.size() &&
-          !ContainsImageId(graphs[source_idx].SourceImageIds(row, col),
-                           views[reference.image_idx].image_id)) {
-        KeepMoreSpecificRejectReason(FusionRejectReason::kMutualConsistency,
-                                     &candidate_reject_reason);
-        continue;
+      if (options.require_mutual_consistency &&
+          !source_data.consistency_graph.Empty()) {
+        const bool mutually_consistent = ContainsImageId(
+            source_data.consistency_graph.SourceImageIds(row, col),
+            views[reference.image_idx].image_id);
+        if (!mutually_consistent) {
+          KeepMoreSpecificRejectReason(
+              FusionRejectReason::kMutualConsistency,
+              &candidate_reject_reason);
+          continue;
+        }
       }
 
       Eigen::Vector3d source_normal_world =
-          views[source_idx].cam_from_world.q_cw.conjugate() *
-          normal_maps[source_idx].Get(row, col).cast<double>();
+          source_geometry.world_from_cam_rotation *
+          source_data.normal_map.Get(row, col).cast<double>();
+      const double source_normal_squared_norm =
+          source_normal_world.squaredNorm();
       if (!source_normal_world.allFinite() ||
-          source_normal_world.squaredNorm() <= 0.0) {
+          source_normal_squared_norm <= 0.0) {
         KeepMoreSpecificRejectReason(FusionRejectReason::kInvalid,
                                      &candidate_reject_reason);
         continue;
       }
-      source_normal_world.normalize();
+      if (std::abs(source_normal_squared_norm - 1.0) > 1e-4) {
+        source_normal_world /= std::sqrt(source_normal_squared_norm);
+      }
 
       // Match COLMAP's track semantics: every observation is checked against
       // the seed normal. Comparing only with the current BFS cursor permits
       // gradual normal drift and can merge very large curved tracks.
-      const double normal_angle =
-          AngleDegreesBetween(seed_normal_world, source_normal_world);
-      AddFusionErrorSample(static_cast<float>(normal_angle),
-                           error_samples == nullptr
-                               ? nullptr
-                               : &error_samples->normal_angles_degrees);
-      if (normal_angle >
-          static_cast<double>(options.max_normal_error_degrees)) {
+      const double normal_cosine = std::max(
+          -1.0, std::min(1.0, seed_normal_world.dot(source_normal_world)));
+      if (error_samples != nullptr) {
+        AddFusionErrorSample(
+            static_cast<float>(DegreesFromCosine(normal_cosine)),
+            &error_samples->normal_angles_degrees);
+      }
+      if (normal_cosine < min_normal_cosine) {
         KeepMoreSpecificRejectReason(FusionRejectReason::kNormal,
+                                     &candidate_reject_reason);
+        continue;
+      }
+
+      if (!view_cosine.has_value()) {
+        // The default 180-degree gate cannot reject an observation. Avoid
+        // normalizing two viewing rays for every accepted observation when
+        // diagnostics are disabled.
+        view_cosine = 1.0;
+      }
+      if (*view_cosine < min_view_cosine) {
+        KeepMoreSpecificRejectReason(FusionRejectReason::kView,
                                      &candidate_reject_reason);
         continue;
       }
@@ -960,8 +1154,9 @@ std::optional<FusionObservation> ProjectFusionObservationToSource(
       source.row = row;
       source.col = col;
       source.traversal_depth = reference.traversal_depth + 1;
-      source.normal_angle_degrees = normal_angle;
-      source.view_angle_degrees = view_angle;
+      source.normal_cosine = normal_cosine;
+      source.view_cosine = *view_cosine;
+      source.data.normal = source_normal_world.cast<float>();
       return source;
     }
 
@@ -993,36 +1188,86 @@ std::size_t ConsistencyGraph::Height() const {
 }
 
 std::size_t ConsistencyGraph::NumPixels() const {
-  return data_.size();
+  return width_ * height_;
 }
 
 bool ConsistencyGraph::Empty() const {
-  return data_.empty();
+  return width_ == 0 || height_ == 0;
 }
 
 void ConsistencyGraph::Add(std::size_t row,
                            std::size_t col,
                            ImageId source_image_id) {
+  if (IsCompact()) {
+    throw std::logic_error("Cannot append to a compact consistency graph.");
+  }
   data_.at(Offset(row, col)).push_back(source_image_id);
 }
 
-const std::vector<ImageId>& ConsistencyGraph::SourceImageIds(
+ConsistencyGraph::ImageIdRange ConsistencyGraph::SourceImageIds(
     std::size_t row,
     std::size_t col) const {
-  return data_.at(Offset(row, col));
+  const std::size_t offset = Offset(row, col);
+  if (IsCompact()) {
+    const std::size_t begin = compact_offsets_[offset];
+    const std::size_t end = compact_offsets_[offset + 1];
+    if (begin == end && compact_image_ids_.empty()) {
+      return ImageIdRange();
+    }
+    return ImageIdRange(compact_image_ids_.data() + begin, end - begin);
+  }
+  const std::vector<ImageId>& source_ids = data_.at(offset);
+  return ImageIdRange(source_ids.data(), source_ids.size());
+}
+
+void ConsistencyGraph::Compact() {
+  if (IsCompact()) {
+    return;
+  }
+  compact_offsets_.resize(NumPixels() + 1, 0);
+  std::size_t num_image_ids = 0;
+  for (std::size_t offset = 0; offset < data_.size(); ++offset) {
+    if (num_image_ids > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::overflow_error("Consistency graph exceeds CSR32 capacity.");
+    }
+    compact_offsets_[offset] = static_cast<std::uint32_t>(num_image_ids);
+    num_image_ids += data_[offset].size();
+  }
+  if (num_image_ids > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::overflow_error("Consistency graph exceeds CSR32 capacity.");
+  }
+  compact_offsets_[NumPixels()] =
+      static_cast<std::uint32_t>(num_image_ids);
+  compact_image_ids_.reserve(num_image_ids);
+  for (const std::vector<ImageId>& source_ids : data_) {
+    compact_image_ids_.insert(compact_image_ids_.end(), source_ids.begin(),
+                              source_ids.end());
+  }
+  std::vector<std::vector<ImageId>>().swap(data_);
+}
+
+bool ConsistencyGraph::IsCompact() const {
+  return !compact_offsets_.empty();
 }
 
 std::size_t ConsistencyGraph::Count(std::size_t row, std::size_t col) const {
+  if (IsCompact()) {
+    const std::size_t offset = Offset(row, col);
+    return static_cast<std::size_t>(compact_offsets_[offset + 1] -
+                                    compact_offsets_[offset]);
+  }
   return SourceImageIds(row, col).size();
 }
 
 std::size_t ConsistencyGraph::NumConsistentPixels(
     std::size_t min_num_sources) const {
-  return static_cast<std::size_t>(
-      std::count_if(data_.begin(), data_.end(),
-                    [min_num_sources](const std::vector<ImageId>& sources) {
-                      return sources.size() >= min_num_sources;
-                    }));
+  std::size_t count = 0;
+  for (std::size_t row = 0; row < height_; ++row) {
+    for (std::size_t col = 0; col < width_; ++col) {
+      count += Count(row, col) >= min_num_sources ? 1 : 0;
+    }
+  }
+  return count;
 }
 
 std::vector<int> ConsistencyGraph::ToColmapData(
@@ -1038,7 +1283,7 @@ std::vector<int> ConsistencyGraph::ToColmapData(
   std::vector<int> data;
   for (std::size_t row = 0; row < height_; ++row) {
     for (std::size_t col = 0; col < width_; ++col) {
-      const std::vector<ImageId>& source_ids = SourceImageIds(row, col);
+      const ImageIdRange source_ids = SourceImageIds(row, col);
       if (source_ids.empty()) {
         continue;
       }
@@ -1088,7 +1333,61 @@ ConsistencyGraph ConsistencyGraph::FromColmapData(
                 image_ids_by_index[static_cast<std::size_t>(image_idx)]);
     }
   }
+  graph.Compact();
   return graph;
+}
+
+ConsistencyGraph ConsistencyGraph::FromCompactData(
+    std::size_t width,
+    std::size_t height,
+    std::vector<std::size_t> offsets,
+    std::vector<ImageId> image_ids) {
+  if (offsets.size() != width * height + 1 || offsets.empty() ||
+      offsets.front() != 0 || offsets.back() != image_ids.size() ||
+      !std::is_sorted(offsets.begin(), offsets.end()) ||
+      offsets.back() > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::invalid_argument("Invalid compact consistency graph data.");
+  }
+  std::vector<std::uint32_t> compact_offsets(offsets.size());
+  std::transform(offsets.begin(), offsets.end(), compact_offsets.begin(),
+                 [](std::size_t offset) {
+                   return static_cast<std::uint32_t>(offset);
+                 });
+  return FromCompactData(width, height, std::move(compact_offsets),
+                         std::move(image_ids));
+}
+
+ConsistencyGraph ConsistencyGraph::FromCompactData(
+    std::size_t width,
+    std::size_t height,
+    std::vector<std::uint32_t> offsets,
+    std::vector<ImageId> image_ids) {
+  const std::size_t num_pixels = width * height;
+  if (offsets.size() != num_pixels + 1 || offsets.front() != 0 ||
+      offsets.back() != image_ids.size() ||
+      !std::is_sorted(offsets.begin(), offsets.end())) {
+    throw std::invalid_argument("Invalid compact consistency graph data.");
+  }
+  ConsistencyGraph graph;
+  graph.width_ = width;
+  graph.height_ = height;
+  graph.compact_offsets_ = std::move(offsets);
+  graph.compact_image_ids_ = std::move(image_ids);
+  return graph;
+}
+
+const std::vector<std::uint32_t>& ConsistencyGraph::CompactOffsets() const {
+  if (!IsCompact()) {
+    throw std::logic_error("Consistency graph is not compact.");
+  }
+  return compact_offsets_;
+}
+
+const std::vector<ImageId>& ConsistencyGraph::CompactImageIds() const {
+  if (!IsCompact()) {
+    throw std::logic_error("Consistency graph is not compact.");
+  }
+  return compact_image_ids_;
 }
 
 std::size_t ConsistencyGraph::Offset(std::size_t row, std::size_t col) const {
@@ -1111,20 +1410,59 @@ void WriteConsistencyGraphBinary(const std::filesystem::path& path,
        << kConsistencyGraphBinaryVersion << "\n"
        << consistency_graph.Width() << " " << consistency_graph.Height()
        << "\n";
-  for (std::size_t row = 0; row < consistency_graph.Height(); ++row) {
-    for (std::size_t col = 0; col < consistency_graph.Width(); ++col) {
-      const std::vector<ImageId>& source_ids =
-          consistency_graph.SourceImageIds(row, col);
-      const std::uint32_t count =
-          static_cast<std::uint32_t>(source_ids.size());
-      file.write(reinterpret_cast<const char*>(&count),
-                 static_cast<std::streamsize>(sizeof(count)));
-      for (const ImageId source_id : source_ids) {
-        const std::uint32_t value = static_cast<std::uint32_t>(source_id);
-        file.write(reinterpret_cast<const char*>(&value),
-                   static_cast<std::streamsize>(sizeof(value)));
+  std::vector<std::uint32_t> generated_offsets;
+  std::vector<ImageId> generated_ids;
+  const std::vector<std::uint32_t>* graph_offsets_ptr = nullptr;
+  const std::vector<ImageId>* graph_ids_ptr = nullptr;
+  if (consistency_graph.IsCompact()) {
+    graph_offsets_ptr = &consistency_graph.CompactOffsets();
+    graph_ids_ptr = &consistency_graph.CompactImageIds();
+  } else {
+    generated_offsets.resize(consistency_graph.NumPixels() + 1, 0);
+    for (std::size_t row = 0; row < consistency_graph.Height(); ++row) {
+      for (std::size_t col = 0; col < consistency_graph.Width(); ++col) {
+        const std::size_t pixel_offset =
+            row * consistency_graph.Width() + col;
+        if (generated_ids.size() >
+            std::numeric_limits<std::uint32_t>::max()) {
+          throw std::overflow_error(
+              "Consistency graph exceeds CSR32 capacity.");
+        }
+        generated_offsets[pixel_offset] =
+            static_cast<std::uint32_t>(generated_ids.size());
+        const ConsistencyGraph::ImageIdRange ids =
+            consistency_graph.SourceImageIds(row, col);
+        generated_ids.insert(generated_ids.end(), ids.begin(), ids.end());
       }
     }
+    if (generated_ids.size() >
+        std::numeric_limits<std::uint32_t>::max()) {
+      throw std::overflow_error("Consistency graph exceeds CSR32 capacity.");
+    }
+    generated_offsets.back() =
+        static_cast<std::uint32_t>(generated_ids.size());
+    graph_offsets_ptr = &generated_offsets;
+    graph_ids_ptr = &generated_ids;
+  }
+  const std::vector<std::uint32_t>& graph_offsets = *graph_offsets_ptr;
+  const std::vector<ImageId>& graph_ids = *graph_ids_ptr;
+  if (graph_ids.size() > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::overflow_error("Consistency graph is too large for CSR32.");
+  }
+  const std::uint64_t num_source_ids =
+      static_cast<std::uint64_t>(graph_ids.size());
+  file.write(reinterpret_cast<const char*>(&num_source_ids),
+             static_cast<std::streamsize>(sizeof(num_source_ids)));
+  if (!graph_offsets.empty()) {
+    file.write(reinterpret_cast<const char*>(graph_offsets.data()),
+               static_cast<std::streamsize>(graph_offsets.size() *
+                                            sizeof(std::uint32_t)));
+  }
+  static_assert(sizeof(ImageId) == sizeof(std::uint32_t));
+  if (!graph_ids.empty()) {
+    file.write(reinterpret_cast<const char*>(graph_ids.data()),
+               static_cast<std::streamsize>(graph_ids.size() *
+                                            sizeof(ImageId)));
   }
   RequireConsistencyGraphStream(static_cast<bool>(file), path);
 }
@@ -1139,10 +1477,10 @@ ConsistencyGraph ReadConsistencyGraphBinary(const std::filesystem::path& path) {
   std::string magic;
   int version = 0;
   file >> magic >> version;
-  RequireConsistencyGraphStream(magic == kConsistencyGraphBinaryMagic &&
-                                    version ==
-                                        kConsistencyGraphBinaryVersion,
-                                path);
+  RequireConsistencyGraphStream(
+      magic == kConsistencyGraphBinaryMagic &&
+          (version == 1 || version == kConsistencyGraphBinaryVersion),
+      path);
 
   std::size_t width = 0;
   std::size_t height = 0;
@@ -1150,23 +1488,85 @@ ConsistencyGraph ReadConsistencyGraphBinary(const std::filesystem::path& path) {
   RequireConsistencyGraphStream(static_cast<bool>(file), path);
   file.get();
 
-  ConsistencyGraph consistency_graph(width, height);
+  const std::size_t num_pixels = width * height;
+  if (version == kConsistencyGraphBinaryVersion) {
+    std::uint64_t num_source_ids_u64 = 0;
+    file.read(reinterpret_cast<char*>(&num_source_ids_u64),
+              static_cast<std::streamsize>(sizeof(num_source_ids_u64)));
+    RequireConsistencyGraphStream(
+        static_cast<bool>(file) &&
+            num_source_ids_u64 <=
+                std::numeric_limits<std::uint32_t>::max(),
+        path);
+    std::vector<std::uint32_t> compact_offsets(num_pixels + 1);
+    if (!compact_offsets.empty()) {
+      file.read(reinterpret_cast<char*>(compact_offsets.data()),
+                static_cast<std::streamsize>(compact_offsets.size() *
+                                             sizeof(std::uint32_t)));
+      RequireConsistencyGraphStream(static_cast<bool>(file), path);
+    }
+    std::vector<ImageId> source_ids(
+        static_cast<std::size_t>(num_source_ids_u64));
+    if (!source_ids.empty()) {
+      file.read(reinterpret_cast<char*>(source_ids.data()),
+                static_cast<std::streamsize>(source_ids.size() *
+                                             sizeof(ImageId)));
+      RequireConsistencyGraphStream(static_cast<bool>(file), path);
+    }
+    RequireConsistencyGraphStream(
+        compact_offsets.front() == 0 &&
+            compact_offsets.back() == source_ids.size() &&
+            std::is_sorted(compact_offsets.begin(), compact_offsets.end()),
+        path);
+    return ConsistencyGraph::FromCompactData(
+        width, height, std::move(compact_offsets), std::move(source_ids));
+  }
+
+  const std::streampos data_start = file.tellg();
+  file.seekg(0, std::ios::end);
+  const std::streamoff data_bytes = file.tellg() - data_start;
+  RequireConsistencyGraphStream(
+      data_bytes >=
+          static_cast<std::streamoff>(num_pixels * sizeof(std::uint32_t)) &&
+          data_bytes % static_cast<std::streamoff>(sizeof(std::uint32_t)) == 0,
+      path);
+  const std::size_t num_source_ids =
+      static_cast<std::size_t>(data_bytes) / sizeof(std::uint32_t) -
+      num_pixels;
+  file.seekg(data_start);
+  std::vector<std::uint32_t> words(
+      static_cast<std::size_t>(data_bytes) / sizeof(std::uint32_t));
+  if (!words.empty()) {
+    file.read(reinterpret_cast<char*>(words.data()),
+              static_cast<std::streamsize>(data_bytes));
+    RequireConsistencyGraphStream(static_cast<bool>(file), path);
+  }
+
+  std::vector<std::size_t> offsets(num_pixels + 1, 0);
+  std::vector<ImageId> source_ids;
+  source_ids.reserve(num_source_ids);
+  std::size_t pixel_offset = 0;
+  std::size_t word_offset = 0;
   for (std::size_t row = 0; row < height; ++row) {
     for (std::size_t col = 0; col < width; ++col) {
-      std::uint32_t count = 0;
-      file.read(reinterpret_cast<char*>(&count),
-                static_cast<std::streamsize>(sizeof(count)));
-      RequireConsistencyGraphStream(static_cast<bool>(file), path);
-      for (std::uint32_t i = 0; i < count; ++i) {
-        std::uint32_t source_id = 0;
-        file.read(reinterpret_cast<char*>(&source_id),
-                  static_cast<std::streamsize>(sizeof(source_id)));
-        RequireConsistencyGraphStream(static_cast<bool>(file), path);
-        consistency_graph.Add(row, col, static_cast<ImageId>(source_id));
+      offsets[pixel_offset++] = source_ids.size();
+      RequireConsistencyGraphStream(word_offset < words.size(), path);
+      const std::size_t count = words[word_offset++];
+      RequireConsistencyGraphStream(
+          count <= words.size() - word_offset, path);
+      for (std::size_t i = 0; i < count; ++i) {
+        source_ids.push_back(
+            static_cast<ImageId>(words[word_offset + i]));
       }
+      word_offset += count;
     }
   }
-  return consistency_graph;
+  offsets[num_pixels] = source_ids.size();
+  RequireConsistencyGraphStream(source_ids.size() == num_source_ids &&
+                                    word_offset == words.size(),
+                                path);
+  return ConsistencyGraph::FromCompactData(
+      width, height, std::move(offsets), std::move(source_ids));
 }
 
 void WriteConsistencyGraphColmapBinary(
@@ -1252,6 +1652,41 @@ void WritePointsVisibilityColmapBinary(
     for (const std::uint32_t image_idx : visibility) {
       file.write(reinterpret_cast<const char*>(&image_idx),
                  static_cast<std::streamsize>(sizeof(image_idx)));
+    }
+  }
+  if (!file) {
+    throw std::runtime_error("Failed to finish COLMAP points visibility: " +
+                             path.string());
+  }
+}
+
+void WritePointsVisibilityColmapBinary(
+    const std::filesystem::path& path,
+    const std::vector<std::uint64_t>& points_visibility_masks) {
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream file(path, std::ios::binary);
+  if (!file) {
+    throw std::runtime_error("Failed to write COLMAP points visibility: " +
+                             path.string());
+  }
+  const std::uint64_t num_points =
+      static_cast<std::uint64_t>(points_visibility_masks.size());
+  file.write(reinterpret_cast<const char*>(&num_points),
+             static_cast<std::streamsize>(sizeof(num_points)));
+  for (std::uint64_t visibility_mask : points_visibility_masks) {
+    std::uint32_t num_visible_images = 0;
+    for (std::uint64_t remaining = visibility_mask; remaining != 0;
+         remaining &= remaining - 1) {
+      ++num_visible_images;
+    }
+    file.write(reinterpret_cast<const char*>(&num_visible_images),
+               static_cast<std::streamsize>(sizeof(num_visible_images)));
+    for (std::uint32_t image_idx = 0; visibility_mask != 0; ++image_idx) {
+      if ((visibility_mask & 1U) != 0) {
+        file.write(reinterpret_cast<const char*>(&image_idx),
+                   static_cast<std::streamsize>(sizeof(image_idx)));
+      }
+      visibility_mask >>= 1;
     }
   }
   if (!file) {
@@ -1750,12 +2185,16 @@ PatchMatchCost ComputePlaneHypothesisCost(
       ComputeSourceDepthReprojectionError(reference_view, source_view,
                                           reference_xy, depth,
                                           *source_depth_map);
-  if (!reprojection_error.has_value()) {
-    return cost;
-  }
-  cost.cost += options.geometric_consistency_weight *
-               std::min(options.geometric_max_reprojection_error,
-                        *reprojection_error);
+  const float geometric_cost =
+      reprojection_error.has_value()
+          ? std::min(options.geometric_max_reprojection_error,
+                     *reprojection_error)
+          : options.geometric_max_reprojection_error;
+  // Match COLMAP's public regularizer semantics: our photometric term is
+  // half of COLMAP's (1 - ZNCC), so scale the geometric term equally.
+  // Invalid source depth receives the truncated maximum penalty.
+  cost.cost +=
+      0.5F * options.geometric_consistency_weight * geometric_cost;
   return cost;
 }
 
@@ -2548,13 +2987,14 @@ PatchMatchStereoResult RunPatchMatchStereoForImageImpl(
     const MvsImage& reference_image,
     const std::vector<MvsImage>& source_images,
     const std::vector<DenseDepthMap>* source_depth_maps,
+    const PatchMatchMaps* initial_maps,
     float depth_min,
     float depth_max,
     const PatchMatchStereoOptions& options) {
   if (options.pyramid_levels <= 1) {
     PatchMatchStereoResult result = RunPatchMatchStereoForImageSingleScale(
         reference_view, source_views, reference_image, source_images,
-        source_depth_maps, depth_min, depth_max, options, nullptr);
+        source_depth_maps, depth_min, depth_max, options, initial_maps);
     result.summary.num_pyramid_levels = 1;
     return result;
   }
@@ -2574,13 +3014,16 @@ PatchMatchStereoResult RunPatchMatchStereoForImageImpl(
   if (num_levels <= 1) {
     PatchMatchStereoResult result = RunPatchMatchStereoForImageSingleScale(
         reference_view, source_views, reference_image, source_images,
-        source_depth_maps, depth_min, depth_max, options, nullptr);
+        source_depth_maps, depth_min, depth_max, options, initial_maps);
     result.summary.num_pyramid_levels = 1;
     return result;
   }
 
   PatchMatchMaps prior_maps;
-  bool has_prior = false;
+  bool has_prior = initial_maps != nullptr;
+  if (initial_maps != nullptr) {
+    prior_maps = *initial_maps;
+  }
   PatchMatchStereoResult final_result;
   PatchMatchStereoSummary accumulated_summary;
   accumulated_summary.num_pyramid_levels = num_levels;
@@ -2734,6 +3177,7 @@ PatchMatchStereoResult RunPatchMatchStereoForImageDispatch(
     const MvsImage& reference_image,
     const std::vector<MvsImage>& source_images,
     const std::vector<DenseDepthMap>* source_depth_maps,
+    const PatchMatchMaps* initial_maps,
     float depth_min,
     float depth_max,
     const PatchMatchStereoOptions& options,
@@ -2746,6 +3190,7 @@ PatchMatchStereoResult RunPatchMatchStereoForImageDispatch(
     request.reference_image = &reference_image;
     request.source_images = &source_images;
     request.source_depth_maps = source_depth_maps;
+    request.initial_maps = initial_maps;
     request.depth_min = depth_min;
     request.depth_max = depth_max;
     request.options = options;
@@ -2769,7 +3214,7 @@ PatchMatchStereoResult RunPatchMatchStereoForImageDispatch(
 
   PatchMatchStereoResult cpu_result = RunPatchMatchStereoForImageImpl(
       reference_view, source_views, reference_image, source_images,
-      source_depth_maps, depth_min, depth_max, options);
+      source_depth_maps, initial_maps, depth_min, depth_max, options);
   cpu_result.summary.requested_backend = options.backend;
   cpu_result.summary.actual_backend = PatchMatchBackend::kCpu;
   return cpu_result;
@@ -2785,7 +3230,7 @@ PatchMatchStereoResult RunPatchMatchStereoForImage(
     const PatchMatchStereoOptions& options) {
   return RunPatchMatchStereoForImageDispatch(
       reference_view, source_views, reference_image, source_images, nullptr,
-      depth_min, depth_max, options, nullptr);
+      nullptr, depth_min, depth_max, options, nullptr);
 }
 
 PatchMatchStereoResult RunPatchMatchStereoForImageWithCudaWorkspace(
@@ -2799,7 +3244,7 @@ PatchMatchStereoResult RunPatchMatchStereoForImageWithCudaWorkspace(
     const PatchMatchStereoOptions& options) {
   return RunPatchMatchStereoForImageDispatch(
       reference_view, source_views, reference_image, source_images, nullptr,
-      depth_min, depth_max, options, cuda_workspace);
+      nullptr, depth_min, depth_max, options, cuda_workspace);
 }
 
 PatchMatchStereoResult RunPatchMatchStereoForImageWithSourceDepths(
@@ -2813,7 +3258,7 @@ PatchMatchStereoResult RunPatchMatchStereoForImageWithSourceDepths(
     const PatchMatchStereoOptions& options) {
   return RunPatchMatchStereoForImageDispatch(
       reference_view, source_views, reference_image, source_images,
-      &source_depth_maps, depth_min, depth_max, options, nullptr);
+      &source_depth_maps, nullptr, depth_min, depth_max, options, nullptr);
 }
 
 PatchMatchStereoResult
@@ -2826,10 +3271,12 @@ RunPatchMatchStereoForImageWithSourceDepthsAndCudaWorkspace(
     float depth_min,
     float depth_max,
     CudaPatchMatchWorkspace* cuda_workspace,
-    const PatchMatchStereoOptions& options) {
+    const PatchMatchStereoOptions& options,
+    const PatchMatchMaps* initial_maps) {
   return RunPatchMatchStereoForImageDispatch(
       reference_view, source_views, reference_image, source_images,
-      &source_depth_maps, depth_min, depth_max, options, cuda_workspace);
+      &source_depth_maps, initial_maps, depth_min, depth_max, options,
+      cuda_workspace);
 }
 
 PatchMatchPhotometricStats ComputePatchMatchPhotometricStats(
@@ -2924,6 +3371,22 @@ ConsistencyGraph ComputeGeometricConsistencyGraph(
     const DenseDepthMap& reference_depth_map,
     const std::vector<DenseDepthMap>& source_depth_maps,
     const PatchMatchGeometricConsistencyOptions& options) {
+  std::vector<const DenseDepthMap*> source_depth_map_ptrs;
+  source_depth_map_ptrs.reserve(source_depth_maps.size());
+  for (const DenseDepthMap& source_depth_map : source_depth_maps) {
+    source_depth_map_ptrs.push_back(&source_depth_map);
+  }
+  return ComputeGeometricConsistencyGraph(
+      reference_view, source_views, reference_depth_map,
+      source_depth_map_ptrs, options);
+}
+
+ConsistencyGraph ComputeGeometricConsistencyGraph(
+    const PatchMatchView& reference_view,
+    const std::vector<PatchMatchView>& source_views,
+    const DenseDepthMap& reference_depth_map,
+    const std::vector<const DenseDepthMap*>& source_depth_maps,
+    const PatchMatchGeometricConsistencyOptions& options) {
   if (source_views.size() != source_depth_maps.size()) {
     throw std::invalid_argument(
         "Source views and source depth maps must have identical sizes.");
@@ -2936,10 +3399,17 @@ ConsistencyGraph ComputeGeometricConsistencyGraph(
         "Geometric consistency thresholds are invalid.");
   }
 
-  ConsistencyGraph graph(reference_depth_map.Width(),
-                         reference_depth_map.Height());
+  const std::size_t width = reference_depth_map.Width();
+  const std::size_t height = reference_depth_map.Height();
+  const std::size_t num_pixels = width * height;
+  std::vector<std::size_t> offsets(num_pixels + 1, 0);
+  std::vector<ImageId> consistent_source_ids;
+  consistent_source_ids.reserve(
+      num_pixels * std::min<std::size_t>(source_views.size(), 4));
   for (std::size_t row = 0; row < reference_depth_map.Height(); ++row) {
     for (std::size_t col = 0; col < reference_depth_map.Width(); ++col) {
+      const std::size_t pixel_offset = row * width + col;
+      offsets[pixel_offset] = consistent_source_ids.size();
       if (!reference_depth_map.IsValid(row, col)) {
         continue;
       }
@@ -2955,8 +3425,11 @@ ConsistencyGraph ComputeGeometricConsistencyGraph(
         if (!source_xy.has_value()) {
           continue;
         }
+        if (source_depth_maps[source_idx] == nullptr) {
+          continue;
+        }
         const std::optional<float> source_depth = SampleDepthBilinear(
-            source_depth_maps[source_idx], source_xy->x(), source_xy->y());
+            *source_depth_maps[source_idx], source_xy->x(), source_xy->y());
         if (!source_depth.has_value()) {
           continue;
         }
@@ -2988,7 +3461,8 @@ ConsistencyGraph ComputeGeometricConsistencyGraph(
               relative_depth_error <= options.max_relative_depth_error;
           if (reprojection_error <= options.max_reprojection_error_pixels &&
               passes_relative_depth) {
-            graph.Add(row, col, source_views[source_idx].image_id);
+            consistent_source_ids.push_back(
+                source_views[source_idx].image_id);
           }
         } catch (const std::exception&) {
           continue;
@@ -2996,7 +3470,10 @@ ConsistencyGraph ComputeGeometricConsistencyGraph(
       }
     }
   }
-  return graph;
+  offsets[num_pixels] = consistent_source_ids.size();
+  return ConsistencyGraph::FromCompactData(
+      width, height, std::move(offsets),
+      std::move(consistent_source_ids));
 }
 
 PatchMatchGeometricFilterSummary FilterPatchMatchGeometricResults(
@@ -3049,7 +3526,10 @@ StereoFusionResult FuseStereoDepthMaps(
     const std::vector<ConsistencyGraph>& consistency_graphs,
     const StereoFusionOptions& options) {
   if (views.size() != images.size() || views.size() != depth_maps.size() ||
-      views.size() != normal_maps.size() || views.size() != cost_maps.size()) {
+      views.size() != normal_maps.size() ||
+      (options.require_cost_map && views.size() != cost_maps.size()) ||
+      (!options.require_cost_map && !cost_maps.empty() &&
+       views.size() != cost_maps.size())) {
     throw std::invalid_argument(
         "Stereo fusion inputs must have identical image counts.");
   }
@@ -3080,68 +3560,142 @@ StereoFusionResult FuseStereoDepthMaps(
     throw std::invalid_argument("Stereo fusion options are invalid.");
   }
 
+  std::vector<std::shared_ptr<const StereoFusionViewData>> owned_views;
+  owned_views.reserve(views.size());
+  for (std::size_t image_idx = 0; image_idx < views.size(); ++image_idx) {
+    auto view_data = std::make_shared<StereoFusionViewData>();
+    view_data->image = images[image_idx];
+    view_data->depth_map = depth_maps[image_idx];
+    view_data->normal_map = normal_maps[image_idx];
+    if (!cost_maps.empty()) {
+      view_data->cost_map = cost_maps[image_idx];
+    }
+    if (!consistency_graphs.empty()) {
+      view_data->consistency_graph = consistency_graphs[image_idx];
+    }
+    owned_views.push_back(std::move(view_data));
+  }
+  return FuseStereoDepthMapsWithViewCache(
+      views,
+      [&owned_views](std::size_t image_idx) {
+        return owned_views.at(image_idx);
+      },
+      options);
+}
+
+StereoFusionResult FuseStereoDepthMapsWithViewCache(
+    const std::vector<PatchMatchView>& views,
+    const StereoFusionViewLoader& load_view,
+    const StereoFusionOptions& options) {
+  if (!load_view) {
+    throw std::invalid_argument("Stereo fusion view loader is empty.");
+  }
+  if (!std::isfinite(options.max_reprojection_error_pixels) ||
+      !std::isfinite(options.max_relative_depth_error) ||
+      !std::isfinite(options.max_normal_error_degrees) ||
+      !std::isfinite(options.max_view_angle_degrees) ||
+      options.max_reprojection_error_pixels < 0.0F ||
+      options.max_relative_depth_error < 0.0F ||
+      options.max_normal_error_degrees < 0.0F ||
+      options.max_view_angle_degrees < 0.0F ||
+      options.max_normal_error_degrees > 180.0F ||
+      options.max_view_angle_degrees > 180.0F ||
+      options.min_num_fused_observations == 0 ||
+      options.max_num_fused_observations == 0 ||
+      options.max_num_fused_observations <
+          options.min_num_fused_observations) {
+    throw std::invalid_argument("Stereo fusion options are invalid.");
+  }
+
   StereoFusionResult result;
   result.summary.num_input_images = views.size();
+  const bool compact_visibility =
+      options.compact_visibility && views.size() <= 64;
+  std::vector<FusionViewGeometry> geometries;
+  geometries.reserve(views.size());
+  for (const PatchMatchView& view : views) {
+    geometries.push_back(MakeFusionViewGeometry(view));
+  }
 
   std::unordered_map<ImageId, std::size_t> image_idx_by_id;
   image_idx_by_id.reserve(views.size());
-  for (std::size_t image_idx = 0; image_idx < views.size(); ++image_idx) {
-    const ConsistencyGraph* graph =
-        consistency_graphs.empty() ? nullptr : &consistency_graphs[image_idx];
-    RequireCompatibleFusionMaps(images[image_idx], depth_maps[image_idx],
-                                normal_maps[image_idx], cost_maps[image_idx],
-                                graph);
-    image_idx_by_id[views[image_idx].image_id] = image_idx;
+  ImageId max_image_id = 0;
+  for (const PatchMatchView& view : views) {
+    max_image_id = std::max(max_image_id, view.image_id);
   }
+  constexpr std::size_t kMaxDenseImageIdLookup = 1U << 20;
+  const std::size_t invalid_image_idx =
+      std::numeric_limits<std::size_t>::max();
+  std::vector<std::size_t> dense_image_idx_by_id;
+  if (static_cast<std::size_t>(max_image_id) <= kMaxDenseImageIdLookup) {
+    dense_image_idx_by_id.assign(
+        static_cast<std::size_t>(max_image_id) + 1, invalid_image_idx);
+  }
+  std::vector<std::size_t> widths(views.size());
+  std::vector<std::size_t> heights(views.size());
+  std::vector<std::size_t> num_pixels(views.size());
+  // Validate in reverse order so the bounded LRU retains the first views
+  // consumed by the subsequent fusion loop. Count valid depth pixels in this
+  // same pass to avoid loading every persisted map a second time.
+  for (std::size_t remaining = views.size(); remaining > 0; --remaining) {
+    const std::size_t image_idx = remaining - 1;
+    const std::shared_ptr<const StereoFusionViewData> view_data =
+        load_view(image_idx);
+    if (!view_data) {
+      throw std::runtime_error("Stereo fusion view loader returned null.");
+    }
+    const DenseCostMap* cost_map =
+        view_data->cost_map.Empty() ? nullptr : &view_data->cost_map;
+    const ConsistencyGraph* graph =
+        view_data->consistency_graph.Empty()
+            ? nullptr
+            : &view_data->consistency_graph;
+    RequireCompatibleFusionMaps(
+        view_data->image, view_data->depth_map, view_data->normal_map,
+        cost_map, graph);
+    if (options.require_cost_map && cost_map == nullptr) {
+      throw std::invalid_argument("Stereo fusion requires cost maps.");
+    }
+    if (options.require_consistency_graph && graph == nullptr) {
+      throw std::invalid_argument(
+          "Stereo fusion requires consistency graphs.");
+    }
+    widths[image_idx] = view_data->depth_map.Width();
+    heights[image_idx] = view_data->depth_map.Height();
+    num_pixels[image_idx] = view_data->depth_map.NumPixels();
+    for (std::size_t row = 0; row < heights[image_idx]; ++row) {
+      for (std::size_t col = 0; col < widths[image_idx]; ++col) {
+        result.summary.num_depth_pixels +=
+            view_data->depth_map.IsValid(row, col) ? 1 : 0;
+      }
+    }
+    image_idx_by_id[views[image_idx].image_id] = image_idx;
+    if (!dense_image_idx_by_id.empty()) {
+      dense_image_idx_by_id[views[image_idx].image_id] = image_idx;
+    }
+  }
+  const auto find_image_idx =
+      [&dense_image_idx_by_id, &image_idx_by_id,
+       invalid_image_idx](ImageId image_id) {
+        if (static_cast<std::size_t>(image_id) <
+            dense_image_idx_by_id.size()) {
+          return dense_image_idx_by_id[image_id];
+        }
+        const auto it = image_idx_by_id.find(image_id);
+        return it == image_idx_by_id.end() ? invalid_image_idx : it->second;
+      };
   std::vector<std::unique_ptr<std::atomic<std::uint8_t>[]>> visited(
       views.size());
-  std::vector<std::vector<std::uint8_t>> complete(views.size());
-  std::vector<std::vector<FusionPixelData>> pixel_data(views.size());
   for (std::size_t image_idx = 0; image_idx < views.size(); ++image_idx) {
     visited[image_idx] = std::make_unique<std::atomic<std::uint8_t>[]>(
-        depth_maps[image_idx].NumPixels());
-    for (std::size_t offset = 0; offset < depth_maps[image_idx].NumPixels();
-         ++offset) {
+        num_pixels[image_idx]);
+    for (std::size_t offset = 0; offset < num_pixels[image_idx]; ++offset) {
       visited[image_idx][offset].store(0, std::memory_order_relaxed);
     }
-    complete[image_idx].assign(depth_maps[image_idx].NumPixels(), 0);
-    pixel_data[image_idx].resize(depth_maps[image_idx].NumPixels());
   }
-  // World-space position, normal, and color are immutable during fusion and
-  // otherwise get reconstructed for the seed, every BFS cursor, and again
-  // during aggregation. Precompute them once; images are independent, so the
-  // core thread pool can fill the cache without synchronization.
-  parallel::parallel_for_(
-      parallel::Range(0, static_cast<int>(views.size())),
-      [&](const parallel::Range& range) {
-        for (int image_idx_int = range.start; image_idx_int < range.end;
-             ++image_idx_int) {
-          const std::size_t image_idx =
-              static_cast<std::size_t>(image_idx_int);
-          const std::size_t width = depth_maps[image_idx].Width();
-          for (std::size_t row = 0; row < depth_maps[image_idx].Height();
-               ++row) {
-            for (std::size_t col = 0; col < width; ++col) {
-              if (!IsCompleteFusionPixel(
-                      images, depth_maps, normal_maps, cost_maps,
-                      consistency_graphs, options, image_idx, row, col)) {
-                continue;
-              }
-              const std::optional<FusionPixelData> data = MakeFusionPixelData(
-                  views, images, depth_maps, normal_maps, image_idx, row, col);
-              if (!data.has_value()) {
-                continue;
-              }
-              const std::size_t offset = row * width + col;
-              pixel_data[image_idx][offset] = *data;
-              complete[image_idx][offset] = 1;
-            }
-          }
-        }
-      });
-  const auto offset_of = [&depth_maps](std::size_t image_idx, std::size_t row,
-                                       std::size_t col) {
-    return row * depth_maps[image_idx].Width() + col;
+  const auto offset_of = [&widths](std::size_t image_idx, std::size_t row,
+                                   std::size_t col) {
+    return row * widths[image_idx] + col;
   };
   const auto claim_pixel = [&visited](std::size_t image_idx,
                                       std::size_t offset) {
@@ -3149,26 +3703,35 @@ StereoFusionResult FuseStereoDepthMaps(
     return visited[image_idx][offset].compare_exchange_strong(
         expected, 1, std::memory_order_relaxed, std::memory_order_relaxed);
   };
-
-  for (std::size_t image_idx = 0; image_idx < views.size(); ++image_idx) {
-    for (std::size_t row = 0; row < depth_maps[image_idx].Height(); ++row) {
-      for (std::size_t col = 0; col < depth_maps[image_idx].Width(); ++col) {
-        result.summary.num_depth_pixels +=
-            depth_maps[image_idx].IsValid(row, col) ? 1 : 0;
-      }
-    }
-  }
+  constexpr double kPi = 3.14159265358979323846;
+  const double min_normal_cosine =
+      std::cos(static_cast<double>(options.max_normal_error_degrees) *
+               kPi / 180.0);
+  const double min_view_cosine =
+      std::cos(static_cast<double>(options.max_view_angle_degrees) *
+               kPi / 180.0);
+  const bool collect_view_angles =
+      min_view_cosine > -1.0 + 1e-12 || options.collect_diagnostics;
 
   const std::size_t num_workers =
       static_cast<std::size_t>(std::max(1, parallel::getNumThreads()));
   std::vector<FusionTaskResult> task_results(num_workers);
   for (FusionTaskResult& task : task_results) {
-    task.pair_diagnostics.resize(views.size() * views.size());
-    task.pair_diagnostics_seen.assign(views.size() * views.size(), 0);
+    if (options.collect_diagnostics) {
+      task.pair_diagnostics.resize(views.size() * views.size());
+      task.pair_diagnostics_seen.assign(views.size() * views.size(), 0);
+    }
+    task.track_scratch.reserve(options.max_num_fused_observations);
+    task.median_scratch.reserve(std::min<std::size_t>(
+        options.max_num_fused_observations,
+        std::max<std::size_t>(options.min_num_fused_observations, 64)));
+    task.view_index.resize(views.size());
   }
 
   for (std::size_t image_idx = 0; image_idx < views.size(); ++image_idx) {
-    const int height = static_cast<int>(depth_maps[image_idx].Height());
+    const std::shared_ptr<const StereoFusionViewData> reference_view_data =
+        load_view(image_idx);
+    const int height = static_cast<int>(heights[image_idx]);
     const int row_stripes = std::max(1, (height + 9) / 10);
     parallel::parallel_for_(
         parallel::Range(0, height),
@@ -3178,11 +3741,28 @@ StereoFusionResult FuseStereoDepthMaps(
           FusionTaskResult& task =
               task_results[std::min(worker_idx, task_results.size() - 1)];
           StereoFusionResult& local = task.result;
+          const auto load_task_view =
+              [&](std::size_t requested_idx)
+              -> std::shared_ptr<const StereoFusionViewData> {
+            std::shared_ptr<const StereoFusionViewData> loaded =
+                task.view_index[requested_idx].lock();
+            if (loaded) {
+              return loaded;
+            }
+            loaded = load_view(requested_idx);
+            task.view_index[requested_idx] = loaded;
+            constexpr std::size_t kWorkerViewCacheCapacity = 4;
+            if (task.view_hot_cache.size() >= kWorkerViewCacheCapacity) {
+              task.view_hot_cache.erase(task.view_hot_cache.begin());
+            }
+            task.view_hot_cache.emplace_back(requested_idx, loaded);
+            return loaded;
+          };
           for (int row_int = range.start; row_int < range.end; ++row_int) {
             const std::size_t row = static_cast<std::size_t>(row_int);
-            for (std::size_t col = 0; col < depth_maps[image_idx].Width();
+            for (std::size_t col = 0; col < widths[image_idx];
                  ++col) {
-              if (!depth_maps[image_idx].IsValid(row, col)) {
+              if (!reference_view_data->depth_map.IsValid(row, col)) {
                 continue;
               }
               const std::size_t seed_offset =
@@ -3191,105 +3771,173 @@ StereoFusionResult FuseStereoDepthMaps(
                       std::memory_order_relaxed) != 0) {
                 continue;
               }
-              if (complete[image_idx][seed_offset] == 0) {
+              if (!IsCompleteFusionPixel(
+                      *reference_view_data, options, row, col)) {
                 local.summary.num_skipped_pixels++;
                 continue;
               }
               if (!claim_pixel(image_idx, seed_offset)) {
                 continue;
               }
-              const FusionPixelData& seed_data =
-                  pixel_data[image_idx][seed_offset];
+              const std::optional<FusionPixelData> seed_data =
+                  MakeFusionPixelData(views[image_idx],
+                                      geometries[image_idx],
+                                      *reference_view_data, row, col);
+              if (!seed_data.has_value()) {
+                local.summary.num_skipped_pixels++;
+                continue;
+              }
               local.summary.num_visited_pixels++;
 
-              std::vector<FusionObservation> track;
-              track.reserve(options.min_num_fused_observations);
-              track.push_back({image_idx, row, col, 0});
+              std::vector<FusionObservation>& track = task.track_scratch;
+              track.clear();
+              track.push_back({image_idx, row, col, 0, 1.0, 1.0, *seed_data});
 
               for (std::size_t cursor = 0;
                    cursor < track.size() &&
                    track.size() < options.max_num_fused_observations;
                    ++cursor) {
-                const FusionObservation current = track[cursor];
-                if (current.traversal_depth >= options.max_traversal_depth ||
-                    consistency_graphs.empty()) {
+                const FusionObservation& current = track[cursor];
+                if (current.traversal_depth >= options.max_traversal_depth) {
                   continue;
                 }
-                const FusionPixelData& current_data =
-                    pixel_data[current.image_idx][offset_of(
-                        current.image_idx, current.row, current.col)];
-                const std::vector<ImageId>& source_image_ids =
-                    consistency_graphs[current.image_idx].SourceImageIds(
+                const FusionPixelData& current_data = current.data;
+                const std::shared_ptr<const StereoFusionViewData>
+                    current_view_data =
+                        load_task_view(current.image_idx);
+                if (current_view_data->consistency_graph.Empty()) {
+                  continue;
+                }
+                const ConsistencyGraph::ImageIdRange source_image_ids =
+                    current_view_data->consistency_graph.SourceImageIds(
                         current.row, current.col);
                 for (const ImageId source_image_id : source_image_ids) {
-                  const auto source_it =
-                      image_idx_by_id.find(source_image_id);
-                  if (source_it == image_idx_by_id.end()) {
+                  const std::size_t source_idx =
+                      find_image_idx(source_image_id);
+                  // Match COLMAP's image-level fusion traversal: once an
+                  // earlier reference image has completed, later seeds never
+                  // traverse back into it. Its accepted pixels have already
+                  // been claimed and retrying them only repeats projection,
+                  // cache lookup, and visited checks.
+                  if (source_idx == invalid_image_idx ||
+                      (options.skip_completed_reference_views &&
+                       source_idx < image_idx)) {
                     continue;
                   }
-                  const std::size_t source_idx = source_it->second;
                   const std::size_t pair_offset =
                       current.image_idx * views.size() + source_idx;
-                  StereoFusionPairDiagnostics& pair_diagnostics =
-                      task.pair_diagnostics[pair_offset];
-                  task.pair_diagnostics_seen[pair_offset] = 1;
-                  pair_diagnostics.reference_image_id =
-                      views[current.image_idx].image_id;
-                  pair_diagnostics.source_image_id =
-                      views[source_idx].image_id;
-                  pair_diagnostics.num_candidates++;
+                  StereoFusionPairDiagnostics* pair_diagnostics = nullptr;
+                  if (options.collect_diagnostics) {
+                    pair_diagnostics =
+                        &task.pair_diagnostics[pair_offset];
+                    task.pair_diagnostics_seen[pair_offset] = 1;
+                    pair_diagnostics->reference_image_id =
+                        views[current.image_idx].image_id;
+                    pair_diagnostics->source_image_id =
+                        views[source_idx].image_id;
+                    pair_diagnostics->num_candidates++;
+                  }
 
                   FusionRejectReason reject_reason = FusionRejectReason::kNone;
-                  const std::optional<FusionObservation> source =
+                  const std::shared_ptr<const StereoFusionViewData>
+                      source_view_data = load_task_view(source_idx);
+                  std::optional<FusionObservation> source =
                       ProjectFusionObservationToSource(
-                          views, depth_maps, normal_maps, cost_maps,
-                          consistency_graphs, options, current, source_idx,
-                          current_data.xyz, seed_data.xyz, seed_data.normal,
-                          image_idx, &local.error_samples, &reject_reason);
+                          views, geometries, *source_view_data, options,
+                          current, source_idx,
+                          current_data.xyz, seed_data->xyz,
+                          seed_data->normal.cast<double>(),
+                          image_idx,
+                          min_normal_cosine,
+                          min_view_cosine,
+                          visited[source_idx].get(),
+                          options.collect_diagnostics
+                              ? &local.error_samples
+                              : nullptr,
+                          &reject_reason);
                   if (!source.has_value()) {
                     switch (reject_reason) {
+                      case FusionRejectReason::kVisited:
+                        if (pair_diagnostics != nullptr) {
+                          pair_diagnostics->num_rejected_visited++;
+                          pair_diagnostics->num_rejected_other++;
+                        }
+                        break;
                       case FusionRejectReason::kNormal:
                         local.summary.num_rejected_normal_observations++;
-                        pair_diagnostics.num_rejected_normal++;
+                        if (pair_diagnostics != nullptr) {
+                          pair_diagnostics->num_rejected_normal++;
+                        }
                         break;
                       case FusionRejectReason::kView:
                         local.summary.num_rejected_view_observations++;
-                        pair_diagnostics.num_rejected_view++;
+                        if (pair_diagnostics != nullptr) {
+                          pair_diagnostics->num_rejected_view++;
+                        }
                         break;
                       case FusionRejectReason::kProjection:
-                        pair_diagnostics.num_rejected_projection++;
-                        pair_diagnostics.num_rejected_other++;
+                        if (pair_diagnostics != nullptr) {
+                          pair_diagnostics->num_rejected_projection++;
+                          pair_diagnostics->num_rejected_other++;
+                        }
                         break;
                       case FusionRejectReason::kDepth:
-                        pair_diagnostics.num_rejected_depth++;
-                        pair_diagnostics.num_rejected_other++;
+                        if (pair_diagnostics != nullptr) {
+                          pair_diagnostics->num_rejected_depth++;
+                          pair_diagnostics->num_rejected_other++;
+                        }
                         break;
                       case FusionRejectReason::kMutualConsistency:
-                        pair_diagnostics.num_rejected_mutual_consistency++;
-                        pair_diagnostics.num_rejected_other++;
+                        if (pair_diagnostics != nullptr) {
+                          pair_diagnostics->num_rejected_mutual_consistency++;
+                          pair_diagnostics->num_rejected_other++;
+                        }
                         break;
                       case FusionRejectReason::kInvalid:
                       case FusionRejectReason::kNone:
-                        pair_diagnostics.num_rejected_invalid++;
-                        pair_diagnostics.num_rejected_other++;
+                        if (pair_diagnostics != nullptr) {
+                          pair_diagnostics->num_rejected_invalid++;
+                          pair_diagnostics->num_rejected_other++;
+                        }
                         break;
                     }
                     continue;
                   }
                   const std::size_t source_offset = offset_of(
                       source->image_idx, source->row, source->col);
-                  if (complete[source->image_idx][source_offset] == 0) {
-                    pair_diagnostics.num_rejected_incomplete++;
-                    pair_diagnostics.num_rejected_other++;
+                  if (!IsCompleteFusionPixel(
+                          *source_view_data, options, source->row,
+                          source->col)) {
+                    if (pair_diagnostics != nullptr) {
+                      pair_diagnostics->num_rejected_incomplete++;
+                      pair_diagnostics->num_rejected_other++;
+                    }
                     continue;
                   }
                   if (!claim_pixel(source->image_idx, source_offset)) {
-                    pair_diagnostics.num_rejected_visited++;
-                    pair_diagnostics.num_rejected_other++;
+                    if (pair_diagnostics != nullptr) {
+                      pair_diagnostics->num_rejected_visited++;
+                      pair_diagnostics->num_rejected_other++;
+                    }
                     continue;
                   }
-                  pair_diagnostics.num_accepted++;
+                  const std::optional<FusionPixelData> source_data =
+                      MakeFusionPixelData(
+                          views[source->image_idx],
+                          geometries[source->image_idx], *source_view_data,
+                          source->row, source->col, &source->data.normal);
+                  if (!source_data.has_value()) {
+                    if (pair_diagnostics != nullptr) {
+                      pair_diagnostics->num_rejected_incomplete++;
+                      pair_diagnostics->num_rejected_other++;
+                    }
+                    continue;
+                  }
+                  if (pair_diagnostics != nullptr) {
+                    pair_diagnostics->num_accepted++;
+                  }
                   local.summary.num_visited_pixels++;
+                  source->data = *source_data;
                   track.push_back(*source);
                   if (track.size() >= options.max_num_fused_observations) {
                     break;
@@ -3303,37 +3951,33 @@ StereoFusionResult FuseStereoDepthMaps(
                 continue;
               }
 
-              std::array<std::vector<double>, 3> xyz_values;
-              std::array<std::vector<double>, 3> normal_values;
-              std::array<std::vector<double>, 3> color_values;
-              for (std::size_t axis = 0; axis < 3; ++axis) {
-                xyz_values[axis].reserve(track.size());
-                normal_values[axis].reserve(track.size());
-                color_values[axis].reserve(track.size());
-              }
-              for (const FusionObservation& observation : track) {
-                const FusionPixelData& data =
-                    pixel_data[observation.image_idx][offset_of(
-                        observation.image_idx, observation.row,
-                        observation.col)];
-                for (std::size_t axis = 0; axis < 3; ++axis) {
-                  xyz_values[axis].push_back(
-                      data.xyz[static_cast<int>(axis)]);
-                  normal_values[axis].push_back(
-                      data.normal[static_cast<int>(axis)]);
-                  color_values[axis].push_back(
-                      data.color[static_cast<int>(axis)]);
-                }
-              }
               Eigen::Vector3d xyz;
               Eigen::Vector3d normal;
               Eigen::Vector3d color;
+              const auto median_component =
+                  [&](const std::size_t axis, const int value_kind) {
+                    task.median_scratch.clear();
+                    for (const FusionObservation& observation : track) {
+                      const FusionPixelData& data = observation.data;
+                      if (value_kind == 0) {
+                        task.median_scratch.push_back(
+                            data.xyz[static_cast<int>(axis)]);
+                      } else if (value_kind == 1) {
+                        task.median_scratch.push_back(
+                            static_cast<double>(
+                                data.normal[static_cast<int>(axis)]));
+                      } else {
+                        task.median_scratch.push_back(
+                            static_cast<double>(
+                                data.color[static_cast<int>(axis)]));
+                      }
+                    }
+                    return FusionMedian(&task.median_scratch);
+                  };
               for (std::size_t axis = 0; axis < 3; ++axis) {
-                xyz[static_cast<int>(axis)] = FusionMedian(&xyz_values[axis]);
-                normal[static_cast<int>(axis)] =
-                    FusionMedian(&normal_values[axis]);
-                color[static_cast<int>(axis)] =
-                    FusionMedian(&color_values[axis]);
+                xyz[static_cast<int>(axis)] = median_component(axis, 0);
+                normal[static_cast<int>(axis)] = median_component(axis, 1);
+                color[static_cast<int>(axis)] = median_component(axis, 2);
               }
               if (!xyz.allFinite() || !normal.allFinite() ||
                   normal.squaredNorm() <= 0.0) {
@@ -3365,31 +4009,66 @@ StereoFusionResult FuseStereoDepthMaps(
               track_diagnostics.seed_row = row;
               track_diagnostics.seed_col = col;
               track_diagnostics.num_observations = track.size();
-              std::unordered_set<ImageId> unique_image_ids;
+              track_diagnostics.view_angle_collected =
+                  collect_view_angles;
               std::vector<std::uint32_t> point_visibility;
-              point_visibility.reserve(track.size());
+              if (!compact_visibility) {
+                point_visibility.reserve(track.size());
+              }
+              std::uint64_t point_visibility_mask = 0;
+              double min_track_normal_cosine = 1.0;
+              double min_track_view_cosine = 1.0;
               for (const FusionObservation& observation : track) {
-                unique_image_ids.insert(views[observation.image_idx].image_id);
-                point_visibility.push_back(
-                    static_cast<std::uint32_t>(observation.image_idx));
+                if (compact_visibility) {
+                  point_visibility_mask |=
+                      std::uint64_t{1} << observation.image_idx;
+                } else {
+                  point_visibility.push_back(
+                      static_cast<std::uint32_t>(
+                          observation.image_idx));
+                }
                 track_diagnostics.max_traversal_depth = std::max(
                     track_diagnostics.max_traversal_depth,
                     observation.traversal_depth);
-                track_diagnostics.max_normal_angle_degrees = std::max(
-                    track_diagnostics.max_normal_angle_degrees,
-                    observation.normal_angle_degrees);
-                track_diagnostics.max_view_angle_degrees = std::max(
-                    track_diagnostics.max_view_angle_degrees,
-                    observation.view_angle_degrees);
+                min_track_normal_cosine =
+                    std::min(min_track_normal_cosine,
+                             observation.normal_cosine);
+                if (collect_view_angles) {
+                  min_track_view_cosine =
+                      std::min(min_track_view_cosine,
+                               observation.view_cosine);
+                }
               }
-              std::sort(point_visibility.begin(), point_visibility.end());
-              point_visibility.erase(
-                  std::unique(point_visibility.begin(),
-                              point_visibility.end()),
-                  point_visibility.end());
-              track_diagnostics.num_unique_images = unique_image_ids.size();
+              track_diagnostics.max_normal_angle_degrees =
+                  DegreesFromCosine(min_track_normal_cosine);
+              if (collect_view_angles) {
+                track_diagnostics.max_view_angle_degrees =
+                    DegreesFromCosine(min_track_view_cosine);
+              }
+              if (compact_visibility) {
+                std::uint64_t remaining = point_visibility_mask;
+                while (remaining != 0) {
+                  ++track_diagnostics.num_unique_images;
+                  remaining &= remaining - 1;
+                }
+              } else {
+                std::sort(point_visibility.begin(),
+                          point_visibility.end());
+                point_visibility.erase(
+                    std::unique(point_visibility.begin(),
+                                point_visibility.end()),
+                    point_visibility.end());
+                track_diagnostics.num_unique_images =
+                    point_visibility.size();
+              }
               local.tracks.push_back(track_diagnostics);
-              local.points_visibility.push_back(std::move(point_visibility));
+              if (compact_visibility) {
+                local.points_visibility_masks.push_back(
+                    point_visibility_mask);
+              } else {
+                local.points_visibility.push_back(
+                    std::move(point_visibility));
+              }
               local.summary.num_fusion_tracks++;
               local.summary.num_fused_observations += track.size();
             }
@@ -3421,6 +4100,10 @@ StereoFusionResult FuseStereoDepthMaps(
         result.points_visibility.end(),
         std::make_move_iterator(task.result.points_visibility.begin()),
         std::make_move_iterator(task.result.points_visibility.end()));
+    result.points_visibility_masks.insert(
+        result.points_visibility_masks.end(),
+        task.result.points_visibility_masks.begin(),
+        task.result.points_visibility_masks.end());
     const StereoFusionSummary& summary = task.result.summary;
     result.summary.num_fusion_tracks += summary.num_fusion_tracks;
     result.summary.num_fused_observations += summary.num_fused_observations;

@@ -96,6 +96,27 @@ TEST(MvsImageWorkspaceTest, LoadsRgbImageForDenseFusion) {
   EXPECT_EQ(rgb[2], 56);
 }
 
+TEST(MvsImageWorkspaceTest, CanLoadOnlyRgbPixelsForPersistedFusion) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() / "colite_mvs_rgb_only_test";
+  std::filesystem::create_directories(root);
+  WriteColorImage(root / "image1.png", cv::Scalar(56, 34, 12));
+  WriteColorImage(root / "image2.png", cv::Scalar(3, 2, 1));
+
+  MvsImageWorkspaceOptions options;
+  options.image_path = root;
+  options.load_gray = false;
+  options.load_color = true;
+  MvsImageWorkspace workspace(MakeWorkspaceReconstruction(), options);
+  const MvsImage& image = workspace.GetImage(1);
+
+  EXPECT_TRUE(image.gray.empty());
+  ASSERT_EQ(image.color.type(), CV_8UC3);
+  EXPECT_EQ(image.Width(), 4U);
+  EXPECT_EQ(image.Height(), 2U);
+  EXPECT_FALSE(image.Empty());
+}
+
 TEST(MvsImageWorkspaceTest, EvictsLeastRecentlyUsedImage) {
   const std::filesystem::path root =
       std::filesystem::temp_directory_path() / "colite_mvs_workspace_lru_test";

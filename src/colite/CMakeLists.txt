@@ -4,6 +4,9 @@ set(COLITE_CUDA_SIFT_SOURCES
 set(COLITE_CUDA_MVS_SOURCES
   mvs/patch_match_cuda_stub.cpp
 )
+set(COLITE_CUDA_MATCHER_SOURCES
+  matching/descriptor_matcher_cuda_stub.cpp
+)
 
 if(COLITE_ENABLE_CUDA_SIFT)
   set(COLITE_CUDA_SIFT_SOURCES
@@ -21,6 +24,12 @@ endif()
 if(COLITE_ENABLE_CUDA_MVS)
   set(COLITE_CUDA_MVS_SOURCES
     mvs/patch_match_cuda.cu
+  )
+endif()
+
+if(COLITE_ENABLE_CUDA_MATCHER)
+  set(COLITE_CUDA_MATCHER_SOURCES
+    matching/descriptor_matcher_cuda.cu
   )
 endif()
 
@@ -44,6 +53,7 @@ add_library(colite_core
   io/camera_prior.cpp
   io/sfm_workspace.cpp
   matching/descriptor_matcher.cpp
+  ${COLITE_CUDA_MATCHER_SOURCES}
   matching/guided_matching.cpp
   matching/pair_generator.cpp
   matching/vocabulary_tree.cpp
@@ -127,9 +137,18 @@ if(COLITE_ENABLE_DELAUNAY_MESHING AND CGAL_FOUND)
   target_compile_definitions(colite_core PUBLIC COLITE_ENABLE_DELAUNAY_MESHING)
 endif()
 
-if(COLITE_ENABLE_CUDA_SIFT)
+if(COLITE_ENABLE_CUDA_SIFT OR COLITE_ENABLE_CUDA_MATCHER)
   target_link_libraries(colite_core PUBLIC CUDA::cudart)
+endif()
+
+if(COLITE_ENABLE_CUDA_SIFT)
   target_compile_definitions(colite_core PUBLIC COLITE_ENABLE_CUDA_SIFT)
+  set_target_properties(colite_core PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+endif()
+
+if(COLITE_ENABLE_CUDA_MATCHER)
+  target_link_libraries(colite_core PUBLIC CUDA::cublas)
+  target_compile_definitions(colite_core PUBLIC COLITE_ENABLE_CUDA_MATCHER)
   set_target_properties(colite_core PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 endif()
 
@@ -153,6 +172,7 @@ endif()
 
 set_source_files_properties(
   features/backends/cuda_sift_extractor_stub.cpp
+  matching/descriptor_matcher_cuda_stub.cpp
   mvs/patch_match_cuda_stub.cpp
   PROPERTIES
     COMPILE_OPTIONS "-Wno-pedantic;-Wno-unused-function"

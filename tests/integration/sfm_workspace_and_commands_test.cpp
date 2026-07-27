@@ -90,6 +90,7 @@ TEST(SfmWorkspaceTest, RoundTripsManifestFeaturesAndMatches) {
   camera.width = 640;
   camera.height = 480;
   camera.params = {500.0, 500.0, 320.0, 240.0};
+  camera.has_prior_focal_length = true;
 
   Image image1;
   image1.id = 1;
@@ -129,6 +130,7 @@ TEST(SfmWorkspaceTest, RoundTripsManifestFeaturesAndMatches) {
 
   ASSERT_EQ(cameras.size(), 1U);
   EXPECT_EQ(cameras[0].width, 640U);
+  EXPECT_TRUE(cameras[0].has_prior_focal_length);
   ASSERT_EQ(images.size(), 2U);
   EXPECT_EQ(images[1].name, "image2.jpg");
   ASSERT_TRUE(images[1].prior_position.has_value());
@@ -577,8 +579,9 @@ TEST(SfmCommandExeTest, FeatureExtractorUsesExifFocalPriorByDefault) {
   const std::vector<Camera> cameras = ReadWorkspaceCameras(workspace);
   ASSERT_EQ(cameras.size(), 1U);
   ASSERT_GE(cameras[0].params.size(), 2U);
-  EXPECT_NEAR(cameras[0].params[0], 2457.6, 1e-6);
-  EXPECT_NEAR(cameras[0].params[1], 2457.6, 1e-6);
+  EXPECT_NEAR(cameras[0].params[0], 2484.86249133349, 1e-6);
+  EXPECT_NEAR(cameras[0].params[1], 2484.86249133349, 1e-6);
+  EXPECT_TRUE(cameras[0].has_prior_focal_length);
 }
 
 TEST(CameraPriorTest, EstimatesFocalLengthFromJpegExif) {
@@ -586,7 +589,8 @@ TEST(CameraPriorTest, EstimatesFocalLengthFromJpegExif) {
       std::filesystem::path(COLITE_SOURCE_DIR) / "data" / "building-18" /
       "P1180166.JPG";
 
-  EXPECT_NEAR(EstimateInitialFocalLengthFromImage(image_path, 0.0), 2457.6,
+  EXPECT_NEAR(EstimateInitialFocalLengthFromImage(image_path, 0.0),
+              2484.86249133349,
               1e-6);
 }
 

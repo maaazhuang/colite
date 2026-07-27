@@ -148,7 +148,7 @@ TEST(ReconSfmExeTest, EstimatesInitialFocalLengthFromJpegExif) {
   const double focal_length =
       EstimateInitialFocalLengthFromImage(image_path, 0.0);
 
-  EXPECT_NEAR(focal_length, 2457.6, 1e-6);
+  EXPECT_NEAR(focal_length, 2484.86249133349, 1e-6);
 }
 
 TEST(ReconSfmExeTest, WritesColmapTextModel) {
@@ -257,8 +257,15 @@ TEST(ReconSfmExeTest, WritesQualitySummaryAndPlyPointCloud) {
 
   const std::filesystem::path output_path =
       std::filesystem::temp_directory_path() / "colite_summary_ply_test";
+  controllers::ReconSfmRunStats run_stats;
+  run_stats.feature_backend = "cuda_vlfeat";
+  run_stats.matcher_backend = "bf";
+  run_stats.cuda_sift_available = true;
+  run_stats.cpu_threads = 8;
+  run_stats.feature_extraction_seconds = 1.25;
+  run_stats.matching_seconds = 2.5;
   controllers::WriteRunSummary(output_path, reconstruction, summary,
-                  /*feature_extraction_seconds=*/1.25);
+                               run_stats);
   controllers::WritePlyPointCloud(output_path / "points3D.ply", reconstruction);
 
   const std::string summary_text = ReadTextFile(output_path / "summary.txt");
@@ -267,6 +274,11 @@ TEST(ReconSfmExeTest, WritesQualitySummaryAndPlyPointCloud) {
   EXPECT_NE(summary_text.find("num_observations 2"), std::string::npos);
   EXPECT_NE(summary_text.find("feature_extraction_seconds 1.25"),
             std::string::npos);
+  EXPECT_NE(summary_text.find("feature_backend cuda_vlfeat"),
+            std::string::npos);
+  EXPECT_NE(summary_text.find("cuda_sift_available 1"), std::string::npos);
+  EXPECT_NE(summary_text.find("cpu_threads 8"), std::string::npos);
+  EXPECT_NE(summary_text.find("matching_seconds 2.5"), std::string::npos);
   EXPECT_NE(summary_text.find("mean_reprojection_error 0"), std::string::npos);
   EXPECT_NE(summary_text.find("max_reprojection_error 0"), std::string::npos);
   EXPECT_NE(ply_text.find("ply"), std::string::npos);
@@ -399,6 +411,8 @@ TEST(ReconSfmExeTest, WritesRegistrationDiagnosticsForMappingRounds) {
   registration.local_bundle_adjustment.num_constant_images = 2;
   registration.local_bundle_adjustment.num_variable_images = 6;
   registration.local_bundle_adjustment.num_variable_points = 80;
+  registration.local_bundle_adjustment.num_constant_cameras = 1;
+  registration.local_bundle_adjustment.num_variable_cameras = 0;
   registration.local_bundle_adjustment.num_residuals = 260;
   registration.local_bundle_adjustment.initial_mean_reprojection_error = 1.25;
   registration.local_bundle_adjustment.final_mean_reprojection_error = 0.75;
@@ -435,7 +449,7 @@ TEST(ReconSfmExeTest, WritesRegistrationDiagnosticsForMappingRounds) {
             std::string::npos);
   EXPECT_NE(diagnostics.find(
                 "2\t7\t128\t256\t2\t4\t512\t128500\t1\t3.5\t140\t118\t120\t11\t2"
-                "\t3\t23\t46\t5\t10\t1\t2\t2\t3\t2\t2\t6\t80\t260"
+                "\t3\t23\t46\t5\t10\t1\t2\t2\t3\t2\t2\t6\t1\t0\t80\t260"
                 "\t1.25\t0.75\t3\t1"),
             std::string::npos);
 

@@ -149,10 +149,12 @@ int RunPatchMatchStereo(const std::vector<std::string>& argv,
     auto recon_args = BuildReconArgs(argv.front(), model, images, output, parsed);
     recon_args.push_back("--run_patch_match");
     recon_args.push_back("--check_geometric_consistency");
+    auto fingerprint_args = recon_args;
+    fingerprint_args.push_back("@implementation=patch_match_v4");
     StageSpec spec{"patch_match_stereo", output, {model, images},
                    {output / "stereo" / "depth_maps",
                     output / "stereo" / "normal_maps"},
-                   recon_args};
+                   fingerprint_args};
     return RunStage(spec, parsed.stage,
                     [&] { return RunReconMvs(recon_args, out, err); }, out, err);
   }, err);
@@ -172,9 +174,11 @@ int RunStereoFusion(const std::vector<std::string>& argv,
     const auto output = OutputPath(parsed);
     auto recon_args = BuildReconArgs(argv.front(), model, images, output, parsed);
     recon_args.push_back("--fuse_stereo");
+    auto fingerprint_args = recon_args;
+    fingerprint_args.push_back("@implementation=stereo_fusion_v3");
     StageSpec spec{"stereo_fusion", output,
                    {model, images, output / "stereo"},
-                   {output / "dense" / "fused.ply"}, recon_args};
+                   {output / "dense" / "fused.ply"}, fingerprint_args};
     return RunStage(spec, parsed.stage,
                     [&] { return RunReconMvs(recon_args, out, err); }, out, err);
   }, err);

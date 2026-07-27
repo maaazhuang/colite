@@ -208,5 +208,84 @@ TEST(LocalBundleAdjusterTest,
   EXPECT_GT(summary.num_residuals, 2U * (10U + 6U));
 }
 
+TEST(LocalBundleAdjusterTest,
+     KeepsSharedCameraIntrinsicsConstantWhenBundleIsIncomplete) {
+  const Camera true_camera = MakeCamera();
+  Camera estimated_camera = true_camera;
+  estimated_camera.params[0] = 650.0;
+  estimated_camera.params[1] = 650.0;
+  const std::map<ImageId, Pose3> true_poses = {
+      {1, CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0))},
+      {2, CameraAt(Eigen::Vector3d(1.0, 0.0, 0.0))},
+      {3, CameraAt(Eigen::Vector3d(0.5, 0.2, 0.0))},
+      {4, CameraAt(Eigen::Vector3d(-1.0, 0.0, 0.0))},
+  };
+
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(estimated_camera);
+  for (const auto& [image_id, pose] : true_poses) {
+    reconstruction.AddImage(MakeImage(image_id, pose));
+  }
+  for (int i = 0; i < 12; ++i) {
+    AddTrackedPoint(&reconstruction, true_camera, true_poses,
+                    Eigen::Vector3d(-0.8 + 0.12 * i, -0.2 + 0.03 * i,
+                                    4.5 + 0.05 * i),
+                    {1, 2, 3});
+  }
+
+  LocalBundleAdjustmentOptions options;
+  options.max_num_images = 3;
+  options.max_num_fixed_images = 0;
+  options.refine_camera_params = CameraParameterGroup::kFocalLength;
+  const std::vector<double> params_before =
+      reconstruction.GetCamera(1).params;
+
+  const LocalBundleAdjustmentSummary summary =
+      AdjustLocalBundle(1, options, &reconstruction);
+
+  EXPECT_TRUE(summary.success);
+  EXPECT_EQ(summary.local_image_ids, (std::set<ImageId>{1, 2, 3}));
+  EXPECT_EQ(summary.num_constant_cameras, 1U);
+  EXPECT_EQ(summary.num_variable_cameras, 0U);
+  EXPECT_EQ(reconstruction.GetCamera(1).params, params_before);
+}
+
+TEST(LocalBundleAdjusterTest,
+     RefinesSharedCameraIntrinsicsWhenBundleCoversAllRegisteredImages) {
+  const Camera true_camera = MakeCamera();
+  Camera estimated_camera = true_camera;
+  estimated_camera.params[0] = 650.0;
+  estimated_camera.params[1] = 650.0;
+  const std::map<ImageId, Pose3> true_poses = {
+      {1, CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0))},
+      {2, CameraAt(Eigen::Vector3d(1.0, 0.0, 0.0))},
+      {3, CameraAt(Eigen::Vector3d(0.5, 0.2, 0.0))},
+  };
+
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(estimated_camera);
+  for (const auto& [image_id, pose] : true_poses) {
+    reconstruction.AddImage(MakeImage(image_id, pose));
+  }
+  for (int i = 0; i < 12; ++i) {
+    AddTrackedPoint(&reconstruction, true_camera, true_poses,
+                    Eigen::Vector3d(-0.8 + 0.12 * i, -0.2 + 0.03 * i,
+                                    4.5 + 0.05 * i),
+                    {1, 2, 3});
+  }
+
+  LocalBundleAdjustmentOptions options;
+  options.max_num_images = 3;
+  options.max_num_fixed_images = 0;
+  options.refine_camera_params = CameraParameterGroup::kFocalLength;
+
+  const LocalBundleAdjustmentSummary summary =
+      AdjustLocalBundle(1, options, &reconstruction);
+
+  EXPECT_TRUE(summary.success);
+  EXPECT_EQ(summary.num_constant_cameras, 0U);
+  EXPECT_EQ(summary.num_variable_cameras, 1U);
+}
+
 }  // namespace
 }  // namespace colite

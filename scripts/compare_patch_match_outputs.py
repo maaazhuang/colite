@@ -75,7 +75,7 @@ def read_model(model: Path):
 
 
 def quantiles(values):
-    if not values:
+    if len(values) == 0:
         return {"count": 0}
     values = np.asarray(values, dtype=np.float64)
     return {
@@ -119,8 +119,13 @@ def main():
         valid["colmap"] += int(colmap_valid.sum())
         valid["common"] += int(common.sum())
         if common.any():
-            direct_errors.extend((np.abs(colite[common] - colmap[common]) /
-                                  np.maximum(colmap[common], 1e-12)).tolist())
+            # Keep dense comparisons in compact NumPy buffers. Converting tens
+            # of millions of half-resolution pixels to Python floats can use
+            # several GiB and makes the comparison itself the memory bottleneck.
+            direct_errors.append(
+                (np.abs(colite[common] - colmap[common]) /
+                 np.maximum(colmap[common], 1e-12)).astype(np.float32)
+            )
 
         rotation = quaternion_matrix(image["q"])
         camera_width, camera_height = image["camera"]
@@ -146,7 +151,10 @@ def main():
     result = {
         "num_images": len(per_image),
         "valid_ratio": {key: valid[key] / valid["pixels"] for key in ("colite", "colmap", "common")},
-        "common_depth_relative_difference": quantiles(direct_errors),
+        "common_depth_relative_difference": quantiles(
+            np.concatenate(direct_errors) if direct_errors
+            else np.empty(0, dtype=np.float32)
+        ),
         "sparse_point_relative_depth_error": {
             "colite": quantiles(sparse_errors["colite"]),
             "colmap": quantiles(sparse_errors["colmap"]),

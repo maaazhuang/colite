@@ -39,6 +39,8 @@ std::string MatcherBackendName(DescriptorMatcherBackend backend) {
       return "bf";
     case DescriptorMatcherBackend::kFlann:
       return "flann";
+    case DescriptorMatcherBackend::kCudaBruteForce:
+      return "cuda";
   }
   return "unknown";
 }

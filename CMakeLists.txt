@@ -9,13 +9,14 @@ project(
 
 option(COLITE_BUILD_TESTS "Build unit tests" ON)
 option(COLITE_ENABLE_CUDA_SIFT "Build the optimized CUDA SIFT feature backend when CUDA is available" ON)
+option(COLITE_ENABLE_CUDA_MATCHER "Build the CUDA brute-force descriptor matcher" ON)
 option(COLITE_ENABLE_CUDA_MVS "Build the optional CUDA MVS PatchMatch backend" OFF)
 option(COLITE_ENABLE_SIFT_PARALLEL "Enable the persistent SIFT worker pool" ON)
 option(COLITE_ENABLE_AVX2 "Enable AVX2/FMA optimized CPU SIFT kernels" ON)
 option(COLITE_ENABLE_POISSON_MESHING "Build the bundled PoissonRecon mesher" ON)
 option(COLITE_ENABLE_DELAUNAY_MESHING "Build the CGAL Delaunay mesher when CGAL is available" ON)
 
-if(COLITE_ENABLE_CUDA_SIFT OR COLITE_ENABLE_CUDA_MVS)
+if(COLITE_ENABLE_CUDA_SIFT OR COLITE_ENABLE_CUDA_MATCHER OR COLITE_ENABLE_CUDA_MVS)
   # WSL non-login shells commonly omit /usr/local/cuda/bin from PATH even
   # when the toolkit is installed there.
   if(UNIX AND NOT CMAKE_CUDA_COMPILER AND
@@ -27,7 +28,7 @@ if(COLITE_ENABLE_CUDA_SIFT OR COLITE_ENABLE_CUDA_MVS)
   check_language(CUDA)
 endif()
 
-if((COLITE_ENABLE_CUDA_SIFT OR COLITE_ENABLE_CUDA_MVS) AND
+if((COLITE_ENABLE_CUDA_SIFT OR COLITE_ENABLE_CUDA_MATCHER OR COLITE_ENABLE_CUDA_MVS) AND
    CMAKE_CUDA_COMPILER)
   set(CMAKE_CUDA_ARCHITECTURES "89" CACHE STRING
       "CUDA architectures used for optional CUDA backends")
@@ -35,9 +36,10 @@ if((COLITE_ENABLE_CUDA_SIFT OR COLITE_ENABLE_CUDA_MVS) AND
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
   find_package(CUDAToolkit REQUIRED)
-elseif(COLITE_ENABLE_CUDA_SIFT OR COLITE_ENABLE_CUDA_MVS)
-  message(STATUS "CUDA compiler not found: CUDA SIFT/MVS backends are disabled")
+elseif(COLITE_ENABLE_CUDA_SIFT OR COLITE_ENABLE_CUDA_MATCHER OR COLITE_ENABLE_CUDA_MVS)
+  message(STATUS "CUDA compiler not found: CUDA SIFT/matcher/MVS backends are disabled")
   set(COLITE_ENABLE_CUDA_SIFT OFF)
+  set(COLITE_ENABLE_CUDA_MATCHER OFF)
   set(COLITE_ENABLE_CUDA_MVS OFF)
 endif()
 

@@ -78,6 +78,13 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --patch_match_pyramid_levels <n> Coarse-to-fine PatchMatch "
          "pyramid levels, default 1.\n"
       << "  --patch_match_window_radius <n> ZNCC window radius, default 2.\n"
+      << "  --patch_match_fixed_initial_normals Disable randomized "
+         "camera-facing initial normals.\n"
+      << "  --patch_match_initial_normal_hemisphere_degrees <deg> Initial "
+         "normal cone; 90 uses the full camera-facing hemisphere, default "
+         "90.\n"
+      << "  --patch_match_normal_perturbation_degrees <deg> Initial normal "
+         "perturbation radius, default 57.2958.\n"
       << "  --patch_match_bilateral_ncc Enable COLMAP-style bilateral "
          "weighted NCC; disabled by default.\n"
       << "  --patch_match_sigma_spatial <s> Bilateral NCC spatial sigma; "
@@ -145,13 +152,17 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --fusion_max_view_angle <deg> Fusion view angle threshold, "
          "default 180.\n"
       << "  --fusion_source_pixel_search_radius <n> Source pixel search "
-         "radius for fusion, default 1.\n"
+         "radius for fusion, default 0.\n"
+      << "  --fusion_diagnostics      Collect pair rejection counters and "
+         "fusion error distributions; disabled by default.\n"
       << "  --filter_dense_cloud      Write dense/fused_clean.ply after "
          "track and voxel filtering.\n"
       << "  --dense_cloud_min_track_observations <n> Minimum observations "
          "per clean dense point, default 2.\n"
       << "  --dense_cloud_voxel_size <v> Optional clean cloud voxel size, "
          "default 0.\n"
+      << "  --dense_cloud_spatial_bounds_quantile <q> Remove the lower and "
+         "upper coordinate-wise clean-cloud tails; default 0 disables it.\n"
       << "  --mesh_dense_cloud        Write a prototype dense/mesh.ply from "
          "the clean cloud.\n"
       << "  --mesh_max_edge_length <v> Prototype mesh max edge length, "
@@ -292,6 +303,15 @@ ReconMvsCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--patch_match_window_radius") {
       options.patch_match_window_radius =
           std::stoi(RequireValue(args, &i, arg));
+    } else if (arg == "--patch_match_fixed_initial_normals") {
+      options.patch_match_randomize_initial_normals = false;
+    } else if (arg ==
+               "--patch_match_initial_normal_hemisphere_degrees") {
+      options.patch_match_initial_normal_hemisphere_degrees =
+          std::stof(RequireValue(args, &i, arg));
+    } else if (arg == "--patch_match_normal_perturbation_degrees") {
+      options.patch_match_normal_perturbation_degrees =
+          std::stof(RequireValue(args, &i, arg));
     } else if (arg == "--patch_match_bilateral_ncc") {
       options.patch_match_bilateral_ncc = true;
     } else if (arg == "--patch_match_sigma_spatial") {
@@ -390,6 +410,8 @@ ReconMvsCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--fusion_source_pixel_search_radius") {
       options.fusion_source_pixel_search_radius =
           static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
+    } else if (arg == "--fusion_diagnostics") {
+      options.fusion_diagnostics = true;
     } else if (arg == "--filter_dense_cloud") {
       options.filter_dense_cloud = true;
     } else if (arg == "--dense_cloud_min_track_observations") {
@@ -397,6 +419,10 @@ ReconMvsCliOptions ParseOptions(const std::vector<std::string>& args) {
           static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
     } else if (arg == "--dense_cloud_voxel_size") {
       options.dense_cloud_voxel_size = std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--dense_cloud_spatial_bounds_quantile") {
+      options.dense_cloud_spatial_bounds_quantile =
+          std::stod(RequireValue(args, &i, arg));
+      options.filter_dense_cloud = true;
     } else if (arg == "--mesh_dense_cloud") {
       options.mesh_dense_cloud = true;
       options.filter_dense_cloud = true;
@@ -596,6 +622,20 @@ void ValidateOptions(const ReconMvsCliOptions& options) {
   if (options.patch_match_window_radius < 0) {
     throw std::invalid_argument(
         "--patch_match_window_radius must be non-negative");
+  }
+  if (!std::isfinite(
+          options.patch_match_initial_normal_hemisphere_degrees) ||
+      options.patch_match_initial_normal_hemisphere_degrees < 0.0F ||
+      options.patch_match_initial_normal_hemisphere_degrees > 180.0F) {
+    throw std::invalid_argument(
+        "--patch_match_initial_normal_hemisphere_degrees must be in "
+        "[0, 180]");
+  }
+  if (!std::isfinite(options.patch_match_normal_perturbation_degrees) ||
+      options.patch_match_normal_perturbation_degrees < 0.0F ||
+      options.patch_match_normal_perturbation_degrees > 180.0F) {
+    throw std::invalid_argument(
+        "--patch_match_normal_perturbation_degrees must be in [0, 180]");
   }
   if (!std::isfinite(options.patch_match_sigma_spatial) ||
       !std::isfinite(options.patch_match_sigma_color) ||
@@ -805,6 +845,12 @@ void ValidateOptions(const ReconMvsCliOptions& options) {
       options.dense_cloud_voxel_size < 0.0) {
     throw std::invalid_argument(
         "--dense_cloud_voxel_size must be non-negative");
+  }
+  if (!std::isfinite(options.dense_cloud_spatial_bounds_quantile) ||
+      options.dense_cloud_spatial_bounds_quantile < 0.0 ||
+      options.dense_cloud_spatial_bounds_quantile >= 0.5) {
+    throw std::invalid_argument(
+        "--dense_cloud_spatial_bounds_quantile must be in [0, 0.5)");
   }
   if (!std::isfinite(options.mesh_max_edge_length) ||
       options.mesh_max_edge_length < 0.0) {

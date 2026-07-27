@@ -64,8 +64,8 @@ $COLITE feature_extractor \
 |---|---:|---|
 | `--image_path` | 必填 | 图像目录 |
 | `--workspace_path` | 必填 | 文件 workspace |
-| `--focal_length` | EXIF/尺寸先验 | 固定初始焦距像素 |
-| `--max_num_features` | 4096 | 基础 keypoint 上限；VLFeat 最终方向点可超过 |
+| `--focal_length` | EXIF/尺寸先验 | 显式初始焦距像素；是否由 BA 继续优化由 `--ba_refine_focal_length` 控制 |
+| `--max_num_features` | 4096 | OpenCV/CUDA 后端为最终输出上限；CPU VLFeat 按基础 keypoint/DoG level 限制，最终多方向点可超过 |
 | `--feature_num_threads` | -1 | CPU 线程数；-1 为逻辑核 |
 | `--feature_extractor` | auto | `auto|vlsift|cvsift|cuda_opencv|cuda_vlfeat` |
 
@@ -85,7 +85,7 @@ $COLITE sequential_matcher --workspace_path "$OUT/workspace" \
 |---|---:|---|
 | `--workspace_path` | 必填 | 已提取特征的 workspace |
 | `--matching_type` | 由命令决定 | `exhaustive|sequential|spatial|vocab_tree` |
-| `--matcher` | flann | `bf|flann` |
+| `--matcher` | flann | `bf|flann|cuda`；`cuda` 是与 CPU BF 口径一致的精确 GPU 暴力匹配 |
 | `--max_ratio` | 0.8 | Lowe ratio |
 | `--overlap` | 5 | sequential 后向邻居数 |
 | `--spatial_max_num_neighbors` | 10 | 空间邻居数 |
@@ -131,15 +131,15 @@ $COLITE recon_sfm \
 
 主要参数：
 
-- `--focal_length`；省略时优先 EXIF，否则 `1.2 × max(width,height)`。
-- `--nearby_match_window` 默认 2，0 禁用；`--nearby_match_ratio` 默认 0.9。
+- `--focal_length`；省略时依次使用 EXIF 35mm 等效焦距（按 43.27 mm 全画幅对角线换算）、EXIF 焦距毫米值与焦平面分辨率，最后回退 `1.2 × max(width,height)`。EXIF/用户值标记为焦距先验，尺寸回退不标记为先验。
+- `--nearby_match_window` 默认 0，控制首轮匹配中相邻图像对的 ratio 放宽；`--nearby_match_ratio` 默认 0.8。首轮始终遍历全部图像对。几何验证后会对所有具有可用初始 F 的 pair 执行极线约束描述子重搜索，不受 nearby window 限制。
 - `--max_registration_trials_per_image`、`--max_initialization_trials` 默认 3。
 - `--registration_retry_error_multiplier` 默认 1.5。
 - `--registration_retry_max_error` 默认 8 px。
-- `--ba_refine_focal_length`、`--ba_refine_principal_point`、`--ba_refine_extra_params` 默认 0。
+- `--ba_refine_focal_length` 默认 1，与 COLMAP 增量 Mapper 的默认行为一致；`--ba_refine_principal_point`、`--ba_refine_extra_params` 默认 0。
 - `--ba_refine_params <fx,fy,k1,...>` 按名称指定内参优化。
 
-`recon_sfm` 输出 cameras/images/points3D text、带 RGB PLY、pair/registration diagnostics 和 summary。
+`recon_sfm` 输出 cameras/images/points3D text、带 RGB PLY、pair/registration diagnostics 和 summary。`summary.txt` 记录实际 SIFT/matcher 后端、CUDA 可用性、初始焦距/来源/是否为先验、CPU 线程数、特征/匹配/内点数量，以及特征提取、首轮匹配、几何验证、guided 重匹配、Mapper、RGB 取色和写盘耗时。当前 CUDA 后端加速首轮全局 BF；极线走廊 guided 重搜索仍走 CPU。
 
 ## MVS 单步骤
 
@@ -182,11 +182,12 @@ $COLITE patch_match_stereo \
 | 迭代 | `iterations=3`，`pyramid_levels=1`，`window_radius=2`，`random_seed=42` |
 | source | `max_num_source_images=8`，`min_num_shared_points=1` |
 | 聚合 | `min_num_valid_sources=1`，`max_num_aggregated_costs=3` |
+| 初始法线 | 默认相机朝向半球随机初始化；`initial_normal_hemisphere_degrees=90`，`normal_perturbation_degrees=57.2958`；`fixed_initial_normals` 仅用于兼容/A-B |
 | 调度 | `propagation_schedule=checkerboard`，每迭代默认一轮红黑 |
 | 光度 | bilateral NCC 可选，`sigma_color=0.2`；dynamic selection 可选，`ncc_sigma=0.6` |
-| HMM/CDF | `directional_hmm` 自动启用动态 source；`source_samples=0` 为 best-K，15 为 COLMAP 风格 CDF |
-| 几何 | refinement iterations/weight/depth error；最终 reprojection 默认 1 px |
-| 输出 | `dense_map_format=text|binary`，可选 photometric filter 和 depth-normal refinement |
+| HMM/CDF | 动态 source 默认启用 directional HMM；`directional_hmm` 也会自动启用动态 source；`source_samples=0` 为 best-K，15 为 COLMAP 风格 CDF |
+| 几何 | refinement iterations/weight/depth error；内部至少 3 层、1 个继承光度结果的同步 pass；最终 reprojection 默认 1 px |
+| 输出 | `dense_map_format=text|binary` 同时控制 depth/normal/cost，可选 photometric filter 和 depth-normal refinement |
 
 `--patch_match_diagnostics` 会启用详细 CUDA 原子统计，正式性能运行默认不要开启。质量优先推荐两层金字塔 + HMM + CDF15；快速预览可使用 `resolution_level=2` 和 2 iterations。
 
@@ -204,10 +205,17 @@ $COLITE stereo_fusion \
 
 - observations：min 1、max 100000、traversal depth 100；
 - reprojection 2 px、relative depth 0.01、normal 10°、view angle 180°；
-- source pixel search radius 1；
+- source pixel search radius 0（与 COLMAP 的最近投影像素语义一致；仅在明确需要
+  邻域补偿时手动增大）；
+- 图传播候选发现使用 current point，但重投影/深度一致性始终相对 seed point，
+  防止逐跳空间漂移；
 - `filter_geometric_min_num_consistent_sources` 控制一致性来源下限。
 
-输出 `dense/fused.ply`（坐标、法线、RGB）、可见性和 Fusion 诊断。
+输出 binary little-endian `dense/fused.ply`（float 坐标/法线、uchar RGB）、可见性和 track 质量统计。
+默认不采集高开销的成对拒绝计数和误差样本；需要调参数据时增加
+`--fusion_diagnostics`，此时额外写出逐 track、image-pair 和误差分布明细。独立持久化融合始终写出
+`dense/fusion_timing.txt`，细分 RGB、depth/normal、一致性图、核心融合和写出
+耗时。
 
 ## 表面单步骤
 
@@ -276,7 +284,7 @@ $COLITE recon_mvs \
   --patch_match_backend cuda --dense_map_format binary
 ```
 
-阶段开关还包括 `initialize_patch_match`、`check_geometric_consistency`、`filter_dense_cloud`、`mesh_dense_cloud`、`delaunay_mesher`。算法参数使用小写兼容形式，如 `poisson_depth`、`mesh_simplification_ratio`、`texture_atlas_size`；用 `recon_mvs --help` 查看完整默认。
+阶段开关还包括 `initialize_patch_match`、`check_geometric_consistency`、`filter_dense_cloud`、`mesh_dense_cloud`、`delaunay_mesher`。`dense_cloud_spatial_bounds_quantile` 可显式裁掉 XYZ 各轴上下空间尾部并写入 `fused_clean.ply`，默认 0 表示关闭；House 离群保护可使用 0.001。算法参数使用小写兼容形式，如 `poisson_depth`、`mesh_simplification_ratio`、`texture_atlas_size`；用 `recon_mvs --help` 查看完整默认。
 
 ## 完整自动流程
 

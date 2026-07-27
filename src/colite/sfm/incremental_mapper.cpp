@@ -364,13 +364,29 @@ ObservationFilterSummary FilterNewlyCreatedPoints(
   return summary;
 }
 
+void AccumulateTriangulationSummary(
+    const IncrementalTriangulatorSummary& update,
+    IncrementalTriangulatorSummary* summary) {
+  if (summary == nullptr) {
+    return;
+  }
+  summary->num_created_points += update.num_created_points;
+  summary->num_created_observations += update.num_created_observations;
+  summary->num_completed_observations += update.num_completed_observations;
+  summary->num_merged_points += update.num_merged_points;
+  summary->num_merged_observations += update.num_merged_observations;
+  summary->num_filtered_observations += update.num_filtered_observations;
+  summary->num_filtered_points += update.num_filtered_points;
+}
+
 }  // namespace
 
 IncrementalMapperSummary RegisterNextImage(
     const MatchGraph& graph,
     ImageId image_id,
     const IncrementalMapperOptions& options,
-    Reconstruction* reconstruction) {
+    Reconstruction* reconstruction,
+    const IncrementalTriangulatorCache* triangulator_cache) {
   IncrementalMapperSummary summary;
   summary.image_id = image_id;
 
@@ -394,14 +410,15 @@ IncrementalMapperSummary RegisterNextImage(
   summary.track_completion = CompleteTracksForRegisteredImage(
       graph, image_id, options.triangulation, reconstruction);
   summary.triangulation = TriangulateRegisteredImage(
-      graph, image_id, options.triangulation, reconstruction);
+      graph, image_id, options.triangulation, reconstruction,
+      triangulator_cache);
   const ObservationFilterOptions* local_retriangulation_filter =
       options.run_local_retriangulation_filter
           ? &options.local_retriangulation_filter
           : nullptr;
   summary.local_retriangulation = RetriangulateLocalNeighborhood(
       graph, image_id, options.triangulation, local_retriangulation_filter,
-      reconstruction);
+      reconstruction, triangulator_cache);
 
   // 3. 对新图像及其共视邻域做局部 BA，消化 PnP 和三角化带来的误差。
   if (options.run_local_bundle_adjustment) {
@@ -415,8 +432,16 @@ IncrementalMapperSummary RegisterNextImage(
 
   // 4. BA 后过滤坏观测和不稳定 3D 点，减少错误 track 继续污染后续注册。
   if (options.run_observation_filter) {
-    summary.observation_filter =
-        FilterObservationsAndPoints(options.observation_filter, reconstruction);
+    std::set<ImageId> adjusted_image_ids =
+        summary.local_bundle_adjustment.local_image_ids;
+    adjusted_image_ids.insert(
+        summary.local_bundle_adjustment.fixed_image_ids.begin(),
+        summary.local_bundle_adjustment.fixed_image_ids.end());
+    if (adjusted_image_ids.empty()) {
+      adjusted_image_ids.insert(image_id);
+    }
+    summary.observation_filter = FilterObservationsAndPointsInImages(
+        options.observation_filter, adjusted_image_ids, reconstruction);
     if (!summary.observation_filter.success) {
       summary.message = summary.observation_filter.message;
       return summary;
@@ -433,7 +458,8 @@ IncrementalTriangulatorSummary RetriangulateLocalNeighborhood(
     ImageId image_id,
     const IncrementalTriangulatorOptions& options,
     const ObservationFilterOptions* local_filter_options,
-    Reconstruction* reconstruction) {
+    Reconstruction* reconstruction,
+    const IncrementalTriangulatorCache* triangulator_cache) {
   IncrementalTriangulatorSummary summary;
   summary.image_id = image_id;
   if (reconstruction == nullptr ||
@@ -465,7 +491,7 @@ IncrementalTriangulatorSummary RetriangulateLocalNeighborhood(
 
     const IncrementalTriangulatorSummary triangulation =
         TriangulateRegisteredImage(graph, local_image_id, options,
-                                   reconstruction);
+                                   reconstruction, triangulator_cache);
     summary.num_created_points += triangulation.num_created_points;
     summary.num_created_observations +=
         triangulation.num_created_observations;
@@ -480,6 +506,29 @@ IncrementalTriangulatorSummary RetriangulateLocalNeighborhood(
   }
 
   summary.message = "Local retriangulation finished";
+  return summary;
+}
+
+IncrementalTriangulatorSummary RetriangulateAllRegisteredImages(
+    const MatchGraph& graph,
+    const IncrementalTriangulatorOptions& options,
+    Reconstruction* reconstruction,
+    const IncrementalTriangulatorCache* triangulator_cache) {
+  IncrementalTriangulatorSummary summary;
+  if (reconstruction == nullptr) {
+    summary.message = "Reconstruction is null";
+    return summary;
+  }
+
+  const std::set<ImageId> image_ids =
+      reconstruction->RegisteredImageIds();
+  for (const ImageId image_id : image_ids) {
+    const IncrementalTriangulatorSummary update =
+        TriangulateRegisteredImage(graph, image_id, options, reconstruction,
+                                   triangulator_cache);
+    AccumulateTriangulationSummary(update, &summary);
+  }
+  summary.message = "Global retriangulation finished";
   return summary;
 }
 
@@ -517,6 +566,7 @@ IncrementalMappingSummary RunIncrementalMapping(
     }
   }
 
+  const IncrementalTriangulatorCache triangulator_cache(graph);
   std::map<ImageId, std::size_t> registration_trials;
   for (std::size_t i = 0; i < options.max_num_registrations; ++i) {
     const std::vector<ImageCandidate> candidates =
@@ -536,7 +586,8 @@ IncrementalMappingSummary RunIncrementalMapping(
           options.mapper.registration, candidate.num_registration_attempts,
           options);
       IncrementalMapperSummary registration = RegisterNextImage(
-          graph, candidate.image_id, attempt_options, reconstruction);
+          graph, candidate.image_id, attempt_options, reconstruction,
+          &triangulator_cache);
       if (!registration.success) {
         const std::size_t attempt = ++registration_trials[candidate.image_id];
         summary.failed_registrations.push_back(MakeFailureSummary(
@@ -562,7 +613,16 @@ IncrementalMappingSummary RunIncrementalMapping(
   if (options.run_global_track_completion &&
       reconstruction->RegisteredImageIds().size() >= 2) {
     summary.global_track_completion = CompleteAndMergeAllTracks(
-        graph, options.mapper.triangulation, reconstruction);
+        graph, options.mapper.triangulation, reconstruction,
+        &triangulator_cache);
+    summary.global_retriangulation = RetriangulateAllRegisteredImages(
+        graph, options.mapper.triangulation, reconstruction,
+        &triangulator_cache);
+    const IncrementalTriangulatorSummary post_retriangulation_tracks =
+        CompleteAndMergeAllTracks(graph, options.mapper.triangulation,
+                                  reconstruction, &triangulator_cache);
+    AccumulateTriangulationSummary(post_retriangulation_tracks,
+                                   &summary.global_track_completion);
   }
 
   if (options.run_global_bundle_adjustment &&
@@ -581,7 +641,7 @@ IncrementalMappingSummary RunIncrementalMapping(
     if (options.run_global_track_completion) {
       const IncrementalTriangulatorSummary post_ba_tracks =
           CompleteAndMergeAllTracks(graph, options.mapper.triangulation,
-                                    reconstruction);
+                                    reconstruction, &triangulator_cache);
       summary.global_track_completion.num_completed_observations +=
           post_ba_tracks.num_completed_observations;
       summary.global_track_completion.num_merged_points +=

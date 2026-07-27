@@ -388,15 +388,10 @@ DenseDepthMap ReadDenseDepthMapBinary(const std::filesystem::path& path) {
 
   DenseDepthMap depth_map(width, height, depth_min, depth_max);
   if (!depth_map.Data().empty()) {
-    std::vector<float> values(depth_map.NumPixels(), 0.0F);
+    std::vector<float>& values = depth_map.MutableData();
     file.read(reinterpret_cast<char*>(values.data()),
               static_cast<std::streamsize>(values.size() * sizeof(float)));
     RequireBinaryStream(static_cast<bool>(file), path);
-    for (std::size_t row = 0; row < height; ++row) {
-      for (std::size_t col = 0; col < width; ++col) {
-        depth_map.Set(row, col, values[row * width + col]);
-      }
-    }
   }
   return depth_map;
 }
@@ -463,10 +458,13 @@ void WriteNormalMapBinary(const std::filesystem::path& path,
 
   file << kNormalMapBinaryMagic << " " << kBinaryMapVersion << "\n"
        << normal_map.Width() << " " << normal_map.Height() << "\n";
-  for (const Eigen::Vector3f& normal : normal_map.Data()) {
-    const float xyz[3] = {normal.x(), normal.y(), normal.z()};
-    file.write(reinterpret_cast<const char*>(xyz),
-               static_cast<std::streamsize>(sizeof(xyz)));
+  static_assert(sizeof(Eigen::Vector3f) == 3 * sizeof(float),
+                "NormalMap binary layout requires packed Vector3f values.");
+  if (!normal_map.Data().empty()) {
+    file.write(
+        reinterpret_cast<const char*>(normal_map.Data().data()),
+        static_cast<std::streamsize>(normal_map.Data().size() *
+                                     sizeof(Eigen::Vector3f)));
   }
   RequireBinaryStream(static_cast<bool>(file), path);
 }
@@ -492,14 +490,15 @@ NormalMap ReadNormalMapBinary(const std::filesystem::path& path) {
   file.get();
 
   NormalMap normal_map(width, height);
-  for (std::size_t row = 0; row < height; ++row) {
-    for (std::size_t col = 0; col < width; ++col) {
-      float xyz[3] = {0.0F, 0.0F, 0.0F};
-      file.read(reinterpret_cast<char*>(xyz),
-                static_cast<std::streamsize>(sizeof(xyz)));
-      RequireBinaryStream(static_cast<bool>(file), path);
-      normal_map.Set(row, col, Eigen::Vector3f(xyz[0], xyz[1], xyz[2]));
-    }
+  static_assert(sizeof(Eigen::Vector3f) == 3 * sizeof(float),
+                "NormalMap binary layout requires packed Vector3f values.");
+  if (!normal_map.Data().empty()) {
+    std::vector<Eigen::Vector3f>& values = normal_map.MutableData();
+    file.read(
+        reinterpret_cast<char*>(values.data()),
+        static_cast<std::streamsize>(values.size() *
+                                     sizeof(Eigen::Vector3f)));
+    RequireBinaryStream(static_cast<bool>(file), path);
   }
   return normal_map;
 }
@@ -551,6 +550,48 @@ DenseCostMap ReadDenseCostMapText(const std::filesystem::path& path) {
       }
       cost_map.Set(row, col, value);
     }
+  }
+  return cost_map;
+}
+
+void WriteDenseCostMapBinary(const std::filesystem::path& path,
+                             const DenseCostMap& cost_map) {
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream file(path, std::ios::binary);
+  if (!file) {
+    throw std::runtime_error("Failed to write binary dense cost map: " +
+                             path.string());
+  }
+  file << kCostMapMagic << " " << kBinaryMapVersion << "\n"
+       << cost_map.Width() << " " << cost_map.Height() << "\n";
+  if (!cost_map.Data().empty()) {
+    file.write(reinterpret_cast<const char*>(cost_map.Data().data()),
+               static_cast<std::streamsize>(cost_map.Data().size() *
+                                            sizeof(float)));
+  }
+  RequireBinaryStream(static_cast<bool>(file), path);
+}
+
+DenseCostMap ReadDenseCostMapBinary(const std::filesystem::path& path) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file) {
+    throw std::runtime_error("Failed to read binary dense cost map: " +
+                             path.string());
+  }
+  std::string magic;
+  int version = 0;
+  std::size_t width = 0;
+  std::size_t height = 0;
+  file >> magic >> version >> width >> height;
+  RequireBinaryStream(
+      magic == kCostMapMagic && version == kBinaryMapVersion, path);
+  file.get();
+  DenseCostMap cost_map(width, height);
+  if (!cost_map.Data().empty()) {
+    std::vector<float>& values = cost_map.MutableData();
+    file.read(reinterpret_cast<char*>(values.data()),
+              static_cast<std::streamsize>(values.size() * sizeof(float)));
+    RequireBinaryStream(static_cast<bool>(file), path);
   }
   return cost_map;
 }

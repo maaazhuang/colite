@@ -166,7 +166,11 @@ def main():
     reference, reference_normals, reference_faces, reference_fmt = read_ply(args.reference)
     candidate_sample = subsample(candidate, args.max_samples)
     reference_sample = subsample(reference, args.max_samples)
-    diagonal = float(np.linalg.norm(reference.max(axis=0) - reference.min(axis=0)))
+    candidate_min = candidate.min(axis=0)
+    candidate_max = candidate.max(axis=0)
+    reference_min = reference.min(axis=0)
+    reference_max = reference.max(axis=0)
+    diagonal = float(np.linalg.norm(reference_max - reference_min))
     candidate_face_keys = geometric_face_keys(candidate, candidate_faces)
     reference_face_keys = geometric_face_keys(reference, reference_faces)
     common_face_keys = candidate_face_keys & reference_face_keys
@@ -181,6 +185,16 @@ def main():
             "reference_only": len(reference_face_keys - candidate_face_keys),
             "jaccard": (len(common_face_keys) / len(union_face_keys)
                         if union_face_keys else 1.0),
+        },
+        "candidate_bounds": {
+            "min": candidate_min.tolist(),
+            "max": candidate_max.tolist(),
+            "diagonal": float(np.linalg.norm(candidate_max - candidate_min)),
+        },
+        "reference_bounds": {
+            "min": reference_min.tolist(),
+            "max": reference_max.tolist(),
+            "diagonal": diagonal,
         },
         "reference_bbox_diagonal": diagonal,
         "candidate_to_reference": quantiles(nearest_distances(candidate_sample,

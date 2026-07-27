@@ -14,12 +14,14 @@ struct DenseCloudFilterOptions {
   std::size_t min_track_observations = 2;
   double max_normal_angle_degrees = 30.0;
   double voxel_size = 0.0;
+  double spatial_bounds_quantile = 0.0;
 };
 
 struct DenseCloudFilterStats {
   std::size_t num_input_points = 0;
   std::size_t num_filtered_points = 0;
   std::size_t num_removed_by_track_observations = 0;
+  std::size_t num_removed_by_spatial_bounds = 0;
   std::size_t num_removed_by_voxel = 0;
 };
 
@@ -40,6 +42,7 @@ struct DenseFusionTrackQualityStats {
   double max_normal_angle_degrees = 0.0;
   double mean_max_view_angle_degrees = 0.0;
   double max_view_angle_degrees = 0.0;
+  std::size_t num_view_angle_tracks = 0;
 };
 
 std::vector<FusedPoint> FilterDenseCloud(

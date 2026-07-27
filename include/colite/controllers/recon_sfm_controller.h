@@ -22,7 +22,7 @@ struct ReconSfmControllerOptions {
   int max_num_features = 4096;
   int feature_num_threads = -1;
   SiftBackend feature_backend = SiftBackend::kAuto;
-  bool use_flann = true;
+  DescriptorMatcherBackend matcher_backend = DescriptorMatcherBackend::kFlann;
   // Match the standalone exhaustive matcher unless relaxation is explicitly
   // requested by the caller.
   std::size_t nearby_match_window = 0;
@@ -47,6 +47,35 @@ struct ReconstructionQualityStats {
   std::size_t num_observations = 0;
   double mean_reprojection_error = -1.0;
   double max_reprojection_error = -1.0;
+};
+
+struct ReconSfmRunStats {
+  std::string feature_backend;
+  std::string matcher_backend;
+  bool cuda_sift_available = false;
+  bool cuda_matcher_available = false;
+  double initial_focal_length = 0.0;
+  std::string initial_focal_source;
+  bool has_prior_focal_length = false;
+  int cpu_threads = 1;
+  std::size_t num_extracted_features = 0;
+  std::size_t num_raw_matches = 0;
+  std::size_t num_verified_inliers = 0;
+  std::size_t num_weak_pairs_checked = 0;
+  std::size_t num_weak_pairs_rematched = 0;
+  std::size_t num_weak_pairs_improved = 0;
+  double feature_extraction_seconds = 0.0;
+  double frontend_pipeline_seconds = 0.0;
+  double matching_seconds = 0.0;
+  double geometry_verification_seconds = 0.0;
+  double weak_pair_rematching_seconds = 0.0;
+  double weak_candidate_generation_work_seconds = 0.0;
+  double weak_descriptor_search_work_seconds = 0.0;
+  double weak_geometry_verification_work_seconds = 0.0;
+  double incremental_mapping_seconds = 0.0;
+  double color_extraction_seconds = 0.0;
+  double output_write_seconds = 0.0;
+  double total_seconds = 0.0;
 };
 
 class ReconSfmController {
@@ -80,7 +109,7 @@ void ExtractPointColors(Reconstruction* reconstruction);
 void WriteRunSummary(const std::filesystem::path& output_path,
                      const Reconstruction& reconstruction,
                      const IncrementalMappingSummary& summary,
-                     double feature_extraction_seconds = 0.0);
+                     const ReconSfmRunStats& run_stats = {});
 
 void WriteColmapTextModel(const std::filesystem::path& output_path,
                           const Reconstruction& reconstruction);

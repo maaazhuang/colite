@@ -29,7 +29,7 @@ std::string MapperConfigHash(const std::filesystem::path& workspace_path) {
   return StableConfigHash(
       {{"stage", "sparse"},
        {"geometry_hash", CurrentStageHash(workspace_path, "geometry")},
-       {"algorithm_version", "colmap_multiview_create_continue_rgb_v15"},
+       {"algorithm_version", "colmap_multiview_create_continue_rgb_v17"},
        {"min_pair_median_triangulation_angle_deg", "1"},
        {"local_retriangulation_min_angle_deg", "1"}});
 }

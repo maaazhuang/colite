@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <set>
 #include <string>
 
 #include "colite/core/reconstruction.h"
@@ -24,6 +25,13 @@ struct ObservationFilterSummary {
 
 ObservationFilterSummary FilterObservationsAndPoints(
     const ObservationFilterOptions& options,
+    Reconstruction* reconstruction);
+
+// 仅过滤指定图像所观测到的 3D 点。局部 BA 后使用该接口，避免每次注册
+// 新图像都重复过滤与本次局部优化无关的整个模型。
+ObservationFilterSummary FilterObservationsAndPointsInImages(
+    const ObservationFilterOptions& options,
+    const std::set<ImageId>& image_ids,
     Reconstruction* reconstruction);
 
 }  // namespace colite

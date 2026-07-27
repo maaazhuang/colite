@@ -137,5 +137,8 @@ NormalMap ReadNormalMapBinary(const std::filesystem::path& path);
 void WriteDenseCostMapText(const std::filesystem::path& path,
                            const DenseCostMap& cost_map);
 DenseCostMap ReadDenseCostMapText(const std::filesystem::path& path);
+void WriteDenseCostMapBinary(const std::filesystem::path& path,
+                             const DenseCostMap& cost_map);
+DenseCostMap ReadDenseCostMapBinary(const std::filesystem::path& path);
 
 }  // namespace colite::mvs

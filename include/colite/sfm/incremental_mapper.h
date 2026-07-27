@@ -96,6 +96,7 @@ struct IncrementalMappingSummary {
   std::vector<IncrementalMapperSummary> registrations;
   std::vector<ImageRegistrationFailureSummary> failed_registrations;
   IncrementalTriangulatorSummary global_track_completion;
+  IncrementalTriangulatorSummary global_retriangulation;
   GlobalBundleAdjustmentSummary global_bundle_adjustment;
   ObservationFilterSummary global_observation_filter;
   GlobalBundleAdjustmentSummary final_global_bundle_adjustment;
@@ -109,7 +110,8 @@ IncrementalMapperSummary RegisterNextImage(
     const MatchGraph& graph,
     ImageId image_id,
     const IncrementalMapperOptions& options,
-    Reconstruction* reconstruction);
+    Reconstruction* reconstruction,
+    const IncrementalTriangulatorCache* triangulator_cache = nullptr);
 
 // 对新注册图像及其已注册强邻居执行局部重三角化，补上新图像引入后可见的
 // 邻居-邻居 track，作为局部 BA 前的几何增密步骤。
@@ -118,7 +120,16 @@ IncrementalTriangulatorSummary RetriangulateLocalNeighborhood(
     ImageId image_id,
     const IncrementalTriangulatorOptions& options,
     const ObservationFilterOptions* local_filter_options,
-    Reconstruction* reconstruction);
+    Reconstruction* reconstruction,
+    const IncrementalTriangulatorCache* triangulator_cache = nullptr);
+
+// 所有图像完成注册后重新遍历一次已注册图像，在完整位姿图上创建增量阶段
+// 遗漏的点。该阶段对应 COLMAP 全局优化前的 Retriangulate。
+IncrementalTriangulatorSummary RetriangulateAllRegisteredImages(
+    const MatchGraph& graph,
+    const IncrementalTriangulatorOptions& options,
+    Reconstruction* reconstruction,
+    const IncrementalTriangulatorCache* triangulator_cache = nullptr);
 
 // 从所有未注册图像中选择下一张最适合注册的图像。
 // 分数为“该图像通过 verified matches 能看到的已有 3D 点数量”。

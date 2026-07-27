@@ -44,6 +44,56 @@ bool TrackPasses(const StereoFusionTrack* track,
          track->max_normal_angle_degrees <= options.max_normal_angle_degrees;
 }
 
+struct SpatialBounds {
+  Eigen::Vector3d minimum =
+      Eigen::Vector3d::Constant(-std::numeric_limits<double>::infinity());
+  Eigen::Vector3d maximum =
+      Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity());
+};
+
+SpatialBounds ComputeSpatialBounds(
+    const std::vector<FusedPoint>& points,
+    const std::vector<const StereoFusionTrack*>& track_lookup,
+    const DenseCloudFilterOptions& options) {
+  SpatialBounds bounds;
+  if (options.spatial_bounds_quantile <= 0.0) {
+    return bounds;
+  }
+  std::array<std::vector<double>, 3> coordinates;
+  for (std::size_t point_idx = 0; point_idx < points.size(); ++point_idx) {
+    const FusedPoint& point = points[point_idx];
+    if (!IsFinitePoint(point) ||
+        !TrackPasses(track_lookup[point_idx], options)) {
+      continue;
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+      coordinates[axis].push_back(point.xyz[axis]);
+    }
+  }
+  if (coordinates[0].empty()) {
+    return bounds;
+  }
+  const std::size_t tail_count = static_cast<std::size_t>(std::floor(
+      options.spatial_bounds_quantile *
+      static_cast<double>(coordinates[0].size())));
+  if (tail_count == 0 || 2 * tail_count >= coordinates[0].size()) {
+    return bounds;
+  }
+  for (int axis = 0; axis < 3; ++axis) {
+    std::sort(coordinates[axis].begin(), coordinates[axis].end());
+    bounds.minimum[axis] = coordinates[axis][tail_count];
+    bounds.maximum[axis] =
+        coordinates[axis][coordinates[axis].size() - tail_count - 1];
+  }
+  return bounds;
+}
+
+bool IsWithinSpatialBounds(const FusedPoint& point,
+                           const SpatialBounds& bounds) {
+  return (point.xyz.array() >= bounds.minimum.array()).all() &&
+         (point.xyz.array() <= bounds.maximum.array()).all();
+}
+
 std::vector<const StereoFusionTrack*> BuildTrackLookup(
     std::size_t num_points,
     const std::vector<StereoFusionTrack>& tracks) {
@@ -198,17 +248,29 @@ DenseCloudFilterResult FilterDenseCloudWithStats(
   if (!std::isfinite(options.voxel_size) || options.voxel_size < 0.0) {
     throw std::invalid_argument("Dense cloud voxel size must be non-negative.");
   }
+  if (!std::isfinite(options.spatial_bounds_quantile) ||
+      options.spatial_bounds_quantile < 0.0 ||
+      options.spatial_bounds_quantile >= 0.5) {
+    throw std::invalid_argument(
+        "Dense cloud spatial bounds quantile must be in [0, 0.5).");
+  }
 
   DenseCloudFilterResult result;
   result.stats.num_input_points = points.size();
   const std::vector<const StereoFusionTrack*> track_lookup =
       BuildTrackLookup(points.size(), tracks);
+  const SpatialBounds spatial_bounds =
+      ComputeSpatialBounds(points, track_lookup, options);
   std::unordered_set<VoxelKey, VoxelKeyHash> occupied_voxels;
   for (std::size_t point_idx = 0; point_idx < points.size(); ++point_idx) {
     const FusedPoint& point = points[point_idx];
     if (!IsFinitePoint(point) ||
         !TrackPasses(track_lookup[point_idx], options)) {
       ++result.stats.num_removed_by_track_observations;
+      continue;
+    }
+    if (!IsWithinSpatialBounds(point, spatial_bounds)) {
+      ++result.stats.num_removed_by_spatial_bounds;
       continue;
     }
     if (options.voxel_size > 0.0) {
@@ -247,9 +309,13 @@ DenseFusionTrackQualityStats ComputeFusionTrackQualityStats(
     stats.max_normal_angle_degrees =
         std::max(stats.max_normal_angle_degrees,
                  track.max_normal_angle_degrees);
-    view_angle_sum += track.max_view_angle_degrees;
-    stats.max_view_angle_degrees =
-        std::max(stats.max_view_angle_degrees, track.max_view_angle_degrees);
+    if (track.view_angle_collected) {
+      view_angle_sum += track.max_view_angle_degrees;
+      stats.max_view_angle_degrees =
+          std::max(stats.max_view_angle_degrees,
+                   track.max_view_angle_degrees);
+      ++stats.num_view_angle_tracks;
+    }
   }
 
   const double num_tracks = static_cast<double>(stats.num_tracks);
@@ -258,7 +324,11 @@ DenseFusionTrackQualityStats ComputeFusionTrackQualityStats(
   stats.multi_observation_track_ratio =
       static_cast<double>(stats.num_multi_observation_tracks) / num_tracks;
   stats.mean_max_normal_angle_degrees = normal_angle_sum / num_tracks;
-  stats.mean_max_view_angle_degrees = view_angle_sum / num_tracks;
+  if (stats.num_view_angle_tracks > 0) {
+    stats.mean_max_view_angle_degrees =
+        view_angle_sum /
+        static_cast<double>(stats.num_view_angle_tracks);
+  }
   return stats;
 }
 
@@ -289,6 +359,7 @@ void WriteFusionTrackQualityStats(
        << stats.mean_max_normal_angle_degrees << "\n"
        << "max_normal_angle_degrees " << stats.max_normal_angle_degrees
        << "\n"
+       << "num_view_angle_tracks " << stats.num_view_angle_tracks << "\n"
        << "mean_max_view_angle_degrees "
        << stats.mean_max_view_angle_degrees << "\n"
        << "max_view_angle_degrees " << stats.max_view_angle_degrees << "\n";

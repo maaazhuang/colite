@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -310,6 +312,30 @@ struct PatchMatchGeometricConsistencyOptions {
 
 class ConsistencyGraph {
  public:
+  class ImageIdRange {
+   public:
+    using const_iterator = const ImageId*;
+
+    ImageIdRange() = default;
+    ImageIdRange(const ImageId* begin, std::size_t size)
+        : begin_(begin), size_(size) {}
+
+    const_iterator begin() const { return begin_; }
+    const_iterator end() const {
+      return size_ == 0 ? begin_ : begin_ + size_;
+    }
+    bool empty() const { return size_ == 0; }
+    std::size_t size() const { return size_; }
+    const ImageId& front() const { return *begin_; }
+    const ImageId& operator[](std::size_t index) const {
+      return begin_[index];
+    }
+
+   private:
+    const ImageId* begin_ = nullptr;
+    std::size_t size_ = 0;
+  };
+
   ConsistencyGraph() = default;
   ConsistencyGraph(std::size_t width, std::size_t height);
 
@@ -319,8 +345,11 @@ class ConsistencyGraph {
   bool Empty() const;
 
   void Add(std::size_t row, std::size_t col, ImageId source_image_id);
-  const std::vector<ImageId>& SourceImageIds(std::size_t row,
-                                             std::size_t col) const;
+  ImageIdRange SourceImageIds(std::size_t row, std::size_t col) const;
+  // Convert the append-friendly per-pixel representation into contiguous CSR
+  // storage. Read-only queries and serialization keep the same semantics.
+  void Compact();
+  bool IsCompact() const;
   std::size_t Count(std::size_t row, std::size_t col) const;
   std::size_t NumConsistentPixels(std::size_t min_num_sources) const;
   std::vector<int> ToColmapData(
@@ -330,6 +359,18 @@ class ConsistencyGraph {
       std::size_t height,
       const std::vector<int>& data,
       const std::vector<ImageId>& image_ids_by_index);
+  static ConsistencyGraph FromCompactData(
+      std::size_t width,
+      std::size_t height,
+      std::vector<std::size_t> offsets,
+      std::vector<ImageId> image_ids);
+  static ConsistencyGraph FromCompactData(
+      std::size_t width,
+      std::size_t height,
+      std::vector<std::uint32_t> offsets,
+      std::vector<ImageId> image_ids);
+  const std::vector<std::uint32_t>& CompactOffsets() const;
+  const std::vector<ImageId>& CompactImageIds() const;
 
  private:
   std::size_t Offset(std::size_t row, std::size_t col) const;
@@ -337,6 +378,8 @@ class ConsistencyGraph {
   std::size_t width_ = 0;
   std::size_t height_ = 0;
   std::vector<std::vector<ImageId>> data_;
+  std::vector<std::uint32_t> compact_offsets_;
+  std::vector<ImageId> compact_image_ids_;
 };
 
 struct PatchMatchGeometricFilterSummary {
@@ -369,9 +412,22 @@ struct StereoFusionOptions {
   // Fusion 时 source 投影点附近搜索有效像素的半径。PatchMatch 的
   // consistency graph 使用双线性深度采样，而 fusion 需要离散像素；
   // 1px 搜索可以减少因为四舍五入像素被过滤导致的单观测 track。
-  std::size_t source_pixel_search_radius = 1;
-  bool require_mutual_consistency = true;
+  std::size_t source_pixel_search_radius = 0;
+  bool require_mutual_consistency = false;
   bool require_consistency_graph = true;
+  // Production controllers follow COLMAP's image-level traversal and do not
+  // revisit earlier reference images after their fusion pass completes.
+  // Keep the core API opt-in so diagnostics/tests can still inspect both
+  // directions of a reciprocal graph.
+  bool skip_completed_reference_views = false;
+  // PatchMatch callers normally use cost validity as an additional mask.
+  // Persisted geometric maps may disable this after filtering has already
+  // synchronized invalid depth, normal, and cost pixels.
+  bool require_cost_map = true;
+  bool collect_diagnostics = true;
+  // Persisted Fusion with at most 64 views can avoid one heap allocation per
+  // point by retaining visibility as a bit mask until binary serialization.
+  bool compact_visibility = false;
 };
 
 struct StereoFusionSummary {
@@ -397,6 +453,7 @@ struct StereoFusionTrack {
   std::size_t max_traversal_depth = 0;
   double max_normal_angle_degrees = 0.0;
   double max_view_angle_degrees = 0.0;
+  bool view_angle_collected = true;
 };
 
 struct StereoFusionPairDiagnostics {
@@ -427,10 +484,22 @@ struct StereoFusionResult {
   std::vector<FusedPoint> points;
   std::vector<StereoFusionTrack> tracks;
   std::vector<std::vector<std::uint32_t>> points_visibility;
+  std::vector<std::uint64_t> points_visibility_masks;
   std::vector<StereoFusionPairDiagnostics> pair_diagnostics;
   StereoFusionErrorSamples error_samples;
   StereoFusionSummary summary;
 };
+
+struct StereoFusionViewData {
+  MvsImage image;
+  DenseDepthMap depth_map;
+  NormalMap normal_map;
+  DenseCostMap cost_map;
+  ConsistencyGraph consistency_graph;
+};
+
+using StereoFusionViewLoader =
+    std::function<std::shared_ptr<const StereoFusionViewData>(std::size_t)>;
 
 PatchMatchMaps InitializePatchMatchMaps(
     const MvsImage& image,
@@ -592,7 +661,8 @@ RunPatchMatchStereoForImageWithSourceDepthsAndCudaWorkspace(
     float depth_min,
     float depth_max,
     CudaPatchMatchWorkspace* cuda_workspace,
-    const PatchMatchStereoOptions& options = {});
+    const PatchMatchStereoOptions& options = {},
+    const PatchMatchMaps* initial_maps = nullptr);
 
 PatchMatchPhotometricStats ComputePatchMatchPhotometricStats(
     const DenseCostMap& cost_map);
@@ -609,6 +679,12 @@ ConsistencyGraph ComputeGeometricConsistencyGraph(
     const DenseDepthMap& reference_depth_map,
     const std::vector<DenseDepthMap>& source_depth_maps,
     const PatchMatchGeometricConsistencyOptions& options = {});
+ConsistencyGraph ComputeGeometricConsistencyGraph(
+    const PatchMatchView& reference_view,
+    const std::vector<PatchMatchView>& source_views,
+    const DenseDepthMap& reference_depth_map,
+    const std::vector<const DenseDepthMap*>& source_depth_maps,
+    const PatchMatchGeometricConsistencyOptions& options = {});
 
 void WriteConsistencyGraphBinary(const std::filesystem::path& path,
                                  const ConsistencyGraph& consistency_graph);
@@ -623,6 +699,9 @@ ConsistencyGraph ReadConsistencyGraphColmapBinary(
 void WritePointsVisibilityColmapBinary(
     const std::filesystem::path& path,
     const std::vector<std::vector<std::uint32_t>>& points_visibility);
+void WritePointsVisibilityColmapBinary(
+    const std::filesystem::path& path,
+    const std::vector<std::uint64_t>& points_visibility_masks);
 std::vector<std::vector<std::uint32_t>> ReadPointsVisibilityColmapBinary(
     const std::filesystem::path& path);
 
@@ -640,6 +719,10 @@ StereoFusionResult FuseStereoDepthMaps(
     const std::vector<NormalMap>& normal_maps,
     const std::vector<DenseCostMap>& cost_maps,
     const std::vector<ConsistencyGraph>& consistency_graphs,
+    const StereoFusionOptions& options = {});
+StereoFusionResult FuseStereoDepthMapsWithViewCache(
+    const std::vector<PatchMatchView>& views,
+    const StereoFusionViewLoader& load_view,
     const StereoFusionOptions& options = {});
 
 }  // namespace colite::mvs

@@ -301,16 +301,35 @@ MvsPipelineSummary RunMvsPipeline(const Reconstruction& reconstruction,
     summary.num_sparse_depth_samples +=
         image_summary.sparse_depth_map.samples.size();
 
-    double min_depth = std::numeric_limits<double>::infinity();
-    double max_depth = 0.0;
+    std::vector<double> depths;
+    depths.reserve(image_summary.sparse_depth_map.samples.size());
     for (const SparseDepthSample& sample :
          image_summary.sparse_depth_map.samples) {
-      min_depth = std::min(min_depth, sample.depth);
-      max_depth = std::max(max_depth, sample.depth);
+      if (std::isfinite(sample.depth) && sample.depth > 0.0) {
+        depths.push_back(sample.depth);
+      }
     }
-    if (!image_summary.sparse_depth_map.samples.empty()) {
-      image_summary.min_depth = min_depth;
-      image_summary.max_depth = max_depth;
+    if (!depths.empty()) {
+      // Match COLMAP's automatic per-view PatchMatch search interval:
+      // discard the sparse-depth tails and stretch the robust interval by
+      // 25%. Using the raw extrema lets a single weak sparse point expand the
+      // inverse-depth search by an order of magnitude. Low-parallax
+      // hypotheses near that inflated far plane can then appear mutually
+      // consistent and survive fusion as distant sheets.
+      std::sort(depths.begin(), depths.end());
+      constexpr double kMinPercentile = 0.01;
+      constexpr double kMaxPercentile = 0.99;
+      constexpr double kStretchRatio = 0.25;
+      const std::size_t min_index = static_cast<std::size_t>(
+          static_cast<double>(depths.size()) * kMinPercentile);
+      const std::size_t max_index = std::min(
+          depths.size() - 1,
+          static_cast<std::size_t>(
+              static_cast<double>(depths.size()) * kMaxPercentile));
+      image_summary.min_depth =
+          depths[min_index] * (1.0 - kStretchRatio);
+      image_summary.max_depth =
+          depths[max_index] * (1.0 + kStretchRatio);
     }
 
     summary.images.push_back(std::move(image_summary));

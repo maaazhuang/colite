@@ -10,15 +10,21 @@
 namespace colite::mvs {
 
 std::size_t MvsImage::Width() const {
-  return gray.empty() ? 0U : static_cast<std::size_t>(gray.cols);
+  if (!gray.empty()) {
+    return static_cast<std::size_t>(gray.cols);
+  }
+  return color.empty() ? 0U : static_cast<std::size_t>(color.cols);
 }
 
 std::size_t MvsImage::Height() const {
-  return gray.empty() ? 0U : static_cast<std::size_t>(gray.rows);
+  if (!gray.empty()) {
+    return static_cast<std::size_t>(gray.rows);
+  }
+  return color.empty() ? 0U : static_cast<std::size_t>(color.rows);
 }
 
 bool MvsImage::Empty() const {
-  return gray.empty();
+  return gray.empty() && color.empty();
 }
 
 MvsImageWorkspace::MvsImageWorkspace(Reconstruction reconstruction,
@@ -62,9 +68,20 @@ MvsImage MvsImageWorkspace::LoadImage(ImageId image_id) const {
   const Image& image = reconstruction_.GetImage(image_id);
   const std::filesystem::path image_path = ResolveImagePath(image);
 
-  cv::Mat gray_u8 = cv::imread(image_path.string(), cv::IMREAD_GRAYSCALE);
-  cv::Mat color_bgr = cv::imread(image_path.string(), cv::IMREAD_COLOR);
-  if (gray_u8.empty() || color_bgr.empty()) {
+  if (!options_.load_gray && !options_.load_color) {
+    throw std::invalid_argument(
+        "MVS workspace must load grayscale or color pixels.");
+  }
+  cv::Mat gray_u8;
+  cv::Mat color_bgr;
+  if (options_.load_gray) {
+    gray_u8 = cv::imread(image_path.string(), cv::IMREAD_GRAYSCALE);
+  }
+  if (options_.load_color) {
+    color_bgr = cv::imread(image_path.string(), cv::IMREAD_COLOR);
+  }
+  if ((options_.load_gray && gray_u8.empty()) ||
+      (options_.load_color && color_bgr.empty())) {
     throw std::runtime_error("Failed to read MVS image: " +
                              image_path.string());
   }
@@ -72,31 +89,43 @@ MvsImage MvsImageWorkspace::LoadImage(ImageId image_id) const {
   double scale = std::ldexp(
       1.0, -static_cast<int>(
                std::min<std::size_t>(options_.resolution_level, 30)));
+  const int original_width =
+      options_.load_gray ? gray_u8.cols : color_bgr.cols;
+  const int original_height =
+      options_.load_gray ? gray_u8.rows : color_bgr.rows;
   cv::Mat resized_u8 = gray_u8;
   cv::Mat resized_color_bgr = color_bgr;
   if (options_.max_image_size > 0) {
-    const int max_dimension = std::max(gray_u8.cols, gray_u8.rows);
+    const int max_dimension = std::max(original_width, original_height);
     scale = std::min(scale,
                      static_cast<double>(options_.max_image_size) /
                          static_cast<double>(max_dimension));
   }
   if (scale < 1.0) {
     const int new_width =
-        std::max(1, static_cast<int>(std::round(gray_u8.cols * scale)));
+        std::max(1, static_cast<int>(std::round(original_width * scale)));
     const int new_height =
-        std::max(1, static_cast<int>(std::round(gray_u8.rows * scale)));
-    cv::resize(gray_u8, resized_u8, cv::Size(new_width, new_height), 0.0, 0.0,
-               cv::INTER_AREA);
-    cv::resize(color_bgr, resized_color_bgr,
-               cv::Size(new_width, new_height), 0.0, 0.0, cv::INTER_AREA);
+        std::max(1, static_cast<int>(std::round(original_height * scale)));
+    if (options_.load_gray) {
+      cv::resize(gray_u8, resized_u8, cv::Size(new_width, new_height), 0.0,
+                 0.0, cv::INTER_AREA);
+    }
+    if (options_.load_color) {
+      cv::resize(color_bgr, resized_color_bgr,
+                 cv::Size(new_width, new_height), 0.0, 0.0, cv::INTER_AREA);
+    }
   }
 
   MvsImage result;
   result.image_id = image_id;
   result.name = image.name;
   result.scale = scale;
-  resized_u8.convertTo(result.gray, CV_32FC1, 1.0 / 255.0);
-  cv::cvtColor(resized_color_bgr, result.color, cv::COLOR_BGR2RGB);
+  if (options_.load_gray) {
+    resized_u8.convertTo(result.gray, CV_32FC1, 1.0 / 255.0);
+  }
+  if (options_.load_color) {
+    cv::cvtColor(resized_color_bgr, result.color, cv::COLOR_BGR2RGB);
+  }
   return result;
 }
 

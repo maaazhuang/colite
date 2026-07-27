@@ -219,8 +219,29 @@ TEST(MvsPipelineTest, RunsSparseMvsWorkspacePass) {
   EXPECT_EQ(summary.num_images, 3U);
   EXPECT_EQ(summary.num_sparse_depth_samples, 7U);
   ASSERT_EQ(summary.images.size(), 3U);
-  EXPECT_DOUBLE_EQ(summary.images.front().min_depth, 2.0);
-  EXPECT_DOUBLE_EQ(summary.images.front().max_depth, 4.0);
+  EXPECT_DOUBLE_EQ(summary.images.front().min_depth, 1.5);
+  EXPECT_DOUBLE_EQ(summary.images.front().max_depth, 5.0);
+}
+
+TEST(MvsPipelineTest, RobustDepthRangeIgnoresSparseDepthExtrema) {
+  Reconstruction reconstruction = MakeSparseReconstruction();
+  Image& image = reconstruction.GetImage(1);
+  image.points2d.resize(103);
+  for (std::size_t i = 3; i < 103; ++i) {
+    Track track;
+    track.AddElement(1, static_cast<Point2DIdx>(i));
+    const double depth = i == 102 ? 1000.0 : 3.0;
+    const Point3DId point_id = reconstruction.AddPoint3D(
+        Eigen::Vector3d(0.0, 0.0, depth), track);
+    image.points2d[i].xy = Eigen::Vector2d(50.0, 40.0);
+    image.points2d[i].point3d_id = point_id;
+  }
+
+  const MvsPipelineSummary summary = RunMvsPipeline(reconstruction);
+
+  ASSERT_FALSE(summary.images.empty());
+  EXPECT_LT(summary.images.front().max_depth, 10.0);
+  EXPECT_GT(summary.images.front().min_depth, 1.0);
 }
 
 }  // namespace

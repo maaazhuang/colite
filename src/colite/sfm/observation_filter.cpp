@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <set>
 #include <vector>
 
 #include "colite/core/geometry.h"
@@ -85,10 +86,28 @@ std::vector<Point3DId> CollectPointIds(const Reconstruction& reconstruction) {
   return point_ids;
 }
 
-}  // namespace
+std::vector<Point3DId> CollectPointIdsInImages(
+    const Reconstruction& reconstruction,
+    const std::set<ImageId>& image_ids) {
+  std::set<Point3DId> unique_point_ids;
+  for (const ImageId image_id : image_ids) {
+    if (!reconstruction.ExistsImage(image_id)) {
+      continue;
+    }
+    const Image& image = reconstruction.GetImage(image_id);
+    for (const Point2D& point2d : image.points2d) {
+      if (point2d.HasPoint3D() &&
+          reconstruction.ExistsPoint3D(point2d.point3d_id)) {
+        unique_point_ids.insert(point2d.point3d_id);
+      }
+    }
+  }
+  return {unique_point_ids.begin(), unique_point_ids.end()};
+}
 
-ObservationFilterSummary FilterObservationsAndPoints(
+ObservationFilterSummary FilterPointIds(
     const ObservationFilterOptions& options,
+    const std::vector<Point3DId>& point_ids,
     Reconstruction* reconstruction) {
   ObservationFilterSummary summary;
   if (reconstruction == nullptr) {
@@ -97,7 +116,7 @@ ObservationFilterSummary FilterObservationsAndPoints(
   }
 
   std::vector<ObservationRef> observations_to_delete;
-  for (const Point3DId point3d_id : CollectPointIds(*reconstruction)) {
+  for (const Point3DId point3d_id : point_ids) {
     if (!reconstruction->ExistsPoint3D(point3d_id)) {
       continue;
     }
@@ -121,7 +140,7 @@ ObservationFilterSummary FilterObservationsAndPoints(
   }
 
   std::vector<Point3DId> points_to_delete;
-  for (const Point3DId point3d_id : CollectPointIds(*reconstruction)) {
+  for (const Point3DId point3d_id : point_ids) {
     if (!reconstruction->ExistsPoint3D(point3d_id)) {
       continue;
     }
@@ -142,6 +161,34 @@ ObservationFilterSummary FilterObservationsAndPoints(
   summary.success = true;
   summary.message = "Observation filtering finished";
   return summary;
+}
+
+}  // namespace
+
+ObservationFilterSummary FilterObservationsAndPoints(
+    const ObservationFilterOptions& options,
+    Reconstruction* reconstruction) {
+  if (reconstruction == nullptr) {
+    ObservationFilterSummary summary;
+    summary.message = "Reconstruction is null";
+    return summary;
+  }
+  return FilterPointIds(options, CollectPointIds(*reconstruction),
+                        reconstruction);
+}
+
+ObservationFilterSummary FilterObservationsAndPointsInImages(
+    const ObservationFilterOptions& options,
+    const std::set<ImageId>& image_ids,
+    Reconstruction* reconstruction) {
+  if (reconstruction == nullptr) {
+    ObservationFilterSummary summary;
+    summary.message = "Reconstruction is null";
+    return summary;
+  }
+  return FilterPointIds(options,
+                        CollectPointIdsInImages(*reconstruction, image_ids),
+                        reconstruction);
 }
 
 }  // namespace colite

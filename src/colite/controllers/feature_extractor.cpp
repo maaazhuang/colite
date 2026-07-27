@@ -41,6 +41,7 @@ std::vector<std::pair<std::string, std::string>> FeatureCacheEntries(
     const std::vector<std::filesystem::path>& image_paths) {
   std::vector<std::pair<std::string, std::string>> entries;
   entries.emplace_back("stage", "features");
+  entries.emplace_back("camera_prior_version", "exif_diagonal_v2");
   entries.emplace_back("image_path", options.image_path.lexically_normal().string());
   entries.emplace_back("focal_length", ToConfigValue(options.focal_length));
   entries.emplace_back("max_num_features", std::to_string(options.max_num_features));
@@ -101,11 +102,11 @@ Camera MakeSingleCamera(const std::filesystem::path& image_path,
   camera.model_id = CameraModelId::kPinhole;
   camera.width = static_cast<std::uint32_t>(image.cols);
   camera.height = static_cast<std::uint32_t>(image.rows);
-  const double default_focal =
-      EstimateInitialFocalLengthFromImage(image_path, focal_length);
-  camera.params = InitializeCameraParams(camera.model_id, default_focal,
+  const InitialFocalLengthEstimate focal =
+      EstimateInitialFocalLengthPriorFromImage(image_path, focal_length);
+  camera.params = InitializeCameraParams(camera.model_id, focal.pixels,
                                          camera.width, camera.height);
-  camera.has_prior_focal_length = focal_length > 0.0;
+  camera.has_prior_focal_length = focal.has_prior;
   return camera;
 }
 

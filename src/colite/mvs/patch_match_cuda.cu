@@ -33,7 +33,7 @@ constexpr int kPoseSelectionProbabilityOffset = 44;
 constexpr int kPoseSweepCosOffset = 45;
 constexpr int kPoseSweepSinOffset = 46;
 constexpr int kNumPoseParams = 47;
-constexpr int kNumPoseVariants = 3;
+constexpr int kNumPoseVariants = 1;
 
 struct DeviceCamera {
   float fx = 1.0F;
@@ -62,8 +62,8 @@ struct DeviceCostOptions {
   float geometric_max_relative_depth_error = 0.01F;
   bool geometric_reject_occluded_candidates = true;
   bool geometric_reject_depth_conflicts = true;
-  float source_weight_strength = 0.25F;
-  float incident_angle_weight = 0.15F;
+  float source_weight_strength = 0.0F;
+  float incident_angle_weight = 0.0F;
 };
 
 struct DevicePatchMatchOptions {
@@ -607,6 +607,16 @@ __device__ float Random01(std::uint32_t seed) {
   return static_cast<float>(state & 0x00FFFFFFu) / 16777215.0F;
 }
 
+__global__ void FillFloatBufferKernel(float* values,
+                                      std::size_t size,
+                                      float value) {
+  const std::size_t idx =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < size) {
+    values[idx] = value;
+  }
+}
+
 __device__ float Clamp(float value, float min_value, float max_value) {
   return fminf(max_value, fmaxf(min_value, value));
 }
@@ -672,6 +682,26 @@ __device__ float3 PerturbNormal(float3 normal,
   return Normalize3(Add3(Scale3(normal_n, cosf(angle)),
                          Scale3(tangent_direction, sinf(angle))),
                     normal_n);
+}
+
+__device__ float3 SampleCameraFacingHemisphereNormal(
+    int row,
+    int col,
+    const DeviceCamera& camera,
+    std::uint32_t seed) {
+  constexpr float kPi = 3.14159265358979323846F;
+  const float z = 1.0F - 2.0F * Random01(seed ^ 0xA511E9B3u);
+  const float radial = sqrtf(fmaxf(0.0F, 1.0F - z * z));
+  const float phi = 2.0F * kPi * Random01(seed ^ 0x63D83595u);
+  float3 normal =
+      make_float3(radial * cosf(phi), radial * sinf(phi), z);
+  const float3 view_ray =
+      make_float3((static_cast<float>(col) - camera.cx) / camera.fx,
+                  (static_cast<float>(row) - camera.cy) / camera.fy, 1.0F);
+  if (Dot3(normal, view_ray) > 0.0F) {
+    normal = Scale3(normal, -1.0F);
+  }
+  return normal;
 }
 
 __device__ void AtomicMaxDouble(double* address, double value) {
@@ -750,69 +780,88 @@ __device__ float ReadPose(cudaTextureObject_t poses_texture,
                              variant_idx);
 }
 
-__device__ bool ProjectPlaneToSource(const DevicePatchMatchOptions& options,
-                                     cudaTextureObject_t poses_texture,
-                                     int source_idx,
-                                     int variant_idx,
-                                     float center_x,
-                                     float center_y,
-                                     float sample_x,
-                                     float sample_y,
-                                     float depth,
-                                     const float3& normal,
-                                     float* source_x,
-                                     float* source_y,
-                                     float* source_depth) {
+__device__ bool ComposePlaneHomography(
+    const DevicePatchMatchOptions& options,
+    cudaTextureObject_t poses_texture,
+    int source_idx,
+    int variant_idx,
+    int col,
+    int row,
+    float depth,
+    const float3& normal,
+    float* homography) {
   const DeviceCamera& ref = options.reference_camera;
-  const float3 center = make_float3((center_x - ref.cx) / ref.fx * depth,
-                                    (center_y - ref.cy) / ref.fy * depth,
-                                    depth);
-  const float3 ray = make_float3((sample_x - ref.cx) / ref.fx,
-                                 (sample_y - ref.cy) / ref.fy, 1.0F);
-  const float numerator =
+  const float3 center =
+      make_float3((static_cast<float>(col) - ref.cx) / ref.fx * depth,
+                  (static_cast<float>(row) - ref.cy) / ref.fy * depth,
+                  depth);
+  const float plane_distance =
       normal.x * center.x + normal.y * center.y + normal.z * center.z;
-  const float denominator =
-      normal.x * ray.x + normal.y * ray.y + normal.z * ray.z;
-  if (fabsf(denominator) < 1e-8F) {
+  if (!isfinite(plane_distance) || fabsf(plane_distance) < 1e-8F) {
     return false;
   }
-  const float ray_depth = numerator / denominator;
-  if (!IsFinitePositive(ray_depth)) {
-    return false;
-  }
-  const float3 point_ref =
-      make_float3(ray.x * ray_depth, ray.y * ray_depth, ray.z * ray_depth);
+
   float rotation[9];
   float translation[3];
+#pragma unroll
   for (int i = 0; i < 9; ++i) {
     rotation[i] =
         ReadPose(poses_texture, source_idx, variant_idx, kPoseROffset + i);
   }
+#pragma unroll
   for (int i = 0; i < 3; ++i) {
     translation[i] =
         ReadPose(poses_texture, source_idx, variant_idx, kPoseTOffset + i);
   }
-  const float sx = rotation[0] * point_ref.x + rotation[1] * point_ref.y +
-                   rotation[2] * point_ref.z + translation[0];
-  const float sy = rotation[3] * point_ref.x + rotation[4] * point_ref.y +
-                   rotation[5] * point_ref.z + translation[1];
-  const float sz = rotation[6] * point_ref.x + rotation[7] * point_ref.y +
-                   rotation[8] * point_ref.z + translation[2];
-  if (!IsFinitePositive(sz)) {
-    return false;
-  }
-  const float fx =
+  const float source_fx =
       ReadPose(poses_texture, source_idx, variant_idx, kPoseKOffset + 0);
-  const float fy =
+  const float source_fy =
       ReadPose(poses_texture, source_idx, variant_idx, kPoseKOffset + 1);
-  const float cx =
+  const float source_cx =
       ReadPose(poses_texture, source_idx, variant_idx, kPoseKOffset + 2);
-  const float cy =
+  const float source_cy =
       ReadPose(poses_texture, source_idx, variant_idx, kPoseKOffset + 3);
-  *source_x = fx * sx / sz + cx;
-  *source_y = fy * sy / sz + cy;
-  *source_depth = sz;
-  return isfinite(*source_x) && isfinite(*source_y);
+
+  // For n^T X = d, the plane homography is
+  // K_src * (R + t*n^T/d) * K_ref^-1. Build it once per source/candidate
+  // instead of re-reading R/t/K and intersecting the plane for every sample.
+  float plane_transform[9];
+  const float inv_plane_distance = 1.0F / plane_distance;
+  const float normal_values[3] = {normal.x, normal.y, normal.z};
+#pragma unroll
+  for (int transform_row = 0; transform_row < 3; ++transform_row) {
+#pragma unroll
+    for (int transform_col = 0; transform_col < 3; ++transform_col) {
+      plane_transform[transform_row * 3 + transform_col] =
+          rotation[transform_row * 3 + transform_col] +
+          translation[transform_row] * normal_values[transform_col] *
+              inv_plane_distance;
+    }
+  }
+
+  float normalized_transform[9];
+#pragma unroll
+  for (int transform_row = 0; transform_row < 3; ++transform_row) {
+    const float a0 = plane_transform[transform_row * 3 + 0];
+    const float a1 = plane_transform[transform_row * 3 + 1];
+    const float a2 = plane_transform[transform_row * 3 + 2];
+    normalized_transform[transform_row * 3 + 0] = a0 / ref.fx;
+    normalized_transform[transform_row * 3 + 1] = a1 / ref.fy;
+    normalized_transform[transform_row * 3 + 2] =
+        a2 - a0 * ref.cx / ref.fx - a1 * ref.cy / ref.fy;
+  }
+
+#pragma unroll
+  for (int transform_col = 0; transform_col < 3; ++transform_col) {
+    const float row0 = normalized_transform[transform_col];
+    const float row1 = normalized_transform[3 + transform_col];
+    const float row2 = normalized_transform[6 + transform_col];
+    homography[transform_col] = source_fx * row0 + source_cx * row2;
+    homography[3 + transform_col] =
+        source_fy * row1 + source_cy * row2;
+    homography[6 + transform_col] = row2;
+  }
+  return true;
 }
 
 __device__ bool ComputeSourceDepthRoundTripErrors(
@@ -924,6 +973,16 @@ __device__ bool PassesGeometricCandidateFilter(
     DeviceCounters* counters) {
   if (source_depth_maps_texture == 0 ||
       options.cost.geometric_consistency_weight <= 0.0F) {
+    return true;
+  }
+  if (!options.cost.geometric_reject_occluded_candidates &&
+      !options.cost.geometric_reject_depth_conflicts) {
+    // COLMAP's geometric refinement is a soft forward-backward reprojection
+    // term. Requiring a candidate to already agree with a source depth before
+    // evaluating that term prevents incorrect initial depths from converging.
+    if (counters != nullptr) {
+      atomicAdd(&counters->geometric_candidate_acceptances, 1ULL);
+    }
     return true;
   }
 
@@ -1108,22 +1167,36 @@ __device__ float ComputeSourceCostForVariant(
     int row,
     float depth,
     float3 normal) {
-  double weight_sum = 0.0;
-  double sum_ref = 0.0;
-  double sum_src = 0.0;
-  double sum_ref2 = 0.0;
-  double sum_src2 = 0.0;
-  double sum_cross = 0.0;
+  float weight_sum = 0.0F;
+  float sum_ref = 0.0F;
+  float sum_src = 0.0F;
+  float sum_ref2 = 0.0F;
+  float sum_src2 = 0.0F;
+  float sum_cross = 0.0F;
   int num_samples = 0;
   const DeviceSourceImage& source = source_images[source_idx];
-  float center_source_x = 0.0F;
-  float center_source_y = 0.0F;
-  float center_source_depth = 0.0F;
-  if (!ProjectPlaneToSource(options, poses_texture, source_idx, variant_idx,
-                            static_cast<float>(col), static_cast<float>(row),
-                            static_cast<float>(col), static_cast<float>(row),
-                            depth, normal, &center_source_x, &center_source_y,
-                            &center_source_depth)) {
+  float homography[9];
+  if (!ComposePlaneHomography(options, poses_texture, source_idx, variant_idx,
+                              col, row, depth, normal, homography)) {
+    return options.cost.invalid_cost;
+  }
+  const float center_denominator =
+      homography[6] * static_cast<float>(col) +
+      homography[7] * static_cast<float>(row) + homography[8];
+  if (!isfinite(center_denominator) ||
+      fabsf(center_denominator) < 1e-8F) {
+    return options.cost.invalid_cost;
+  }
+  const float inverse_center_denominator = 1.0F / center_denominator;
+  const float center_source_x =
+      (homography[0] * static_cast<float>(col) +
+       homography[1] * static_cast<float>(row) + homography[2]) *
+      inverse_center_denominator;
+  const float center_source_y =
+      (homography[3] * static_cast<float>(col) +
+       homography[4] * static_cast<float>(row) + homography[5]) *
+      inverse_center_denominator;
+  if (!isfinite(center_source_x) || !isfinite(center_source_y)) {
     return options.cost.invalid_cost;
   }
   const float sweep_cos =
@@ -1144,28 +1217,47 @@ __device__ float ComputeSourceCostForVariant(
       1.0F / (2.0F * sigma_spatial * sigma_spatial);
   const float color_normalization =
       1.0F / (2.0F * options.cost.sigma_color * options.cost.sigma_color);
-  for (int dy = -options.cost.window_radius; dy <= options.cost.window_radius;
-       dy += options.cost.window_step) {
-    for (int dx = -options.cost.window_radius;
-         dx <= options.cost.window_radius; dx += options.cost.window_step) {
-      const float sample_x = static_cast<float>(col + dx);
-      const float sample_y = static_cast<float>(row + dy);
+  const int window_radius = options.cost.window_radius;
+  const int window_step = options.cost.window_step;
+  const float first_sample_x = static_cast<float>(col - window_radius);
+  const float first_sample_y = static_cast<float>(row - window_radius);
+  float row_numerator_x =
+      homography[0] * first_sample_x +
+      homography[1] * first_sample_y + homography[2];
+  float row_numerator_y =
+      homography[3] * first_sample_x +
+      homography[4] * first_sample_y + homography[5];
+  float row_denominator =
+      homography[6] * first_sample_x +
+      homography[7] * first_sample_y + homography[8];
+  const float col_step_numerator_x =
+      homography[0] * static_cast<float>(window_step);
+  const float col_step_numerator_y =
+      homography[3] * static_cast<float>(window_step);
+  const float col_step_denominator =
+      homography[6] * static_cast<float>(window_step);
+  const float row_step_numerator_x =
+      homography[1] * static_cast<float>(window_step);
+  const float row_step_numerator_y =
+      homography[4] * static_cast<float>(window_step);
+  const float row_step_denominator =
+      homography[7] * static_cast<float>(window_step);
+  for (int dy = -window_radius; dy <= window_radius; dy += window_step) {
+    float numerator_x = row_numerator_x;
+    float numerator_y = row_numerator_y;
+    float denominator = row_denominator;
+    for (int dx = -window_radius; dx <= window_radius; dx += window_step) {
       const float ref_value = SampleReferenceImage(
           reference_texture, options, shared_reference_tile,
           shared_reference_start_idx, shared_reference_num_pixels, col + dx,
           row + dy);
-      float source_x = 0.0F;
-      float source_y = 0.0F;
-      float projected_source_depth = 0.0F;
-      if (!isfinite(ref_value) ||
-          !ProjectPlaneToSource(options, poses_texture, source_idx,
-                                variant_idx,
-                                static_cast<float>(col),
-                                static_cast<float>(row), sample_x,
-                                sample_y, depth, normal, &source_x, &source_y,
-                                &projected_source_depth)) {
+      if (!isfinite(ref_value) || !isfinite(denominator) ||
+          fabsf(denominator) < 1e-8F) {
         return options.cost.invalid_cost;
       }
+      const float inverse_denominator = 1.0F / denominator;
+      float source_x = numerator_x * inverse_denominator;
+      float source_y = numerator_y * inverse_denominator;
       const float delta_x = source_x - center_source_x;
       const float delta_y = source_y - center_source_y;
       source_x = center_source_x + sweep_cos * delta_x - sweep_sin * delta_y;
@@ -1185,45 +1277,57 @@ __device__ float ComputeSourceCostForVariant(
                          color_normalization)
               : 1.0F;
       weight_sum += weight;
-      sum_ref += static_cast<double>(weight) * ref_value;
-      sum_src += static_cast<double>(weight) * src_value;
-      sum_ref2 += static_cast<double>(weight) * ref_value * ref_value;
-      sum_src2 += static_cast<double>(weight) * src_value * src_value;
-      sum_cross += static_cast<double>(weight) * ref_value * src_value;
+      sum_ref += weight * ref_value;
+      sum_src += weight * src_value;
+      sum_ref2 += weight * ref_value * ref_value;
+      sum_src2 += weight * src_value * src_value;
+      sum_cross += weight * ref_value * src_value;
       num_samples++;
+      numerator_x += col_step_numerator_x;
+      numerator_y += col_step_numerator_y;
+      denominator += col_step_denominator;
     }
+    row_numerator_x += row_step_numerator_x;
+    row_numerator_y += row_step_numerator_y;
+    row_denominator += row_step_denominator;
   }
-  if (num_samples <= 0 || !isfinite(weight_sum) || weight_sum <= 0.0) {
+  if (num_samples <= 0 || !isfinite(weight_sum) || weight_sum <= 0.0F) {
     return options.cost.invalid_cost;
   }
-  const double inverse_weight_sum = 1.0 / weight_sum;
+  const float inverse_weight_sum = 1.0F / weight_sum;
   sum_ref *= inverse_weight_sum;
   sum_src *= inverse_weight_sum;
   sum_ref2 *= inverse_weight_sum;
   sum_src2 *= inverse_weight_sum;
   sum_cross *= inverse_weight_sum;
-  const double ref_var = sum_ref2 - sum_ref * sum_ref;
-  const double src_var = sum_src2 - sum_src * sum_src;
+  const float ref_var = sum_ref2 - sum_ref * sum_ref;
+  const float src_var = sum_src2 - sum_src * sum_src;
   if (ref_var <= options.cost.min_variance ||
       src_var <= options.cost.min_variance) {
     return options.cost.invalid_cost;
   }
-  const double covariance = sum_cross - sum_ref * sum_src;
-  const double zncc = fmax(-1.0, fmin(1.0, covariance / sqrt(ref_var * src_var)));
-  float cost = static_cast<float>(0.5 * (1.0 - zncc));
+  const float covariance = sum_cross - sum_ref * sum_src;
+  const float zncc =
+      fmaxf(-1.0F, fminf(1.0F, covariance * rsqrtf(ref_var * src_var)));
+  float cost = 0.5F * (1.0F - zncc);
 
   if (source_depth_maps_texture != 0 &&
       options.cost.geometric_consistency_weight > 0.0F) {
     float signed_relative_error = 0.0F;
     float reprojection_error = 0.0F;
+    float geometric_cost = options.cost.geometric_max_reprojection_error;
     if (ComputeSourceDepthRoundTripErrors(
             options, poses_texture, source_depth_maps_texture, source,
             source_idx, col, row, depth, &signed_relative_error,
             &reprojection_error)) {
-      cost += options.cost.geometric_consistency_weight *
-              fminf(options.cost.geometric_max_reprojection_error,
-                    reprojection_error);
+      geometric_cost =
+          fminf(options.cost.geometric_max_reprojection_error,
+                reprojection_error);
     }
+    // Match COLMAP's public regularizer semantics: our photometric term is
+    // half of COLMAP's (1 - ZNCC), so scale the geometric term equally.
+    // Invalid source depth receives the truncated maximum penalty.
+    cost += 0.5F * options.cost.geometric_consistency_weight * geometric_cost;
   }
   const float source_weight =
       ReadPose(poses_texture, source_idx, 0, kPoseWeightOffset);
@@ -1570,11 +1674,20 @@ __global__ void InitHypothesesKernel(float* depth_map,
           (options.depth_max - options.depth_min);
   depth_map[idx] = depth;
   // 使用像素索引派生独立随机序列，保证 CUDA 初始化在固定 seed 下可复现。
-  const float3 normal =
-      randomize_initial_normals
-          ? PerturbNormal(default_normal, initial_normal_radius_degrees,
-                          seed + static_cast<std::uint32_t>(idx) * 131u)
-          : default_normal;
+  float3 normal = default_normal;
+  if (randomize_initial_normals) {
+    const std::uint32_t normal_seed =
+        seed + static_cast<std::uint32_t>(idx) * 131u;
+    if (initial_normal_radius_degrees >= 89.999F) {
+      const int row = idx / options.width;
+      const int col = idx - row * options.width;
+      normal = SampleCameraFacingHemisphereNormal(
+          row, col, options.reference_camera, normal_seed);
+    } else {
+      normal = PerturbNormal(default_normal, initial_normal_radius_degrees,
+                             normal_seed);
+    }
+  }
   normal_map[idx * 3 + 0] = normal.x;
   normal_map[idx * 3 + 1] = normal.y;
   normal_map[idx * 3 + 2] = normal.z;
@@ -1888,30 +2001,63 @@ __global__ void CheckerboardPropagationKernel(
   if (((row + col) & 1) != parity) {
     return;
   }
-  TryUpdateFromNeighbor(reference_texture, source_images_texture,
-                        source_depth_maps_texture, poses_texture,
-                        selection_texture, dynamic_probabilities, source_images,
-                        depth_map,
-                        normal_map, cost_map, options, row, col, row,
-                        col - 1, counters);
-  TryUpdateFromNeighbor(reference_texture, source_images_texture,
-                        source_depth_maps_texture, poses_texture,
-                        selection_texture, dynamic_probabilities, source_images,
-                        depth_map,
-                        normal_map, cost_map, options, row, col, row,
-                        col + 1, counters);
-  TryUpdateFromNeighbor(reference_texture, source_images_texture,
-                        source_depth_maps_texture, poses_texture,
-                        selection_texture, dynamic_probabilities, source_images,
-                        depth_map,
-                        normal_map, cost_map, options, row, col, row - 1,
-                        col, counters);
-  TryUpdateFromNeighbor(reference_texture, source_images_texture,
-                        source_depth_maps_texture, poses_texture,
-                        selection_texture, dynamic_probabilities, source_images,
-                        depth_map,
-                        normal_map, cost_map, options, row, col, row + 1,
-                        col, counters);
+  const int neighbor_rows[4] = {row, row, row - 1, row + 1};
+  const int neighbor_cols[4] = {col - 1, col + 1, col, col};
+  // Photometric evaluation dominates checkerboard propagation. Neighbor cost
+  // is a cheap local proxy, so evaluate the two strongest planes instead of
+  // recomputing all four. Keeping two candidates preserves corner/edge
+  // alternatives that a single-best strategy loses on real scenes.
+  int best_neighbors[2] = {-1, -1};
+  float best_neighbor_costs[2] = {
+      options.cost.invalid_cost, options.cost.invalid_cost};
+  for (int neighbor = 0; neighbor < 4; ++neighbor) {
+    const int neighbor_row = neighbor_rows[neighbor];
+    const int neighbor_col = neighbor_cols[neighbor];
+    if (neighbor_row < 0 || neighbor_row >= options.height ||
+        neighbor_col < 0 || neighbor_col >= options.width) {
+      continue;
+    }
+    const int neighbor_idx =
+        neighbor_row * options.width + neighbor_col;
+    const float neighbor_depth = depth_map[neighbor_idx];
+    const float3 neighbor_normal =
+        make_float3(normal_map[neighbor_idx * 3 + 0],
+                    normal_map[neighbor_idx * 3 + 1],
+                    normal_map[neighbor_idx * 3 + 2]);
+    float projected_depth = 0.0F;
+    if (!ProjectNeighborPlaneDepthToPixel(
+            options, neighbor_col, neighbor_row, neighbor_depth,
+            neighbor_normal, col, row, &projected_depth) ||
+        projected_depth < options.depth_min ||
+        projected_depth > options.depth_max) {
+      continue;
+    }
+    const float neighbor_cost = cost_map[neighbor_idx];
+    if (best_neighbors[0] < 0 ||
+        (isfinite(neighbor_cost) &&
+         neighbor_cost < best_neighbor_costs[0])) {
+      best_neighbors[1] = best_neighbors[0];
+      best_neighbor_costs[1] = best_neighbor_costs[0];
+      best_neighbors[0] = neighbor;
+      best_neighbor_costs[0] = neighbor_cost;
+    } else if (best_neighbors[1] < 0 ||
+               (isfinite(neighbor_cost) &&
+                neighbor_cost < best_neighbor_costs[1])) {
+      best_neighbors[1] = neighbor;
+      best_neighbor_costs[1] = neighbor_cost;
+    }
+  }
+  for (int rank = 0; rank < 2; ++rank) {
+    const int best_neighbor = best_neighbors[rank];
+    if (best_neighbor < 0) {
+      continue;
+    }
+    TryUpdateFromNeighbor(
+        reference_texture, source_images_texture, source_depth_maps_texture,
+        poses_texture, selection_texture, dynamic_probabilities, source_images,
+        depth_map, normal_map, cost_map, options, row, col,
+        neighbor_rows[best_neighbor], neighbor_cols[best_neighbor], counters);
+  }
 }
 
 __device__ void TryUpdatePerturbationCandidate(
@@ -2073,7 +2219,7 @@ std::vector<float> PackPoseTextureData(
   const Eigen::Matrix3d r_ref =
       reference_view.cam_from_world.q_cw.toRotationMatrix();
   const Eigen::Vector3d t_ref = reference_view.cam_from_world.t_cw;
-  const float sweep_angles_degrees[kNumPoseVariants] = {0.0F, -7.5F, 7.5F};
+  const float sweep_angles_degrees[kNumPoseVariants] = {0.0F};
   for (std::size_t source_idx = 0; source_idx < source_views.size();
        ++source_idx) {
     const PatchMatchView& source_view = source_views[source_idx];
@@ -2323,69 +2469,80 @@ PatchMatchMaps ResizePatchMatchMapsNearestForCuda(const PatchMatchMaps& source,
   return resized;
 }
 
-std::vector<float> CopyMatToVector(const cv::Mat& image) {
+void CopyMatToBuffer(const cv::Mat& image, float* values) {
   if (image.empty() || image.type() != CV_32FC1) {
     throw std::invalid_argument("CUDA PatchMatch requires CV_32FC1 images.");
   }
-  std::vector<float> values(static_cast<std::size_t>(image.rows) *
-                            static_cast<std::size_t>(image.cols));
+  if (values == nullptr) {
+    throw std::invalid_argument("CUDA image staging buffer is null.");
+  }
   for (int row = 0; row < image.rows; ++row) {
     const float* src = image.ptr<float>(row);
     std::copy(src, src + image.cols,
-              values.begin() + static_cast<std::size_t>(row) * image.cols);
+              values + static_cast<std::size_t>(row) * image.cols);
   }
-  return values;
 }
 
-std::vector<float> PackSourceImages(const std::vector<MvsImage>& images,
-                                    int max_width,
-                                    int max_height) {
-  std::vector<float> packed(static_cast<std::size_t>(images.size()) *
-                                max_width * max_height,
-                            0.0F);
+void PackSourceImagesToBuffer(const std::vector<MvsImage>& images,
+                              int max_width,
+                              int max_height,
+                              float* packed) {
+  const std::size_t packed_size =
+      static_cast<std::size_t>(images.size()) * max_width * max_height;
+  if (packed_size > 0 && packed == nullptr) {
+    throw std::invalid_argument("CUDA source image staging buffer is null.");
+  }
+  std::fill(packed, packed + packed_size, 0.0F);
   for (std::size_t image_idx = 0; image_idx < images.size(); ++image_idx) {
     if (images[image_idx].gray.empty() ||
         images[image_idx].gray.type() != CV_32FC1) {
       throw std::invalid_argument("CUDA PatchMatch requires CV_32FC1 images.");
     }
-    float* layer = packed.data() + image_idx * max_width * max_height;
+    float* layer = packed + image_idx * max_width * max_height;
     for (int row = 0; row < images[image_idx].gray.rows; ++row) {
       const float* src = images[image_idx].gray.ptr<float>(row);
       std::copy(src, src + images[image_idx].gray.cols,
                 layer + row * max_width);
     }
   }
-  return packed;
 }
 
-std::vector<float> PackSourceDepthMaps(
+void PackSourceDepthMapsToBuffer(
     const std::vector<DenseDepthMap>& depth_maps,
     int max_width,
-    int max_height) {
-  std::vector<float> packed(static_cast<std::size_t>(depth_maps.size()) *
-                                max_width * max_height,
-                            0.0F);
+    int max_height,
+    float* packed) {
+  const std::size_t packed_size =
+      static_cast<std::size_t>(depth_maps.size()) * max_width * max_height;
+  if (packed_size > 0 && packed == nullptr) {
+    throw std::invalid_argument("CUDA source depth staging buffer is null.");
+  }
+  std::fill(packed, packed + packed_size, 0.0F);
   for (std::size_t map_idx = 0; map_idx < depth_maps.size(); ++map_idx) {
-    float* layer = packed.data() + map_idx * max_width * max_height;
+    float* layer = packed + map_idx * max_width * max_height;
     for (std::size_t row = 0; row < depth_maps[map_idx].Height(); ++row) {
       for (std::size_t col = 0; col < depth_maps[map_idx].Width(); ++col) {
         layer[row * max_width + col] = depth_maps[map_idx].Get(row, col);
       }
     }
   }
-  return packed;
 }
 
-std::vector<float> PackSelectionProbabilityMaps(
+void PackSelectionProbabilityMapsToBuffer(
     const std::vector<DenseCostMap>& probability_maps,
     int width,
-    int height) {
-  std::vector<float> packed(static_cast<std::size_t>(probability_maps.size()) *
-                                width * height,
-                            0.0F);
+    int height,
+    float* packed) {
+  const std::size_t packed_size =
+      static_cast<std::size_t>(probability_maps.size()) * width * height;
+  if (packed_size > 0 && packed == nullptr) {
+    throw std::invalid_argument(
+        "CUDA selection probability staging buffer is null.");
+  }
+  std::fill(packed, packed + packed_size, 0.0F);
   for (std::size_t map_idx = 0; map_idx < probability_maps.size();
        ++map_idx) {
-    float* layer = packed.data() + map_idx * width * height;
+    float* layer = packed + map_idx * width * height;
     for (std::size_t row = 0; row < probability_maps[map_idx].Height();
          ++row) {
       for (std::size_t col = 0; col < probability_maps[map_idx].Width();
@@ -2395,26 +2552,29 @@ std::vector<float> PackSelectionProbabilityMaps(
       }
     }
   }
-  return packed;
 }
 
-std::vector<float> CopyDepthMapToVector(const DenseDepthMap& depth_map) {
-  std::vector<float> values(depth_map.NumPixels(), 0.0F);
+void CopyDepthMapToBuffer(const DenseDepthMap& depth_map, float* values) {
+  if (depth_map.NumPixels() > 0 && values == nullptr) {
+    throw std::invalid_argument("CUDA depth staging buffer is null.");
+  }
   for (std::size_t row = 0; row < depth_map.Height(); ++row) {
     for (std::size_t col = 0; col < depth_map.Width(); ++col) {
       values[row * depth_map.Width() + col] = depth_map.Get(row, col);
     }
   }
-  return values;
 }
 
-std::vector<float> CopyNormalizedNormalMapToVector(
+void CopyNormalizedNormalMapToBuffer(
     const NormalMap& normal_map,
+    float* values,
     std::size_t* num_normalizations) {
   if (num_normalizations != nullptr) {
     *num_normalizations = 0;
   }
-  std::vector<float> values(normal_map.NumPixels() * 3, 0.0F);
+  if (normal_map.NumPixels() > 0 && values == nullptr) {
+    throw std::invalid_argument("CUDA normal staging buffer is null.");
+  }
   for (std::size_t row = 0; row < normal_map.Height(); ++row) {
     for (std::size_t col = 0; col < normal_map.Width(); ++col) {
       const std::size_t idx = row * normal_map.Width() + col;
@@ -2432,7 +2592,6 @@ std::vector<float> CopyNormalizedNormalMapToVector(
       values[idx * 3 + 2] = normal.z();
     }
   }
-  return values;
 }
 
 void ValidateRequest(const CudaPatchMatchRequest& request) {
@@ -2825,11 +2984,6 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
     const std::vector<float> pose_texture_data =
         PackPoseTextureData(*request.reference_view, *request.source_views);
 
-    const std::vector<float> reference_image =
-        CopyMatToVector(request.reference_image->gray);
-    const std::vector<float> source_images =
-        PackSourceImages(*request.source_images, max_source_width,
-                         max_source_height);
     const bool use_source_depth_maps = request.source_depth_maps != nullptr &&
                                        !request.source_depth_maps->empty() &&
                                        request.options.cost
@@ -2838,34 +2992,13 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
     const bool use_selection_probability_maps =
         request.source_selection_probability_maps != nullptr &&
         !request.source_selection_probability_maps->empty();
-    const std::vector<float> source_depth_maps =
-        use_source_depth_maps
-            ? PackSourceDepthMaps(*request.source_depth_maps, max_source_width,
-                                  max_source_height)
-            : std::vector<float>{};
-    const std::vector<float> selection_probability_maps =
-        use_selection_probability_maps
-            ? PackSelectionProbabilityMaps(
-                  *request.source_selection_probability_maps, width, height)
-            : std::vector<float>{};
-    std::vector<float> dynamic_selection_probabilities;
-    if (request.options.source_selection.dynamic_probability) {
-      if (use_selection_probability_maps) {
-        dynamic_selection_probabilities = selection_probability_maps;
-      } else {
-        dynamic_selection_probabilities.resize(
-            static_cast<std::size_t>(device_options.num_sources) * width *
-            height,
-            std::clamp(0.5F,
-                       request.options.source_selection.min_probability,
-                       request.options.source_selection.max_probability));
-      }
-    }
     cuda_host_pack_time_ms =
         ElapsedMilliseconds(host_pack_start, SteadyClock::now());
 
     const std::size_t num_pixels =
         static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    const std::size_t num_source_pixels =
+        static_cast<std::size_t>(device_options.num_sources) * num_pixels;
     const auto record_texture_upload = [&](bool allocated) {
       if (allocated) {
         ++cuda_workspace_texture_allocations;
@@ -2883,10 +3016,10 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
     const auto upload_texture =
         [&](FloatLayeredTexture& texture, PinnedHostBuffer<float>& staging,
             int texture_width, int texture_height, int texture_depth,
-            const std::vector<float>& values,
+            std::size_t num_values, const auto& pack_values,
             cudaTextureFilterMode filter_mode = cudaFilterModeLinear) {
-          staging.Resize(values.size());
-          std::copy(values.begin(), values.end(), staging.data());
+          staging.Resize(num_values);
+          pack_values(staging.data());
           ++cuda_async_texture_uploads;
           cuda_pinned_texture_upload_bytes += sizeof(float) * staging.size();
           return texture.CreateAsync(texture_width, texture_height,
@@ -2896,28 +3029,53 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
     record_texture_upload(upload_texture(
         workspace_storage.reference_texture,
         workspace_storage.host_reference_texture_upload, width, height, 1,
-        reference_image));
+        num_pixels,
+        [&](float* staging) {
+          CopyMatToBuffer(request.reference_image->gray, staging);
+        }));
+    const std::size_t source_image_texture_values =
+        static_cast<std::size_t>(device_options.num_sources) *
+        max_source_width * max_source_height;
     record_texture_upload(upload_texture(
         workspace_storage.source_images_texture,
         workspace_storage.host_source_images_texture_upload, max_source_width,
-        max_source_height, device_options.num_sources, source_images));
+        max_source_height, device_options.num_sources,
+        source_image_texture_values,
+        [&](float* staging) {
+          PackSourceImagesToBuffer(*request.source_images, max_source_width,
+                                   max_source_height, staging);
+        }));
     record_texture_upload(upload_texture(
         workspace_storage.poses_texture,
         workspace_storage.host_poses_texture_upload, kNumPoseParams,
-        device_options.num_sources, kNumPoseVariants, pose_texture_data,
+        device_options.num_sources, kNumPoseVariants, pose_texture_data.size(),
+        [&](float* staging) {
+          std::copy(pose_texture_data.begin(), pose_texture_data.end(),
+                    staging);
+        },
         cudaFilterModePoint));
     if (use_source_depth_maps) {
       record_texture_upload(upload_texture(
           workspace_storage.source_depth_maps_texture,
           workspace_storage.host_source_depth_maps_texture_upload,
           max_source_width, max_source_height, device_options.num_sources,
-          source_depth_maps));
+          source_image_texture_values,
+          [&](float* staging) {
+            PackSourceDepthMapsToBuffer(
+                *request.source_depth_maps, max_source_width,
+                max_source_height, staging);
+          }));
     }
     if (use_selection_probability_maps) {
       record_texture_upload(upload_texture(
           workspace_storage.selection_probability_texture,
           workspace_storage.host_selection_probability_texture_upload, width,
-          height, device_options.num_sources, selection_probability_maps));
+          height, device_options.num_sources, num_source_pixels,
+          [&](float* staging) {
+            PackSelectionProbabilityMapsToBuffer(
+                *request.source_selection_probability_maps, width, height,
+                staging);
+          }));
     }
     FloatLayeredTexture& reference_texture =
         workspace_storage.reference_texture;
@@ -2970,15 +3128,19 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
     record_buffer_resize(d_cost_map.Resize(num_pixels));
     if (request.options.source_selection.dynamic_probability) {
       record_buffer_resize(d_dynamic_selection_probability_map.Resize(
-          dynamic_selection_probabilities.size()));
+          num_source_pixels));
       if (request.options.source_selection.directional_hmm) {
         record_buffer_resize(d_source_selection_emission_map.Resize(
-            dynamic_selection_probabilities.size()));
+            num_source_pixels));
         record_buffer_resize(d_source_selection_backward_message_map.Resize(
-            dynamic_selection_probabilities.size()));
+            num_source_pixels));
       }
-      h_dynamic_selection_probability_map.Resize(
-          dynamic_selection_probabilities.size());
+      if (use_selection_probability_maps ||
+          request.options.collect_diagnostics) {
+        h_dynamic_selection_probability_map.Resize(num_source_pixels);
+      } else {
+        h_dynamic_selection_probability_map.Resize(0);
+      }
     }
     record_buffer_resize(d_counters.Resize(1));
     record_buffer_resize(d_output_pixels.Resize(num_pixels));
@@ -3007,14 +3169,39 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
         sizeof(float) * h_dynamic_selection_probability_map.size();
     d_source_images_info.CopyFromHost(source_images_info);
     if (request.options.source_selection.dynamic_probability) {
-      std::copy(dynamic_selection_probabilities.begin(),
-                dynamic_selection_probabilities.end(),
-                h_dynamic_selection_probability_map.data());
-      d_dynamic_selection_probability_map.CopyFromHostAsync(
-          h_dynamic_selection_probability_map.data(), stream);
-      ++cuda_async_host_uploads;
-      cuda_pinned_host_upload_bytes +=
-          sizeof(float) * h_dynamic_selection_probability_map.size();
+      if (use_selection_probability_maps) {
+        PackSelectionProbabilityMapsToBuffer(
+            *request.source_selection_probability_maps, width, height,
+            h_dynamic_selection_probability_map.data());
+        d_dynamic_selection_probability_map.CopyFromHostAsync(
+            h_dynamic_selection_probability_map.data(), stream);
+        ++cuda_async_host_uploads;
+        cuda_pinned_host_upload_bytes +=
+            sizeof(float) * h_dynamic_selection_probability_map.size();
+      } else if (request.options.collect_diagnostics) {
+        std::fill(
+            h_dynamic_selection_probability_map.data(),
+            h_dynamic_selection_probability_map.data() + num_source_pixels,
+            std::clamp(0.5F,
+                       request.options.source_selection.min_probability,
+                       request.options.source_selection.max_probability));
+        d_dynamic_selection_probability_map.CopyFromHostAsync(
+            h_dynamic_selection_probability_map.data(), stream);
+        ++cuda_async_host_uploads;
+        cuda_pinned_host_upload_bytes +=
+            sizeof(float) * h_dynamic_selection_probability_map.size();
+      } else {
+        const int probability_blocks = static_cast<int>(
+            (num_source_pixels + kThreadsPerBlock - 1) / kThreadsPerBlock);
+        FillFloatBufferKernel<<<probability_blocks, kThreadsPerBlock, 0,
+                                stream>>>(
+            d_dynamic_selection_probability_map.get(), num_source_pixels,
+            std::clamp(0.5F,
+                       request.options.source_selection.min_probability,
+                       request.options.source_selection.max_probability));
+        ++cuda_stream_kernel_launches;
+        CudaCheck(cudaGetLastError());
+      }
     }
     Eigen::Vector3f default_normal =
         request.options.initialization.default_normal.squaredNorm() > 0.0F
@@ -3033,16 +3220,11 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
     if (request.initial_maps != nullptr) {
       h_depth_upload.Resize(num_pixels);
       h_normal_upload.Resize(num_pixels * 3);
-      const std::vector<float> depth_upload =
-          CopyDepthMapToVector(request.initial_maps->depth_map);
-      const std::vector<float> normal_upload =
-          CopyNormalizedNormalMapToVector(
-              request.initial_maps->normal_map,
-              &cuda_host_initial_normal_upload_normalizations);
-      std::copy(depth_upload.begin(), depth_upload.end(),
-                h_depth_upload.data());
-      std::copy(normal_upload.begin(), normal_upload.end(),
-                h_normal_upload.data());
+      CopyDepthMapToBuffer(request.initial_maps->depth_map,
+                           h_depth_upload.data());
+      CopyNormalizedNormalMapToBuffer(
+          request.initial_maps->normal_map, h_normal_upload.data(),
+          &cuda_host_initial_normal_upload_normalizations);
       d_depth_map.CopyFromHostAsync(h_depth_upload.data(), stream);
       d_normal_map.CopyFromHostAsync(h_normal_upload.data(), stream);
       cuda_async_host_uploads += 2;
@@ -3264,7 +3446,8 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
     ++cuda_stream_kernel_launches;
     CudaCheck(cudaGetLastError());
     d_output_pixels.CopyToHostAsync(h_output_pixels.data(), stream);
-    if (request.options.source_selection.dynamic_probability) {
+    if (request.options.source_selection.dynamic_probability &&
+        request.options.collect_diagnostics) {
       d_dynamic_selection_probability_map.CopyToHostAsync(
           h_dynamic_selection_probability_map.data(), stream);
       ++cuda_async_output_readbacks;
@@ -3454,7 +3637,8 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
       result.summary.normal_radii_degrees.push_back(
           iteration_normal_radii[iteration]);
     }
-    if (request.options.source_selection.dynamic_probability) {
+    if (request.options.source_selection.dynamic_probability &&
+        request.options.collect_diagnostics) {
       result.summary.final_source_selection_probability_means.reserve(
           static_cast<std::size_t>(device_options.num_sources));
       for (int source_idx = 0; source_idx < device_options.num_sources;
@@ -3629,7 +3813,10 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereo(
     }
 
     PatchMatchMaps prior_maps;
-    bool has_prior = false;
+    bool has_prior = request.initial_maps != nullptr;
+    if (request.initial_maps != nullptr) {
+      prior_maps = *request.initial_maps;
+    }
     PatchMatchStereoResult final_result;
     PatchMatchStereoSummary accumulated_summary;
     accumulated_summary.num_pyramid_levels = num_levels;

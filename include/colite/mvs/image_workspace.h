@@ -38,6 +38,12 @@ struct MvsImageWorkspaceOptions {
   int max_image_size = -1;
   // Each level halves width and height before applying max_image_size.
   std::size_t resolution_level = 0;
+
+  // PatchMatch needs normalized grayscale pixels, while persisted stereo
+  // fusion only samples RGB colors. Callers may skip either representation to
+  // avoid a redundant image decode and buffer.
+  bool load_gray = true;
+  bool load_color = true;
 };
 
 // MVS 图像 workspace。它只负责图像加载、尺度变换和 LRU 缓存，不负责深度估计。

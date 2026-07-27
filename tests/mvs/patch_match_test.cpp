@@ -1011,6 +1011,66 @@ TEST(PatchMatchBackendTest, CudaBackendMatchesCpuBilateralWeightedCost) {
 }
 
 TEST(PatchMatchBackendTest,
+     CudaBackendMatchesCpuCostForGuiHighWindowRadius) {
+  if (!IsCudaPatchMatchCompiled()) {
+    GTEST_SKIP() << "CUDA PatchMatch backend is not compiled in this build.";
+  }
+  ASSERT_TRUE(IsCudaPatchMatchAvailable())
+      << CudaPatchMatchUnavailableReason();
+
+  MvsImage reference = MakeGradientImage(15, 15);
+  MvsImage source = reference;
+  source.gray = reference.gray.clone();
+  for (int row = 0; row < 15; ++row) {
+    for (int col = 0; col < 15; ++col) {
+      source.gray.at<float>(row, col) =
+          std::min(1.0F, reference.gray.at<float>(row, col) +
+                             0.002F * static_cast<float>((row + col) % 5));
+    }
+  }
+
+  const PatchMatchView reference_view = MakeView(1);
+  const std::vector<PatchMatchView> source_views{MakeView(2)};
+  const std::vector<MvsImage> source_images{source};
+  PatchMatchMaps initial_maps;
+  initial_maps.depth_map = DenseDepthMap(15, 15, 2.0F, 6.0F);
+  initial_maps.depth_map.Fill(3.0F);
+  initial_maps.normal_map = NormalMap(15, 15);
+  initial_maps.normal_map.Fill(Eigen::Vector3f(0.0F, 0.0F, -1.0F));
+
+  PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kCuda;
+  options.num_iterations = 0;
+  options.cost.window_radius = 5;
+  options.cost.bilateral_weighting = true;
+  options.cost.sigma_spatial = 5.0F;
+  options.cost.sigma_color = 0.2F;
+
+  CudaPatchMatchRequest request;
+  request.reference_view = &reference_view;
+  request.source_views = &source_views;
+  request.reference_image = &reference;
+  request.source_images = &source_images;
+  request.initial_maps = &initial_maps;
+  request.depth_min = 2.0F;
+  request.depth_max = 6.0F;
+  request.options = options;
+
+  std::string unavailable_reason;
+  const std::optional<PatchMatchStereoResult> result =
+      RunCudaPatchMatchStereo(request, &unavailable_reason);
+  ASSERT_TRUE(result.has_value()) << unavailable_reason;
+
+  const PatchMatchCost cpu_cost = ComputePlaneHypothesisCost(
+      reference_view, source_views.front(), reference, source,
+      Eigen::Vector2f(7.0F, 7.0F), 3.0F,
+      Eigen::Vector3f(0.0F, 0.0F, -1.0F), options.cost);
+  ASSERT_TRUE(cpu_cost.valid);
+  ASSERT_TRUE(result->cost_map.IsValid(7, 7));
+  EXPECT_NEAR(result->cost_map.Get(7, 7), cpu_cost.cost, 5e-4F);
+}
+
+TEST(PatchMatchBackendTest,
      CudaBackendRandomInitialNormalsAreDeterministicAndDiverse) {
   if (!IsCudaPatchMatchCompiled()) {
     GTEST_SKIP() << "CUDA PatchMatch backend is not compiled in this build.";
@@ -1059,6 +1119,43 @@ TEST(PatchMatchBackendTest,
   }
   EXPECT_TRUE(saw_randomized_normal);
   EXPECT_TRUE(saw_distinct_normals);
+}
+
+TEST(PatchMatchBackendTest,
+     CudaBackendHemisphereInitialNormalsFaceAwayFromCamera) {
+  if (!IsCudaPatchMatchCompiled()) {
+    GTEST_SKIP() << "CUDA PatchMatch backend is not compiled in this build.";
+  }
+  ASSERT_TRUE(IsCudaPatchMatchAvailable())
+      << CudaPatchMatchUnavailableReason();
+
+  const MvsImage reference = MakeGradientImage(16, 12);
+  PatchMatchView reference_view = MakeView(1);
+  reference_view.camera.params = {8.0, 8.0, 7.5, 5.5};
+  PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kCuda;
+  options.num_iterations = 0;
+  options.cost.window_radius = 1;
+  options.initialization.random_seed = 41;
+  options.initialization.randomize_initial_normals = true;
+  options.initialization.initial_normal_hemisphere_degrees = 90.0F;
+
+  const PatchMatchStereoResult result = RunPatchMatchStereoForImage(
+      reference_view, {reference_view}, reference, {reference}, 2.0F, 6.0F,
+      options);
+  bool saw_large_tilt = false;
+  for (std::size_t row = 0; row < result.normal_map.Height(); ++row) {
+    for (std::size_t col = 0; col < result.normal_map.Width(); ++col) {
+      const Eigen::Vector3f normal = result.normal_map.Get(row, col);
+      const Eigen::Vector3f view_ray(
+          (static_cast<float>(col) - 7.5F) / 8.0F,
+          (static_cast<float>(row) - 5.5F) / 8.0F, 1.0F);
+      EXPECT_LE(normal.dot(view_ray), 1e-6F);
+      EXPECT_NEAR(normal.norm(), 1.0F, 1e-5F);
+      saw_large_tilt = saw_large_tilt || std::abs(normal.z()) < 0.25F;
+    }
+  }
+  EXPECT_TRUE(saw_large_tilt);
 }
 
 TEST(PatchMatchBackendTest, CudaBackendPropagatesNeighborPlanesToCurrentRay) {
@@ -1739,6 +1836,8 @@ TEST(PatchMatchBackendTest, CudaBackendRunsExplicitRedBlackCheckerboard) {
   EXPECT_EQ(result.summary.num_top_down_sweeps, 0U);
   EXPECT_EQ(result.summary.num_bottom_up_sweeps, 0U);
   EXPECT_GT(result.summary.num_candidate_evaluations, 0U);
+  EXPECT_LE(result.summary.num_plane_propagation_candidates,
+            2 * reference.Width() * reference.Height());
 }
 
 TEST(PatchMatchBackendTest, CudaBackendRejectsGeometricallyInconsistentCandidates) {
@@ -1774,6 +1873,46 @@ TEST(PatchMatchBackendTest, CudaBackendRejectsGeometricallyInconsistentCandidate
   EXPECT_GT(result.summary.num_perturbation_geometric_candidate_rejections,
             0U);
   EXPECT_EQ(result.summary.num_perturbation_geometric_candidate_acceptances,
+            0U);
+}
+
+TEST(PatchMatchBackendTest,
+     CudaBackendSoftGeometricModeEvaluatesInconsistentCandidates) {
+  if (!IsCudaPatchMatchCompiled()) {
+    GTEST_SKIP() << "CUDA PatchMatch backend is not compiled in this build.";
+  }
+  ASSERT_TRUE(IsCudaPatchMatchAvailable())
+      << CudaPatchMatchUnavailableReason();
+
+  const MvsImage reference = MakeGradientImage(8, 8);
+  const PatchMatchView reference_view = MakeView(1);
+  std::vector<PatchMatchView> source_views{MakeView(2)};
+  std::vector<MvsImage> source_images{reference};
+  std::vector<DenseDepthMap> source_depth_maps;
+  source_depth_maps.emplace_back(8, 8, 1.0F, 6.0F);
+  source_depth_maps.front().Fill(1.0F);
+
+  PatchMatchStereoOptions options;
+  options.backend = PatchMatchBackend::kCuda;
+  options.collect_diagnostics = true;
+  options.num_iterations = 1;
+  options.cost.window_radius = 1;
+  options.cost.geometric_consistency_weight = 0.2F;
+  options.cost.geometric_max_relative_depth_error = 0.001F;
+  options.cost.geometric_reject_occluded_candidates = false;
+  options.cost.geometric_reject_depth_conflicts = false;
+  options.cost.min_num_valid_sources = 1;
+  options.perturbation.num_samples_per_pixel = 1;
+
+  const PatchMatchStereoResult result =
+      RunPatchMatchStereoForImageWithSourceDepths(
+          reference_view, source_views, reference, source_images,
+          source_depth_maps, 3.0F, 5.0F, options);
+
+  EXPECT_EQ(result.summary.actual_backend, PatchMatchBackend::kCuda);
+  EXPECT_EQ(result.summary.num_perturbation_geometric_candidate_rejections,
+            0U);
+  EXPECT_GT(result.summary.num_perturbation_geometric_candidate_acceptances,
             0U);
 }
 
@@ -2115,6 +2254,7 @@ TEST(CpuPatchMatchGeometricConsistencyTest,
   const ConsistencyGraph loaded =
       ReadConsistencyGraphBinary(root / "graph.bin");
 
+  EXPECT_TRUE(loaded.IsCompact());
   EXPECT_EQ(loaded.Width(), 3U);
   EXPECT_EQ(loaded.Height(), 2U);
   EXPECT_EQ(loaded.Count(0, 0), 2U);
@@ -2249,6 +2389,25 @@ TEST(CpuStereoFusionTest, PreservesRgbSourceColor) {
   EXPECT_EQ(result.points[0].color.z(), 56);
 }
 
+TEST(CpuStereoFusionTest, CanFusePersistedMapsWithoutReloadingCostMaps) {
+  const MvsImage reference = MakeGradientImage(5, 5);
+  DenseDepthMap depth_map(5, 5, 1.0F, 5.0F);
+  depth_map.Set(2, 2, 3.0F);
+  NormalMap normal_map(5, 5);
+  normal_map.Set(2, 2, Eigen::Vector3f(0.0F, 0.0F, 1.0F));
+  ConsistencyGraph graph(5, 5);
+  graph.Add(2, 2, 2);
+  StereoFusionOptions options;
+  options.require_cost_map = false;
+
+  const StereoFusionResult result =
+      FuseStereoDepthMaps({MakeView(1)}, {reference}, {depth_map},
+                          {normal_map}, {}, {graph}, options);
+
+  ASSERT_EQ(result.points.size(), 1U);
+  EXPECT_EQ(result.summary.num_fused_points, 1U);
+}
+
 TEST(CpuStereoFusionTest, MergesReciprocalConsistentPixelsIntoSingleTrack) {
   const MvsImage image1 = MakeGradientImage(5, 5);
   MvsImage image2 = image1;
@@ -2325,6 +2484,17 @@ TEST(CpuStereoFusionTest, RoundTripsColmapPointsVisibilityBinary) {
   EXPECT_EQ(loaded[0], visibility[0]);
   EXPECT_EQ(loaded[1], visibility[1]);
   EXPECT_EQ(loaded[2], visibility[2]);
+
+  const std::vector<std::uint64_t> visibility_masks{
+      (std::uint64_t{1} << 0) | (std::uint64_t{1} << 2),
+      std::uint64_t{1} << 1,
+      0};
+  WritePointsVisibilityColmapBinary(root / "points_visibility_masks.bin",
+                                    visibility_masks);
+  const std::vector<std::vector<std::uint32_t>> loaded_masks =
+      ReadPointsVisibilityColmapBinary(
+          root / "points_visibility_masks.bin");
+  EXPECT_EQ(loaded_masks, visibility);
 }
 
 TEST(CpuStereoFusionTest, RecordsFusionErrorSamplesForThresholdTuning) {
@@ -2494,6 +2664,56 @@ TEST(CpuStereoFusionTest, RejectsGradualNormalDriftFromSeed) {
   EXPECT_GT(result.summary.num_rejected_tracks, 0U);
 }
 
+TEST(CpuStereoFusionTest, RejectsGradualPositionDriftFromSeed) {
+  MvsImage image1 = MakeGradientImage(5, 5);
+  MvsImage image2 = image1;
+  MvsImage image3 = image1;
+  image2.image_id = 2;
+  image3.image_id = 3;
+
+  DenseDepthMap depth1(5, 5, 1.0F, 5.0F);
+  DenseDepthMap depth2(5, 5, 1.0F, 5.0F);
+  DenseDepthMap depth3(5, 5, 1.0F, 5.0F);
+  depth1.Set(2, 1, 3.0F);
+  depth2.Set(2, 2, 3.0F);
+  depth3.Set(2, 3, 3.0F);
+  NormalMap normal1(5, 5);
+  NormalMap normal2(5, 5);
+  NormalMap normal3(5, 5);
+  normal1.Set(2, 1, Eigen::Vector3f(0.0F, 0.0F, 1.0F));
+  normal2.Set(2, 2, Eigen::Vector3f(0.0F, 0.0F, 1.0F));
+  normal3.Set(2, 3, Eigen::Vector3f(0.0F, 0.0F, 1.0F));
+  DenseCostMap cost1(5, 5);
+  DenseCostMap cost2(5, 5);
+  DenseCostMap cost3(5, 5);
+  cost1.Set(2, 1, 0.1F);
+  cost2.Set(2, 2, 0.1F);
+  cost3.Set(2, 3, 0.1F);
+  ConsistencyGraph graph1(5, 5);
+  ConsistencyGraph graph2(5, 5);
+  ConsistencyGraph graph3(5, 5);
+  graph1.Add(2, 1, 2);
+  graph2.Add(2, 2, 3);
+
+  StereoFusionOptions options;
+  options.min_num_fused_observations = 3;
+  options.source_pixel_search_radius = 1;
+  options.max_reprojection_error_pixels = 1.1F;
+  const StereoFusionResult result = FuseStereoDepthMaps(
+      {MakeView(1), MakeView(2), MakeView(3)}, {image1, image2, image3},
+      {depth1, depth2, depth3}, {normal1, normal2, normal3},
+      {cost1, cost2, cost3}, {graph1, graph2, graph3}, options);
+
+  EXPECT_TRUE(result.points.empty());
+  EXPECT_TRUE(result.tracks.empty());
+  EXPECT_GT(result.summary.num_rejected_tracks, 0U);
+  ASSERT_EQ(result.pair_diagnostics.size(), 2U);
+  EXPECT_EQ(result.pair_diagnostics[1].reference_image_id, 2U);
+  EXPECT_EQ(result.pair_diagnostics[1].source_image_id, 3U);
+  EXPECT_EQ(result.pair_diagnostics[1].num_accepted, 0U);
+  EXPECT_EQ(result.pair_diagnostics[1].num_rejected_other, 1U);
+}
+
 TEST(CpuStereoFusionTest, RejectsSourceObservationWithLargeNormalAngle) {
   const MvsImage image1 = MakeGradientImage(5, 5);
   MvsImage image2 = image1;
@@ -2524,13 +2744,13 @@ TEST(CpuStereoFusionTest, RejectsSourceObservationWithLargeNormalAngle) {
       {normal1, normal2}, {cost1, cost2}, {graph1, graph2}, options);
 
   EXPECT_TRUE(result.points.empty());
-  EXPECT_EQ(result.summary.num_rejected_normal_observations, 2U);
+  EXPECT_EQ(result.summary.num_rejected_normal_observations, 1U);
   EXPECT_EQ(result.summary.num_rejected_tracks, 2U);
   ASSERT_EQ(result.pair_diagnostics.size(), 2U);
   EXPECT_EQ(result.pair_diagnostics[0].num_candidates, 1U);
   EXPECT_EQ(result.pair_diagnostics[0].num_rejected_normal, 1U);
   EXPECT_EQ(result.pair_diagnostics[1].num_candidates, 1U);
-  EXPECT_EQ(result.pair_diagnostics[1].num_rejected_normal, 1U);
+  EXPECT_EQ(result.pair_diagnostics[1].num_rejected_visited, 1U);
 }
 
 TEST(CpuStereoFusionTest, RejectsSourceObservationWithLargeViewAngle) {

@@ -12,6 +12,7 @@
 #include <ceres/local_parameterization.h>
 
 #include "colite/core/geometry.h"
+#include "colite/core/parallel.h"
 
 namespace colite {
 namespace {
@@ -365,7 +366,7 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
   solver_options.max_num_iterations = options.max_num_iterations;
   solver_options.linear_solver_type = ceres::SPARSE_SCHUR;
   solver_options.minimizer_progress_to_stdout = false;
-  solver_options.num_threads = 1;
+  solver_options.num_threads = parallel::getNumThreads();
 
   ceres::Solver::Summary solver_summary;
   ceres::Solve(solver_options, &problem, &solver_summary);

@@ -202,14 +202,15 @@ void WriteWorkspaceCameras(const std::filesystem::path& workspace_path,
                            const std::vector<Camera>& cameras) {
   std::filesystem::create_directories(workspace_path);
   std::ofstream file(workspace_path / "cameras.txt");
-  file << "# CAMERA_ID MODEL WIDTH HEIGHT PARAMS[]\n";
+  file << "# CAMERA_ID MODEL WIDTH HEIGHT PARAMS[] PRIOR_FOCAL=<0|1>\n";
   for (const Camera& camera : cameras) {
     file << camera.id << " " << CameraModelIdToName(camera.model_id) << " "
          << camera.width << " " << camera.height;
     for (const double param : camera.params) {
       file << " " << std::setprecision(17) << param;
     }
-    file << "\n";
+    file << " PRIOR_FOCAL=" << (camera.has_prior_focal_length ? 1 : 0)
+         << "\n";
   }
 }
 
@@ -222,11 +223,25 @@ std::vector<Camera> ReadWorkspaceCameras(
     std::string model_name;
     stream >> camera.id >> model_name >> camera.width >> camera.height;
     camera.model_id = CameraModelNameToId(model_name);
-    double param = 0.0;
-    while (stream >> param) {
+    const std::size_t num_params =
+        GetCameraModelSpec(camera.model_id).param_names.size();
+    for (std::size_t idx = 0; idx < num_params; ++idx) {
+      double param = 0.0;
+      if (!(stream >> param)) {
+        throw std::runtime_error("Invalid workspace camera entry: " + line);
+      }
       camera.params.push_back(param);
     }
-    if (!stream.eof() || !camera.VerifyParams()) {
+    std::string metadata;
+    if (stream >> metadata) {
+      if (metadata == "PRIOR_FOCAL=1") {
+        camera.has_prior_focal_length = true;
+      } else if (metadata != "PRIOR_FOCAL=0") {
+        throw std::runtime_error("Invalid workspace camera metadata: " + line);
+      }
+    }
+    std::string trailing;
+    if (stream >> trailing || !camera.VerifyParams()) {
       throw std::runtime_error("Invalid workspace camera entry: " + line);
     }
     cameras.push_back(camera);

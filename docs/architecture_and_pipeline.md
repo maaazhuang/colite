@@ -109,7 +109,7 @@ OUTPUT/
     <stage>.json
 ```
 
-Dense map 支持 text 和 COLMAP 风格 binary。`stereo_fusion` 只读取已存在的深度、法线、代价和一致性图，不会隐式重跑 PatchMatch。
+Dense map 支持 text 和 COLMAP 风格 binary。`stereo_fusion` 只读取已存在的深度、法线和一致性图，不会隐式重跑 PatchMatch；持久化几何过滤已经把无效掩码同步写入 depth/normal，因此该路径不再重复解析 text cost map。
 
 ## Stage manifest
 

@@ -235,6 +235,7 @@ TEST(ReconMvsExeTest, InitializesPatchMatchMapsWhenImagePathIsProvided) {
   const std::filesystem::path model_path = root / "model";
   const std::filesystem::path image_path = root / "images";
   const std::filesystem::path output_path = root / "mvs";
+  std::filesystem::remove_all(root);
   WriteSmallColmapTextModel(model_path);
   WriteSmallImages(image_path);
 
@@ -584,6 +585,7 @@ TEST(ReconMvsExeTest, WritesGeometricConsistencyGraphWhenRequested) {
   const std::filesystem::path model_path = root / "model";
   const std::filesystem::path image_path = root / "images";
   const std::filesystem::path output_path = root / "mvs";
+  std::filesystem::remove_all(root);
   WriteSmallColmapTextModel(model_path);
   WriteSmallImages(image_path);
 
@@ -618,11 +620,7 @@ TEST(ReconMvsExeTest, WritesGeometricConsistencyGraphWhenRequested) {
             std::string::npos);
   EXPECT_TRUE(std::filesystem::exists(output_path / "stereo" /
                                       "consistency_graphs" /
-                                      "image1.jpg.txt"));
-  EXPECT_NE(ReadTextFile(output_path / "stereo" / "consistency_graphs" /
-                         "image1.jpg.txt")
-                .find("COLITE_CONSISTENCY_GRAPH_TEXT"),
-            std::string::npos);
+                                      "image1.jpg.bin"));
   EXPECT_NE(ReadTextFile(output_path / "stereo" / "patch_match.tsv")
                 .find("geometric_consistent_pixels"),
             std::string::npos);
@@ -635,6 +633,7 @@ TEST(ReconMvsExeTest, WritesBinaryDenseMapsWhenRequested) {
   const std::filesystem::path model_path = root / "model";
   const std::filesystem::path image_path = root / "images";
   const std::filesystem::path output_path = root / "mvs";
+  std::filesystem::remove_all(root);
   WriteSmallColmapTextModel(model_path);
   WriteSmallImages(image_path);
 
@@ -669,11 +668,11 @@ TEST(ReconMvsExeTest, WritesBinaryDenseMapsWhenRequested) {
   EXPECT_TRUE(std::filesystem::exists(output_path / "stereo" /
                                       "consistency_graphs" /
                                       "image1.jpg.bin"));
-  EXPECT_TRUE(std::filesystem::exists(output_path / "stereo" /
-                                      "consistency_graphs_colmap" /
-                                      "image1.jpg.bin"));
+  EXPECT_FALSE(std::filesystem::exists(output_path / "stereo" /
+                                       "consistency_graphs_colmap" /
+                                       "image1.jpg.bin"));
   EXPECT_TRUE(std::filesystem::exists(output_path / "stereo" / "cost_maps" /
-                                      "image1.jpg.txt"));
+                                      "image1.jpg.bin"));
 }
 
 TEST(ReconMvsExeTest, WritesStereoFusionPlyWhenRequested) {
@@ -682,6 +681,7 @@ TEST(ReconMvsExeTest, WritesStereoFusionPlyWhenRequested) {
   const std::filesystem::path model_path = root / "model";
   const std::filesystem::path image_path = root / "images";
   const std::filesystem::path output_path = root / "mvs";
+  std::filesystem::remove_all(root);
   WriteSmallColmapTextModel(model_path);
   WriteSmallImages(image_path);
 
@@ -707,6 +707,7 @@ TEST(ReconMvsExeTest, WritesStereoFusionPlyWhenRequested) {
                       "10",
                       "--fusion_max_view_angle",
                       "180",
+                      "--fusion_diagnostics",
                       "--filter_geometric_min_num_consistent_sources",
                       "1"},
                      out,
@@ -834,6 +835,13 @@ TEST(ReconMvsExeTest, StandaloneFusionReusesPersistedPatchMatchMaps) {
       << err.str();
   EXPECT_EQ(std::filesystem::last_write_time(depth_path), depth_time);
   EXPECT_TRUE(std::filesystem::exists(output_path / "dense" / "fused.ply"));
+  const std::filesystem::path timing_path =
+      output_path / "dense" / "fusion_timing.txt";
+  ASSERT_TRUE(std::filesystem::exists(timing_path));
+  const std::string timing = ReadTextFile(timing_path);
+  EXPECT_NE(timing.find("consistency_graph_loading_ms "), std::string::npos);
+  EXPECT_NE(timing.find("fusion_core_ms "), std::string::npos);
+  EXPECT_NE(timing.find("total_ms "), std::string::npos);
   EXPECT_TRUE(std::filesystem::exists(
       output_path / ".colite" / "stages" / "patch_match_stereo.json"));
   EXPECT_TRUE(std::filesystem::exists(
@@ -904,6 +912,7 @@ TEST(ReconMvsExeTest, WritesCleanDenseCloudAndMeshWhenRequested) {
   const std::filesystem::path model_path = root / "model";
   const std::filesystem::path image_path = root / "images";
   const std::filesystem::path output_path = root / "mvs";
+  std::filesystem::remove_all(root);
   WriteSmallColmapTextModel(model_path);
   WriteSmallImages(image_path);
 

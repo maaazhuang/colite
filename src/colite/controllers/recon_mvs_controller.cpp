@@ -12,8 +12,10 @@
 #include <iomanip>
 #include <ios>
 #include <limits>
+#include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
@@ -306,6 +308,9 @@ struct PatchMatchSchedulingSummary {
   double refinement_sum_cuda_time_ms = 0.0;
   double refinement_overlap_saved_time_ms = 0.0;
   double refinement_overlap_ratio = 0.0;
+  double consistency_graph_build_write_time_ms = 0.0;
+  double consistency_graph_read_filter_time_ms = 0.0;
+  double dense_map_output_time_ms = 0.0;
 };
 
 void WriteMvsSummary(const std::filesystem::path& output_path,
@@ -386,6 +391,15 @@ void WriteMvsSummary(const std::filesystem::path& output_path,
        << "\n"
        << "patch_match_refinement_overlap_ratio "
        << scheduling_summary.refinement_overlap_ratio
+       << "\n"
+       << "consistency_graph_build_write_time_ms "
+       << scheduling_summary.consistency_graph_build_write_time_ms
+       << "\n"
+       << "consistency_graph_read_filter_time_ms "
+       << scheduling_summary.consistency_graph_read_filter_time_ms
+       << "\n"
+       << "dense_map_output_time_ms "
+       << scheduling_summary.dense_map_output_time_ms
        << "\n"
        << "fused_points "
        << fusion_summary.num_fused_points
@@ -791,31 +805,6 @@ void FillOverlapSummary(double wall_time_ms,
                               : *overlap_saved_time_out / sum_cuda_time_ms;
 }
 
-void WriteConsistencyGraphText(const std::filesystem::path& path,
-                               const mvs::ConsistencyGraph& graph) {
-  std::filesystem::create_directories(path.parent_path());
-  std::ofstream file(path);
-  if (!file) {
-    throw std::runtime_error("Failed to write consistency graph: " +
-                             path.string());
-  }
-  file << "COLITE_CONSISTENCY_GRAPH_TEXT 1\n"
-       << graph.Width() << " " << graph.Height() << "\n";
-  for (std::size_t row = 0; row < graph.Height(); ++row) {
-    for (std::size_t col = 0; col < graph.Width(); ++col) {
-      const std::vector<ImageId>& source_ids = graph.SourceImageIds(row, col);
-      if (source_ids.empty()) {
-        continue;
-      }
-      file << row << " " << col << " " << source_ids.size();
-      for (const ImageId source_id : source_ids) {
-        file << " " << source_id;
-      }
-      file << "\n";
-    }
-  }
-}
-
 std::vector<const mvs::ImageMvsSummary*> CollectPatchMatchSummaries(
     const mvs::MvsPipelineSummary& summary) {
   std::vector<const mvs::ImageMvsSummary*> image_summaries;
@@ -1080,6 +1069,7 @@ struct PatchMatchRefinementJob {
   std::vector<mvs::PatchMatchView> source_views;
   std::vector<mvs::MvsImage> source_images;
   std::vector<std::size_t> source_result_indices;
+  mvs::NormalMap initial_normal_map;
   float min_depth = 0.0F;
   float max_depth = 0.0F;
 };
@@ -1090,7 +1080,7 @@ struct PatchMatchRefinementResult {
 };
 
 PatchMatchRefinementResult RunPatchMatchRefinementJob(
-    const PatchMatchRefinementJob& job,
+    PatchMatchRefinementJob job,
     const std::vector<mvs::DenseDepthMap>& initial_depth_maps,
     const mvs::PatchMatchStereoOptions& refinement_options,
     mvs::CudaPatchMatchWorkspace* cuda_workspace,
@@ -1103,11 +1093,14 @@ PatchMatchRefinementResult RunPatchMatchRefinementJob(
   for (const std::size_t source_result_index : job.source_result_indices) {
     source_depth_maps.push_back(initial_depth_maps.at(source_result_index));
   }
+  mvs::PatchMatchMaps initial_maps;
+  initial_maps.depth_map = initial_depth_maps.at(job.result_index);
+  initial_maps.normal_map = std::move(job.initial_normal_map);
   output.result =
       mvs::RunPatchMatchStereoForImageWithSourceDepthsAndCudaWorkspace(
           job.reference_view, job.source_views, job.reference_image,
           job.source_images, source_depth_maps, job.min_depth,
-          job.max_depth, cuda_workspace, refinement_options);
+          job.max_depth, cuda_workspace, refinement_options, &initial_maps);
   if (output.result.summary.actual_backend == mvs::PatchMatchBackend::kCuda &&
       cuda_workspace_pool_size > 0) {
     output.result.summary.cuda_workspace_pool_size =
@@ -1119,7 +1112,7 @@ PatchMatchRefinementResult RunPatchMatchRefinementJob(
 }
 
 std::vector<PatchMatchRefinementResult> RunPatchMatchRefinementJobs(
-    const std::vector<PatchMatchRefinementJob>& jobs,
+    std::vector<PatchMatchRefinementJob>* jobs,
     const std::vector<mvs::DenseDepthMap>& initial_depth_maps,
     const mvs::PatchMatchStereoOptions& refinement_options,
     const ReconMvsControllerOptions& cli_options,
@@ -1127,7 +1120,7 @@ std::vector<PatchMatchRefinementResult> RunPatchMatchRefinementJobs(
     PatchMatchSchedulingSummary* scheduling_summary) {
   const ControllerClock::time_point batch_start = ControllerClock::now();
   std::vector<PatchMatchRefinementResult> outputs;
-  outputs.reserve(jobs.size());
+  outputs.reserve(jobs->size());
   const std::size_t num_threads =
       std::max<std::size_t>(1, cli_options.num_threads);
   const auto collect_oldest_future =
@@ -1142,41 +1135,41 @@ std::vector<PatchMatchRefinementResult> RunPatchMatchRefinementJobs(
     std::vector<std::future<PatchMatchRefinementResult>> futures;
     futures.reserve(pool_size);
     std::size_t next_slot = 0;
-    for (const PatchMatchRefinementJob& job : jobs) {
+    for (PatchMatchRefinementJob& job : *jobs) {
       if (futures.size() >= pool_size) {
         collect_oldest_future(&futures);
       }
       const std::size_t slot = next_slot;
       next_slot = (next_slot + 1) % pool_size;
-      const PatchMatchRefinementJob* job_ptr = &job;
       futures.push_back(std::async(
           std::launch::async,
-          [job_ptr, &initial_depth_maps, &refinement_options,
-           &cuda_workspace_pool, pool_size, slot]() {
+          [job = std::move(job), &initial_depth_maps, &refinement_options,
+           &cuda_workspace_pool, pool_size, slot]() mutable {
             return RunPatchMatchRefinementJob(
-                *job_ptr, initial_depth_maps, refinement_options,
+                std::move(job), initial_depth_maps, refinement_options,
                 cuda_workspace_pool[slot], pool_size, slot);
           }));
     }
     while (!futures.empty()) {
       collect_oldest_future(&futures);
     }
-  } else if (num_threads == 1 || jobs.size() <= 1) {
-    for (const PatchMatchRefinementJob& job : jobs) {
+  } else if (num_threads == 1 || jobs->size() <= 1) {
+    for (PatchMatchRefinementJob& job : *jobs) {
       outputs.push_back(RunPatchMatchRefinementJob(
-          job, initial_depth_maps, refinement_options, nullptr, 0, 0));
+          std::move(job), initial_depth_maps, refinement_options,
+          nullptr, 0, 0));
     }
   } else {
     std::vector<std::future<PatchMatchRefinementResult>> futures;
     futures.reserve(num_threads);
-    for (const PatchMatchRefinementJob& job : jobs) {
-      const PatchMatchRefinementJob* job_ptr = &job;
+    for (PatchMatchRefinementJob& job : *jobs) {
       futures.push_back(std::async(
           std::launch::async,
-          [job_ptr, &initial_depth_maps, &refinement_options]() {
+          [job = std::move(job), &initial_depth_maps,
+           &refinement_options]() mutable {
             return RunPatchMatchRefinementJob(
-                *job_ptr, initial_depth_maps, refinement_options, nullptr, 0,
-                0);
+                std::move(job), initial_depth_maps, refinement_options,
+                nullptr, 0, 0);
           }));
       if (futures.size() >= num_threads) {
         collect_oldest_future(&futures);
@@ -1198,12 +1191,17 @@ std::vector<PatchMatchRefinementResult> RunPatchMatchRefinementJobs(
         sum_cuda_time_ms += output.result.summary.cuda_total_time_ms;
       }
     }
-    FillOverlapSummary(
-        wall_time_ms, sum_cuda_time_ms,
-        &scheduling_summary->refinement_wall_time_ms,
-        &scheduling_summary->refinement_sum_cuda_time_ms,
-        &scheduling_summary->refinement_overlap_saved_time_ms,
-        &scheduling_summary->refinement_overlap_ratio);
+    const double overlap_saved_time_ms =
+        std::max(0.0, sum_cuda_time_ms - wall_time_ms);
+    scheduling_summary->refinement_wall_time_ms += wall_time_ms;
+    scheduling_summary->refinement_sum_cuda_time_ms += sum_cuda_time_ms;
+    scheduling_summary->refinement_overlap_saved_time_ms +=
+        overlap_saved_time_ms;
+    scheduling_summary->refinement_overlap_ratio =
+        scheduling_summary->refinement_sum_cuda_time_ms > 0.0
+            ? scheduling_summary->refinement_overlap_saved_time_ms /
+                  scheduling_summary->refinement_sum_cuda_time_ms
+            : 0.0;
   }
   return outputs;
 }
@@ -1211,18 +1209,18 @@ std::vector<PatchMatchRefinementResult> RunPatchMatchRefinementJobs(
 void WriteFusedPointCloudPly(const std::filesystem::path& path,
                              const std::vector<mvs::FusedPoint>& points) {
   std::filesystem::create_directories(path.parent_path());
-  std::ofstream file(path);
+  std::ofstream file(path, std::ios::binary);
   if (!file) {
     throw std::runtime_error("Failed to write fused point cloud: " +
                              path.string());
   }
 
   file << "ply\n"
-       << "format ascii 1.0\n"
+       << "format binary_little_endian 1.0\n"
        << "element vertex " << points.size() << "\n"
-       << "property double x\n"
-       << "property double y\n"
-       << "property double z\n"
+       << "property float x\n"
+       << "property float y\n"
+       << "property float z\n"
        << "property float nx\n"
        << "property float ny\n"
        << "property float nz\n"
@@ -1230,14 +1228,23 @@ void WriteFusedPointCloudPly(const std::filesystem::path& path,
        << "property uchar green\n"
        << "property uchar blue\n"
        << "end_header\n";
-  file << std::setprecision(17);
   for (const mvs::FusedPoint& point : points) {
-    file << point.xyz.x() << " " << point.xyz.y() << " " << point.xyz.z()
-         << " " << point.normal.x() << " " << point.normal.y() << " "
-         << point.normal.z() << " "
-         << static_cast<int>(point.color.x()) << " "
-         << static_cast<int>(point.color.y()) << " "
-         << static_cast<int>(point.color.z()) << "\n";
+    const std::array<float, 6> values = {
+        static_cast<float>(point.xyz.x()),
+        static_cast<float>(point.xyz.y()),
+        static_cast<float>(point.xyz.z()),
+        point.normal.x(),
+        point.normal.y(),
+        point.normal.z(),
+    };
+    file.write(reinterpret_cast<const char*>(values.data()),
+               static_cast<std::streamsize>(sizeof(values)));
+    file.write(reinterpret_cast<const char*>(point.color.data()),
+               static_cast<std::streamsize>(3 * sizeof(std::uint8_t)));
+    if (!file) {
+      throw std::runtime_error("Failed while writing fused point cloud: " +
+                               path.string());
+    }
   }
 }
 
@@ -1255,6 +1262,8 @@ void WriteDenseCloudFilterStats(
        << "num_filtered_points " << stats.num_filtered_points << "\n"
        << "num_removed_by_track_observations "
        << stats.num_removed_by_track_observations << "\n"
+       << "num_removed_by_spatial_bounds "
+       << stats.num_removed_by_spatial_bounds << "\n"
        << "num_removed_by_voxel " << stats.num_removed_by_voxel << "\n";
 }
 
@@ -1447,7 +1456,13 @@ std::size_t RunPatchMatchForWorkspace(
       mvs::PatchMatchBackendFromName(cli_options.patch_match_backend);
   patch_match_options.cuda_gpu_index = cli_options.patch_match_gpu_index;
   patch_match_options.initialization.random_seed = cli_options.random_seed;
+  patch_match_options.initialization.randomize_initial_normals =
+      cli_options.patch_match_randomize_initial_normals;
+  patch_match_options.initialization.initial_normal_hemisphere_degrees =
+      cli_options.patch_match_initial_normal_hemisphere_degrees;
   patch_match_options.perturbation.random_seed = cli_options.random_seed + 7919;
+  patch_match_options.perturbation.normal_radius_degrees =
+      cli_options.patch_match_normal_perturbation_degrees;
   patch_match_options.num_iterations = cli_options.patch_match_iterations;
   patch_match_options.pyramid_levels = cli_options.patch_match_pyramid_levels;
   patch_match_options.cost.window_radius = cli_options.patch_match_window_radius;
@@ -1459,7 +1474,8 @@ std::size_t RunPatchMatchForWorkspace(
   patch_match_options.source_selection.dynamic_probability =
       cli_options.patch_match_dynamic_source_selection;
   patch_match_options.source_selection.directional_hmm =
-      cli_options.patch_match_directional_hmm;
+      cli_options.patch_match_directional_hmm ||
+      cli_options.patch_match_dynamic_source_selection;
   patch_match_options.source_selection.num_samples =
       cli_options.patch_match_source_samples;
   patch_match_options.source_selection.ncc_sigma =
@@ -1493,6 +1509,12 @@ std::size_t RunPatchMatchForWorkspace(
   mvs::PatchMatchStereoOptions refinement_options = patch_match_options;
   refinement_options.num_iterations =
       cli_options.patch_match_geometric_refinement_iterations;
+  // Keep the requested photometric pyramid unchanged, but use a small
+  // coarse-to-fine hierarchy for geometric refinement. At a single scale,
+  // red-black propagation only travels a few full-resolution pixels and
+  // stalls on large weakly textured surfaces.
+  refinement_options.pyramid_levels =
+      std::max<std::size_t>(3, patch_match_options.pyramid_levels);
   refinement_options.cost.geometric_consistency_weight =
       cli_options.patch_match_geometric_consistency_weight;
   refinement_options.cost.geometric_max_reprojection_error = 3.0F;
@@ -1510,8 +1532,6 @@ std::size_t RunPatchMatchForWorkspace(
   const std::filesystem::path cost_dir = output_path / "stereo" / "cost_maps";
   const std::filesystem::path consistency_dir =
       output_path / "stereo" / "consistency_graphs";
-  const std::filesystem::path colmap_consistency_dir =
-      output_path / "stereo" / "consistency_graphs_colmap";
   std::filesystem::create_directories(output_path / "stereo");
   const bool binary_dense_maps = UseBinaryDenseMaps(cli_options);
 
@@ -1567,20 +1587,10 @@ std::size_t RunPatchMatchForWorkspace(
     }
   }
   num_patch_match_images = results.size();
-  std::vector<ImageId> image_ids_by_mvs_index;
-  image_ids_by_mvs_index.reserve(results.size());
-  for (const PatchMatchWorkspaceResult& result : results) {
-    image_ids_by_mvs_index.push_back(result.image_id);
-  }
-
   if (run_geometric_refinement) {
-    std::vector<mvs::DenseDepthMap> initial_depth_maps;
-    initial_depth_maps.reserve(results.size());
-    for (const PatchMatchWorkspaceResult& result : results) {
-      initial_depth_maps.push_back(result.result.depth_map);
-    }
     std::vector<PatchMatchRefinementJob> refinement_jobs;
     refinement_jobs.reserve(results.size());
+    std::vector<std::uint8_t> refinement_job_by_result(results.size(), 0);
     for (std::size_t result_idx = 0; result_idx < results.size();
          ++result_idx) {
       const PatchMatchWorkspaceResult& result = results[result_idx];
@@ -1603,16 +1613,49 @@ std::size_t RunPatchMatchForWorkspace(
       if (job.source_views.empty()) {
         continue;
       }
+      // Each reference normal map is used by exactly one refinement job.
+      // Transfer ownership into the queued job so completed jobs release the
+      // old map while their replacement result is accumulated. Keeping a
+      // separate all-view normal snapshot doubles the 12-byte-per-pixel
+      // normal working set at large resolutions.
+      job.initial_normal_map =
+          std::move(results[result_idx].result.normal_map);
+      refinement_job_by_result[result_idx] = 1;
       refinement_jobs.push_back(std::move(job));
     }
-    std::vector<PatchMatchRefinementResult> refinement_results =
-        RunPatchMatchRefinementJobs(
-            refinement_jobs, initial_depth_maps, refinement_options,
-            cli_options, cuda_workspace_ptrs, scheduling_summary_out);
-    for (PatchMatchRefinementResult& refinement_result :
-         refinement_results) {
-      results[refinement_result.result_index].result =
-          std::move(refinement_result.result);
+
+    // A single inherited geometric pass already runs the configured inner
+    // iterations over a three-level coarse-to-fine pyramid. A second outer
+    // synchronization pass has little accuracy benefit but nearly doubles the
+    // large-image refinement time and transfers, so keep the photometric
+    // result as the immutable source snapshot for one inherited pass.
+    constexpr std::size_t kGeometricRefinementPasses = 1;
+    for (std::size_t pass = 0; pass < kGeometricRefinementPasses; ++pass) {
+      std::vector<mvs::DenseDepthMap> source_depth_snapshot;
+      source_depth_snapshot.reserve(results.size());
+      for (std::size_t result_idx = 0; result_idx < results.size();
+           ++result_idx) {
+        PatchMatchWorkspaceResult& result = results[result_idx];
+        // Refinement consumes the previous pass only as source depth. Move
+        // those maps into the immutable pass snapshot instead of keeping a
+        // second full-resolution copy beside the newly produced maps.
+        if (refinement_job_by_result[result_idx] != 0) {
+          source_depth_snapshot.push_back(
+              std::move(result.result.depth_map));
+        } else {
+          source_depth_snapshot.push_back(result.result.depth_map);
+        }
+      }
+      std::vector<PatchMatchRefinementResult> refinement_results =
+          RunPatchMatchRefinementJobs(
+              &refinement_jobs, source_depth_snapshot,
+              refinement_options, cli_options,
+              cuda_workspace_ptrs, scheduling_summary_out);
+      for (PatchMatchRefinementResult& refinement_result :
+           refinement_results) {
+        results[refinement_result.result_index].result =
+            std::move(refinement_result.result);
+      }
     }
 
     total_photometric_filtered_pixels = 0;
@@ -1650,68 +1693,117 @@ std::size_t RunPatchMatchForWorkspace(
     geometric_options.max_relative_depth_error =
         cli_options.geometric_max_relative_depth_error;
 
-    // Every consistency graph must observe the same unfiltered geometric
-    // refinement result. Filtering results in-place while iterating makes the
-    // output depend on image order and causes invalid pixels to cascade into
-    // later source-depth lookups.
-    std::vector<mvs::DenseDepthMap> geometric_source_depth_maps;
-    geometric_source_depth_maps.reserve(results.size());
-    for (const PatchMatchWorkspaceResult& result : results) {
-      geometric_source_depth_maps.push_back(result.result.depth_map);
-    }
-
-    std::vector<mvs::ConsistencyGraph> geometric_graphs;
-    geometric_graphs.reserve(results.size());
-
-    for (const PatchMatchWorkspaceResult& result : results) {
-      std::vector<mvs::PatchMatchView> source_views;
-      std::vector<mvs::DenseDepthMap> source_depth_maps;
-      for (const ImageId source_id : result.source_image_ids) {
-        const auto it = result_index_by_image_id.find(source_id);
-        if (it == result_index_by_image_id.end()) {
-          continue;
-        }
-        const PatchMatchWorkspaceResult& source_result = results[it->second];
-        source_views.push_back(source_result.view);
-        source_depth_maps.push_back(geometric_source_depth_maps[it->second]);
-      }
-      geometric_graphs.push_back(mvs::ComputeGeometricConsistencyGraph(
-          result.view, source_views,
-          geometric_source_depth_maps[result_index_by_image_id.at(
-              result.image_id)],
-          source_depth_maps, geometric_options));
-    }
-
+    // Compute and persist one compact graph at a time while every depth map is
+    // still unfiltered. A second streaming pass applies the graph masks. This
+    // keeps the result order-independent without retaining a second copy of
+    // all depth maps or all consistency graphs in memory.
+    const ControllerClock::time_point graph_build_start =
+        ControllerClock::now();
+    const std::size_t graph_num_threads =
+        std::max<std::size_t>(1, cli_options.num_threads);
+    std::vector<std::future<void>> graph_futures;
+    graph_futures.reserve(graph_num_threads);
+    const auto collect_oldest_graph_future = [&graph_futures]() {
+      graph_futures.front().get();
+      graph_futures.erase(graph_futures.begin());
+    };
     for (std::size_t result_idx = 0; result_idx < results.size();
          ++result_idx) {
-      PatchMatchWorkspaceResult& result = results[result_idx];
-      mvs::ConsistencyGraph& graph = geometric_graphs[result_idx];
-      result.geometric_consistent_pixels = graph.NumConsistentPixels(1);
-      total_geometric_consistent_pixels +=
-          result.geometric_consistent_pixels;
-      if (cli_options.filter_geometric_min_num_consistent_sources > 0) {
-        const mvs::PatchMatchGeometricFilterSummary geometric_filter =
-            mvs::FilterPatchMatchGeometricResults(
-                graph,
-                cli_options.filter_geometric_min_num_consistent_sources,
-                &result.result.depth_map, &result.result.normal_map,
-                &result.result.cost_map);
-        result.geometric_filtered_pixels =
-            geometric_filter.num_filtered_pixels;
-        total_geometric_filtered_pixels +=
-            result.geometric_filtered_pixels;
+      if (graph_futures.size() >= graph_num_threads) {
+        collect_oldest_graph_future();
       }
-      result.consistency_graph = graph;
-      mvs::WriteConsistencyGraphColmapBinary(
-          colmap_consistency_dir / result.dense_file_name, graph,
-          image_ids_by_mvs_index);
-      if (binary_dense_maps) {
-        mvs::WriteConsistencyGraphBinary(
-            consistency_dir / result.dense_file_name, graph);
-      } else {
-        WriteConsistencyGraphText(consistency_dir / result.text_file_name,
-                                  graph);
+      graph_futures.push_back(std::async(
+          std::launch::async,
+          [result_idx, &results, &result_index_by_image_id,
+           &geometric_options, &consistency_dir]() {
+            const PatchMatchWorkspaceResult& result = results[result_idx];
+            std::vector<mvs::PatchMatchView> source_views;
+            std::vector<const mvs::DenseDepthMap*> source_depth_maps;
+            source_views.reserve(result.source_image_ids.size());
+            source_depth_maps.reserve(result.source_image_ids.size());
+            for (const ImageId source_id : result.source_image_ids) {
+              const auto it = result_index_by_image_id.find(source_id);
+              if (it == result_index_by_image_id.end()) {
+                continue;
+              }
+              const PatchMatchWorkspaceResult& source_result =
+                  results[it->second];
+              source_views.push_back(source_result.view);
+              source_depth_maps.push_back(&source_result.result.depth_map);
+            }
+            const mvs::ConsistencyGraph graph =
+                mvs::ComputeGeometricConsistencyGraph(
+                    result.view, source_views, result.result.depth_map,
+                    source_depth_maps, geometric_options);
+            mvs::WriteConsistencyGraphBinary(
+                consistency_dir / (result.image.name + ".bin"), graph);
+          }));
+    }
+    while (!graph_futures.empty()) {
+      collect_oldest_graph_future();
+    }
+    if (scheduling_summary_out != nullptr) {
+      scheduling_summary_out->consistency_graph_build_write_time_ms =
+          std::chrono::duration<double, std::milli>(
+              ControllerClock::now() - graph_build_start)
+              .count();
+    }
+
+    const ControllerClock::time_point graph_filter_start =
+        ControllerClock::now();
+    std::vector<std::future<std::pair<std::size_t, std::size_t>>>
+        filter_futures;
+    filter_futures.reserve(graph_num_threads);
+    const auto collect_oldest_filter_future =
+        [&filter_futures, &total_geometric_consistent_pixels,
+         &total_geometric_filtered_pixels]() {
+          const auto [consistent_pixels, filtered_pixels] =
+              filter_futures.front().get();
+          filter_futures.erase(filter_futures.begin());
+          total_geometric_consistent_pixels += consistent_pixels;
+          total_geometric_filtered_pixels += filtered_pixels;
+        };
+    for (std::size_t result_idx = 0; result_idx < results.size();
+         ++result_idx) {
+      if (filter_futures.size() >= graph_num_threads) {
+        collect_oldest_filter_future();
       }
+      filter_futures.push_back(std::async(
+          std::launch::async,
+          [result_idx, &results, &consistency_dir, &cli_options]() {
+            PatchMatchWorkspaceResult& result = results[result_idx];
+            mvs::ConsistencyGraph graph = mvs::ReadConsistencyGraphBinary(
+                consistency_dir / (result.image.name + ".bin"));
+            result.geometric_consistent_pixels =
+                graph.NumConsistentPixels(1);
+            if (cli_options
+                    .filter_geometric_min_num_consistent_sources > 0) {
+              const mvs::PatchMatchGeometricFilterSummary geometric_filter =
+                  mvs::FilterPatchMatchGeometricResults(
+                      graph,
+                      cli_options
+                          .filter_geometric_min_num_consistent_sources,
+                      &result.result.depth_map, &result.result.normal_map,
+                      &result.result.cost_map);
+              result.geometric_filtered_pixels =
+                  geometric_filter.num_filtered_pixels;
+            }
+            // The native CSR graph is the canonical persisted
+            // representation. COLMAP-format compatibility output can be
+            // produced explicitly by a conversion tool; writing both here
+            // doubles graph I/O and disk usage.
+            return std::make_pair(result.geometric_consistent_pixels,
+                                  result.geometric_filtered_pixels);
+          }));
+    }
+    while (!filter_futures.empty()) {
+      collect_oldest_filter_future();
+    }
+    if (scheduling_summary_out != nullptr) {
+      scheduling_summary_out->consistency_graph_read_filter_time_ms =
+          std::chrono::duration<double, std::milli>(
+              ControllerClock::now() - graph_filter_start)
+              .count();
     }
   }
 
@@ -1759,6 +1851,8 @@ std::size_t RunPatchMatchForWorkspace(
         cli_options.fusion_max_view_angle_degrees;
     fusion_options.source_pixel_search_radius =
         cli_options.fusion_source_pixel_search_radius;
+    fusion_options.skip_completed_reference_views = true;
+    fusion_options.collect_diagnostics = cli_options.fusion_diagnostics;
     const mvs::StereoFusionResult fusion = mvs::FuseStereoDepthMaps(
         fusion_views, fusion_images, fusion_depth_maps, fusion_normal_maps,
         fusion_cost_maps, fusion_graphs, fusion_options);
@@ -1768,17 +1862,19 @@ std::size_t RunPatchMatchForWorkspace(
     mvs::WritePointsVisibilityColmapBinary(
         output_path / "dense" / "points_visibility.bin",
         fusion.points_visibility);
-    WriteFusionTracksDiagnostics(output_path / "dense" / "fusion_tracks.tsv",
-                                  fusion.tracks);
-    WriteFusionImagePairsDiagnostics(
-        output_path / "dense" / "fusion_image_pairs.tsv",
-        fusion.pair_diagnostics);
+    if (cli_options.fusion_diagnostics) {
+      WriteFusionTracksDiagnostics(
+          output_path / "dense" / "fusion_tracks.tsv", fusion.tracks);
+      WriteFusionImagePairsDiagnostics(
+          output_path / "dense" / "fusion_image_pairs.tsv",
+          fusion.pair_diagnostics);
+      WriteFusionErrorDistribution(
+          output_path / "dense" / "fusion_error_distribution.tsv",
+          fusion.error_samples);
+    }
     WriteFusionTrackLengthHistogram(
         output_path / "dense" / "fusion_track_lengths.tsv",
         fusion.tracks);
-    WriteFusionErrorDistribution(
-        output_path / "dense" / "fusion_error_distribution.tsv",
-        fusion.error_samples);
     mvs::WriteFusionTrackQualityStats(
         output_path / "dense" / "fusion_summary.txt",
         mvs::ComputeFusionTrackQualityStats(fusion.tracks));
@@ -1898,6 +1994,8 @@ std::size_t RunPatchMatchForWorkspace(
       filter_options.max_normal_angle_degrees =
           cli_options.fusion_max_normal_error_degrees;
       filter_options.voxel_size = cli_options.dense_cloud_voxel_size;
+      filter_options.spatial_bounds_quantile =
+          cli_options.dense_cloud_spatial_bounds_quantile;
       const mvs::DenseCloudFilterResult clean_cloud =
           mvs::FilterDenseCloudWithStats(fusion.points, fusion.tracks,
                                          filter_options);
@@ -1932,6 +2030,8 @@ std::size_t RunPatchMatchForWorkspace(
     }
   }
 
+  const ControllerClock::time_point dense_output_start =
+      ControllerClock::now();
   std::ofstream diagnostics(output_path / "stereo" / "patch_match.tsv");
   diagnostics << "image_id\trequested_backend\tactual_backend"
               << "\tpyramid_levels\titerations"
@@ -2023,7 +2123,8 @@ std::size_t RunPatchMatchForWorkspace(
               << "\tmax_cost_after_filter"
               << "\tgeometric_consistent_pixels"
               << "\tgeometric_filtered_pixels"
-              << "\tfinal_valid_cost_pixels\n";
+              << "\tfinal_valid_cost_pixels"
+              << "\tdepth_min\tdepth_max\n";
   for (const PatchMatchWorkspaceResult& result : results) {
     const mvs::PatchMatchPhotometricStats final_stats =
         mvs::ComputePatchMatchPhotometricStats(result.result.cost_map);
@@ -2031,8 +2132,13 @@ std::size_t RunPatchMatchForWorkspace(
                        result.result.depth_map, binary_dense_maps);
     WriteNormalMap(normal_dir / result.dense_file_name,
                    result.result.normal_map, binary_dense_maps);
-    mvs::WriteDenseCostMapText(cost_dir / result.text_file_name,
-                               result.result.cost_map);
+    if (binary_dense_maps) {
+      mvs::WriteDenseCostMapBinary(cost_dir / result.dense_file_name,
+                                   result.result.cost_map);
+    } else {
+      mvs::WriteDenseCostMapText(cost_dir / result.text_file_name,
+                                 result.result.cost_map);
+    }
     diagnostics << result.image_id << "\t"
                 << mvs::PatchMatchBackendToName(
                        result.result.summary.requested_backend)
@@ -2257,7 +2363,15 @@ std::size_t RunPatchMatchForWorkspace(
                 << FormatStat(result.stats_after_photometric_filter.max_cost)
                 << "\t" << result.geometric_consistent_pixels << "\t"
                 << result.geometric_filtered_pixels << "\t"
-                << final_stats.num_valid_cost_pixels << "\n";
+                << final_stats.num_valid_cost_pixels << "\t"
+                << FormatStat(result.min_depth) << "\t"
+                << FormatStat(result.max_depth) << "\n";
+  }
+  if (scheduling_summary_out != nullptr) {
+    scheduling_summary_out->dense_map_output_time_ms =
+        std::chrono::duration<double, std::milli>(
+            ControllerClock::now() - dense_output_start)
+            .count();
   }
 
   if (num_photometric_filtered_pixels != nullptr) {
@@ -2283,63 +2397,153 @@ mvs::StereoFusionSummary FusePersistedStereoMaps(
     const ReconMvsControllerOptions& cli_options,
     const Reconstruction& reconstruction,
     const mvs::MvsPipelineSummary& summary) {
+  const auto total_start = ControllerClock::now();
+  const auto elapsed_ms = [](const ControllerClock::time_point start) {
+    return std::chrono::duration<double, std::milli>(
+               ControllerClock::now() - start)
+        .count();
+  };
   mvs::MvsImageWorkspaceOptions workspace_options;
   workspace_options.image_path = cli_options.image_path;
   workspace_options.max_cache_entries = cli_options.image_cache_size;
   workspace_options.max_image_size = cli_options.max_image_size;
   workspace_options.resolution_level = cli_options.resolution_level;
+  workspace_options.load_gray = false;
+  workspace_options.load_color = true;
   mvs::MvsImageWorkspace workspace(reconstruction, workspace_options);
 
   const std::vector<const mvs::ImageMvsSummary*> image_summaries =
       CollectPatchMatchSummaries(summary);
-  const std::vector<ImageId> required_image_ids =
-      CollectRequiredMvsImageIds(image_summaries);
-  const auto images = PreloadMvsImages(required_image_ids, &workspace);
-  const auto views = BuildPatchMatchViews(reconstruction, images);
+  std::vector<ImageId> image_ids;
+  std::vector<std::string> image_names;
+  std::vector<mvs::PatchMatchView> fusion_views;
+  image_ids.reserve(image_summaries.size());
+  image_names.reserve(image_summaries.size());
+  fusion_views.reserve(image_summaries.size());
+  for (const mvs::ImageMvsSummary* image_summary : image_summaries) {
+    const mvs::MvsImage image = workspace.GetImage(image_summary->image_id);
+    image_ids.push_back(image_summary->image_id);
+    image_names.push_back(image.name);
+    fusion_views.push_back(MakePatchMatchView(
+        reconstruction, image_summary->image_id, image.scale));
+  }
+  const double image_loading_ms = elapsed_ms(total_start);
   const bool binary = UseBinaryDenseMaps(cli_options);
 
-  std::vector<mvs::PatchMatchView> fusion_views;
-  std::vector<mvs::MvsImage> fusion_images;
-  std::vector<mvs::DenseDepthMap> depth_maps;
-  std::vector<mvs::NormalMap> normal_maps;
-  std::vector<mvs::DenseCostMap> cost_maps;
-  std::vector<mvs::ConsistencyGraph> consistency_graphs;
-  std::vector<ImageId> image_ids;
-  for (const auto* image_summary : image_summaries) {
-    const mvs::MvsImage& image = images.at(image_summary->image_id);
-    const std::string dense_name =
-        DenseMapFileName(image.name, false, binary);
-    const auto depth_path = output_path / "stereo" / "depth_maps" / dense_name;
-    const auto normal_path = output_path / "stereo" / "normal_maps" / dense_name;
-    const auto cost_path = output_path / "stereo" / "cost_maps" /
-                           (image.name + ".txt");
-    fusion_views.push_back(views.at(image_summary->image_id));
-    fusion_images.push_back(image);
-    depth_maps.push_back(binary ? mvs::ReadDenseDepthMapBinary(depth_path)
-                                : mvs::ReadDenseDepthMapText(depth_path));
-    normal_maps.push_back(binary ? mvs::ReadNormalMapBinary(normal_path)
-                                 : mvs::ReadNormalMapText(normal_path));
-    cost_maps.push_back(mvs::ReadDenseCostMapText(cost_path));
-    image_ids.push_back(image_summary->image_id);
+  struct CacheEntry {
+    std::shared_ptr<const mvs::StereoFusionViewData> data;
+    std::list<std::size_t>::iterator lru_it;
+  };
+  std::mutex cache_mutex;
+  std::list<std::size_t> cache_lru;
+  std::unordered_map<std::size_t, CacheEntry> view_cache;
+  std::unordered_map<
+      std::size_t,
+      std::weak_ptr<const mvs::StereoFusionViewData>>
+      loaded_views;
+  const std::size_t view_cache_capacity =
+      std::max<std::size_t>(1, cli_options.image_cache_size);
+  std::vector<std::unique_ptr<std::mutex>> view_load_mutexes;
+  view_load_mutexes.reserve(image_ids.size());
+  for (std::size_t image_idx = 0; image_idx < image_ids.size(); ++image_idx) {
+    view_load_mutexes.push_back(std::make_unique<std::mutex>());
   }
-  for (std::size_t i = 0; i < fusion_images.size(); ++i) {
+  const auto trim_view_cache = [&]() {
+    while (view_cache.size() > view_cache_capacity) {
+      const std::size_t evicted_idx = cache_lru.back();
+      cache_lru.pop_back();
+      view_cache.erase(evicted_idx);
+    }
+  };
+  const auto find_cached_view =
+      [&](std::size_t image_idx)
+      -> std::shared_ptr<const mvs::StereoFusionViewData> {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    const auto cached = view_cache.find(image_idx);
+    if (cached != view_cache.end()) {
+      cache_lru.splice(cache_lru.begin(), cache_lru,
+                       cached->second.lru_it);
+      return cached->second.data;
+    }
+    const auto loaded = loaded_views.find(image_idx);
+    if (loaded == loaded_views.end()) {
+      return nullptr;
+    }
+    std::shared_ptr<const mvs::StereoFusionViewData> active =
+        loaded->second.lock();
+    if (!active) {
+      return nullptr;
+    }
+    cache_lru.push_front(image_idx);
+    view_cache.emplace(
+        image_idx, CacheEntry{active, cache_lru.begin()});
+    trim_view_cache();
+    return active;
+  };
+  const auto load_view =
+      [&](std::size_t image_idx)
+      -> std::shared_ptr<const mvs::StereoFusionViewData> {
+    if (std::shared_ptr<const mvs::StereoFusionViewData> cached =
+            find_cached_view(image_idx)) {
+      return cached;
+    }
+
+    // Serialize only duplicate loads of the same view. Dense-map and graph
+    // I/O must not hold the global LRU mutex, otherwise one cache miss stalls
+    // every Fusion worker for the full read/parse duration.
+    std::lock_guard<std::mutex> view_load_lock(
+        *view_load_mutexes.at(image_idx));
+    if (std::shared_ptr<const mvs::StereoFusionViewData> cached =
+            find_cached_view(image_idx)) {
+      return cached;
+    }
+
+    auto data = std::make_shared<mvs::StereoFusionViewData>();
+    data->image = workspace.GetImage(image_ids.at(image_idx));
     const std::string dense_name =
-        DenseMapFileName(fusion_images[i].name, false, binary);
+        DenseMapFileName(image_names.at(image_idx), false, binary);
+    const auto depth_path =
+        output_path / "stereo" / "depth_maps" / dense_name;
+    const auto normal_path =
+        output_path / "stereo" / "normal_maps" / dense_name;
+    data->depth_map =
+        binary ? mvs::ReadDenseDepthMapBinary(depth_path)
+               : mvs::ReadDenseDepthMapText(depth_path);
+    data->normal_map =
+        binary ? mvs::ReadNormalMapBinary(normal_path)
+               : mvs::ReadNormalMapText(normal_path);
     const auto native_path = output_path / "stereo" /
-                             "consistency_graphs" / dense_name;
+                             "consistency_graphs" /
+                             (image_names.at(image_idx) + ".bin");
+    const auto legacy_native_path = output_path / "stereo" /
+                                    "consistency_graphs" / dense_name;
     const auto colmap_path = output_path / "stereo" /
                              "consistency_graphs_colmap" / dense_name;
-    if (std::filesystem::exists(native_path) && binary) {
-      consistency_graphs.push_back(
-          mvs::ReadConsistencyGraphBinary(native_path));
+    if (std::filesystem::exists(native_path)) {
+      data->consistency_graph =
+          mvs::ReadConsistencyGraphBinary(native_path);
+    } else if (binary && std::filesystem::exists(legacy_native_path)) {
+      data->consistency_graph =
+          mvs::ReadConsistencyGraphBinary(legacy_native_path);
     } else if (std::filesystem::exists(colmap_path)) {
-      consistency_graphs.push_back(
-          mvs::ReadConsistencyGraphColmapBinary(colmap_path, image_ids));
+      data->consistency_graph =
+          mvs::ReadConsistencyGraphColmapBinary(colmap_path, image_ids);
     } else {
-      consistency_graphs.emplace_back(depth_maps[i].Width(),
-                                      depth_maps[i].Height());
+      data->consistency_graph = mvs::ConsistencyGraph(
+          data->depth_map.Width(), data->depth_map.Height());
     }
-  }
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex);
+      cache_lru.push_front(image_idx);
+      view_cache.emplace(
+          image_idx, CacheEntry{data, cache_lru.begin()});
+      loaded_views[image_idx] = data;
+      trim_view_cache();
+    }
+    return data;
+  };
+  const double dense_map_loading_ms = 0.0;
+  const double consistency_graph_loading_ms = 0.0;
 
   mvs::StereoFusionOptions options;
   options.min_num_consistent_sources =
@@ -2356,26 +2560,87 @@ mvs::StereoFusionSummary FusePersistedStereoMaps(
   options.max_view_angle_degrees = cli_options.fusion_max_view_angle_degrees;
   options.source_pixel_search_radius =
       cli_options.fusion_source_pixel_search_radius;
-  const mvs::StereoFusionResult fusion = mvs::FuseStereoDepthMaps(
-      fusion_views, fusion_images, depth_maps, normal_maps, cost_maps,
-      consistency_graphs, options);
+  options.skip_completed_reference_views = true;
+  // Geometric filtering persists invalid pixels consistently in depth,
+  // normal, and cost maps. Depth and normal are sufficient here, so avoid
+  // reparsing the large text cost maps during standalone fusion.
+  options.require_cost_map = false;
+  options.collect_diagnostics = cli_options.fusion_diagnostics;
+  options.compact_visibility = fusion_views.size() <= 64;
+  const auto fusion_start = ControllerClock::now();
+  const mvs::StereoFusionResult fusion =
+      mvs::FuseStereoDepthMapsWithViewCache(
+          fusion_views, load_view, options);
+  const double fusion_core_ms = elapsed_ms(fusion_start);
+  const auto output_start = ControllerClock::now();
   WriteFusedPointCloudPly(output_path / "dense" / "fused.ply", fusion.points);
-  mvs::WritePointsVisibilityColmapBinary(
-      output_path / "dense" / "points_visibility.bin",
-      fusion.points_visibility);
-  WriteFusionTracksDiagnostics(output_path / "dense" / "fusion_tracks.tsv",
-                                fusion.tracks);
-  WriteFusionImagePairsDiagnostics(
-      output_path / "dense" / "fusion_image_pairs.tsv",
-      fusion.pair_diagnostics);
+  if (!fusion.points_visibility_masks.empty()) {
+    mvs::WritePointsVisibilityColmapBinary(
+        output_path / "dense" / "points_visibility.bin",
+        fusion.points_visibility_masks);
+  } else {
+    mvs::WritePointsVisibilityColmapBinary(
+        output_path / "dense" / "points_visibility.bin",
+        fusion.points_visibility);
+  }
+  if (cli_options.fusion_diagnostics) {
+    WriteFusionTracksDiagnostics(
+        output_path / "dense" / "fusion_tracks.tsv", fusion.tracks);
+    WriteFusionImagePairsDiagnostics(
+        output_path / "dense" / "fusion_image_pairs.tsv",
+        fusion.pair_diagnostics);
+    WriteFusionErrorDistribution(
+        output_path / "dense" / "fusion_error_distribution.tsv",
+        fusion.error_samples);
+  }
   WriteFusionTrackLengthHistogram(
       output_path / "dense" / "fusion_track_lengths.tsv", fusion.tracks);
-  WriteFusionErrorDistribution(
-      output_path / "dense" / "fusion_error_distribution.tsv",
-      fusion.error_samples);
   mvs::WriteFusionTrackQualityStats(
       output_path / "dense" / "fusion_summary.txt",
       mvs::ComputeFusionTrackQualityStats(fusion.tracks));
+  if (cli_options.filter_dense_cloud) {
+    mvs::DenseCloudFilterOptions filter_options;
+    filter_options.min_track_observations =
+        cli_options.dense_cloud_min_track_observations;
+    filter_options.max_normal_angle_degrees =
+        cli_options.fusion_max_normal_error_degrees;
+    filter_options.voxel_size = cli_options.dense_cloud_voxel_size;
+    filter_options.spatial_bounds_quantile =
+        cli_options.dense_cloud_spatial_bounds_quantile;
+    const mvs::DenseCloudFilterResult clean_cloud =
+        mvs::FilterDenseCloudWithStats(fusion.points, fusion.tracks,
+                                       filter_options);
+    WriteFusedPointCloudPly(output_path / "dense" / "fused_clean.ply",
+                            clean_cloud.points);
+    WriteDenseCloudFilterStats(
+        output_path / "dense" / "fused_clean_stats.txt", clean_cloud.stats);
+    if (cli_options.mesh_dense_cloud) {
+      mvs::DenseCloudMeshingOptions mesh_options;
+      mesh_options.max_edge_length = cli_options.mesh_max_edge_length;
+      mesh_options.max_normal_angle_degrees =
+          cli_options.mesh_max_normal_angle_degrees;
+      const mvs::DenseTriangleMesh mesh =
+          mvs::MeshDenseCloud(clean_cloud.points, mesh_options);
+      mvs::WriteDenseTriangleMeshPly(output_path / "dense" / "mesh.ply",
+                                     mesh);
+      mvs::WriteDenseTriangleMeshStats(
+          output_path / "dense" / "mesh_stats.txt",
+          mvs::ComputeDenseTriangleMeshStats(mesh));
+    }
+  }
+  const double output_writing_ms = elapsed_ms(output_start);
+  std::ofstream timing_file(output_path / "dense" / "fusion_timing.txt");
+  if (!timing_file) {
+    throw std::runtime_error("Failed to write fusion timing summary.");
+  }
+  timing_file << std::setprecision(17)
+              << "image_loading_ms " << image_loading_ms << "\n"
+              << "dense_map_loading_ms " << dense_map_loading_ms << "\n"
+              << "consistency_graph_loading_ms "
+              << consistency_graph_loading_ms << "\n"
+              << "fusion_core_ms " << fusion_core_ms << "\n"
+              << "output_writing_ms " << output_writing_ms << "\n"
+              << "total_ms " << elapsed_ms(total_start) << "\n";
   return fusion.summary;
 }
 
@@ -2425,12 +2690,18 @@ int ReconMvsController::Run(std::ostream& out) const {
   PatchMatchSchedulingSummary scheduling_summary;
   mvs::StereoFusionSummary fusion_summary;
   if (cli_options.run_patch_match) {
+    ReconMvsControllerOptions patch_match_options = cli_options;
+    // Persist PatchMatch outputs first, then let all per-view CUDA/host
+    // workspaces and map buffers leave scope before standalone fusion loads
+    // its bounded working set.
+    patch_match_options.fuse_stereo = false;
     num_patch_match_images = RunPatchMatchForWorkspace(
-        output_path, cli_options, reconstruction, summary,
+        output_path, patch_match_options, reconstruction, summary,
         &num_photometric_filtered_pixels, &num_normal_refined_pixels,
         &num_geometric_consistent_pixels, &num_geometric_filtered_pixels,
         &scheduling_summary, &fusion_summary);
-  } else if (cli_options.fuse_stereo) {
+  }
+  if (cli_options.fuse_stereo) {
     fusion_summary = FusePersistedStereoMaps(
         output_path, cli_options, reconstruction, summary);
   }

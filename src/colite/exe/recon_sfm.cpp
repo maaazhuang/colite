@@ -26,8 +26,8 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "\n"
       << "Options:\n"
       << "  --focal_length <px>       Initial focal length. If omitted, use "
-         "JPEG EXIF 35mm focal prior when available, otherwise "
-         "1.2 * max(width, height).\n"
+         "JPEG EXIF 35mm/focal-plane prior when available, otherwise "
+         "1.2 * max(width, height); EXIF values are marked as priors.\n"
       << "  --max_num_features <n>   SIFT feature limit, default 4096.\n"
       << "  --feature_num_threads <n>\n"
          "                            CPU feature extraction threads, default -1 "
@@ -35,7 +35,7 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --feature_extractor <auto|vlsift|cvsift|cuda_opencv|cuda_vlfeat>\n"
          "                            Default auto prefers CUDA OpenCV and "
          "falls back to CPU OpenCV.\n"
-      << "  --matcher <bf|flann>     Descriptor matcher backend, default flann.\n"
+      << "  --matcher <bf|flann|cuda> Descriptor matcher backend, default flann.\n"
       << "  --nearby_match_window <n>\n"
          "                            Relax and re-match neighboring image pairs "
          "within this file-order window, default 0 disables it.\n"
@@ -55,7 +55,7 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
          "threshold, default 8.\n"
       << "  --ba_refine_focal_length <0|1>\n"
          "                            Refine focal length in local/global BA, "
-         "default 0.\n"
+         "default 1.\n"
       << "  --ba_refine_principal_point <0|1>\n"
          "                            Refine principal point in local/global BA, "
          "default 0.\n"
@@ -166,9 +166,11 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--matcher") {
       const std::string matcher = RequireValue(args, &i, arg);
       if (matcher == "bf") {
-        options.use_flann = false;
+        options.matcher_backend = DescriptorMatcherBackend::kBruteForce;
       } else if (matcher == "flann") {
-        options.use_flann = true;
+        options.matcher_backend = DescriptorMatcherBackend::kFlann;
+      } else if (matcher == "cuda") {
+        options.matcher_backend = DescriptorMatcherBackend::kCudaBruteForce;
       } else {
         throw std::invalid_argument("Unsupported matcher: " + matcher);
       }
@@ -225,7 +227,7 @@ controllers::ReconSfmControllerOptions ToControllerOptions(
   controller_options.max_num_features = options.max_num_features;
   controller_options.feature_num_threads = options.feature_num_threads;
   controller_options.feature_backend = options.feature_backend;
-  controller_options.use_flann = options.use_flann;
+  controller_options.matcher_backend = options.matcher_backend;
   controller_options.nearby_match_window = options.nearby_match_window;
   controller_options.nearby_match_ratio = options.nearby_match_ratio;
   controller_options.max_registration_trials_per_image =

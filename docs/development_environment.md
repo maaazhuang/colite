@@ -8,15 +8,23 @@
 |---|---|
 | Windows 工作区 | `D:\Code\CXX\colite` |
 | WSL 路径 | `/mnt/d/Code/CXX/colite` |
-| WSL | Ubuntu 22.04.5 LTS |
+| WSL | Ubuntu 22.04.5 LTS，发行版 `Ubuntu-22.04`，WSL2 |
 | GCC/G++ | 11.4.0 |
 | CMake / Ninja | 3.22.1 / 1.10.1 |
-| CUDA | 13.2，`nvcc 13.2.51` |
-| 验证 GPU | RTX 4070 SUPER，compute capability 8.9 |
+| CUDA | 13.2，`/usr/local/cuda-13.2/bin/nvcc`，`nvcc 13.2.51` |
+| 验证 GPU | RTX 4070 SUPER，compute capability 8.9，驱动 610.74，显存 12,282 MiB |
 | 系统 COLMAP | `/usr/local/bin/colmap`，3.11.0 |
 | 主构建目录 | `build-wsl-colite-cuda` |
 
 项目主线使用 WSL + CMake + Ninja。Windows checkout 便于 IDE 和文件管理；编译、测试、Git 和基准命令优先在 WSL 执行。
+
+当前已验证的 WSL 运行方式为用户 `ma`：
+
+```powershell
+wsl.exe -d Ubuntu-22.04 -u ma -- bash -lc 'export PATH=/usr/local/cuda-13.2/bin:/usr/local/bin:/usr/bin:/bin:/usr/lib/wsl/lib; export LD_LIBRARY_PATH=/usr/local/cuda-13.2/lib64:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu; nvcc -V; nvidia-smi'
+```
+
+Codex/任务调度启动的 WSL 非登录 shell 不一定继承用户登录环境；若 `nvcc` 显示找不到，应显式设置上述 `PATH` 和 `LD_LIBRARY_PATH`。GPU 验证结果为 RTX 4070 SUPER、驱动 610.74、12,282 MiB 显存。
 
 ## 系统依赖
 
@@ -44,7 +52,7 @@ cmake --build --preset wsl-colite-cuda --parallel 2
 ctest --preset wsl-colite-cuda
 ```
 
-该 preset 显式开启：CUDA SIFT、CUDA MVS、SIFT 多线程、AVX2/FMA、Poisson、Delaunay 和测试，CUDA 架构为 89。
+该 preset 显式开启：CUDA SIFT、CUDA 描述子匹配、CUDA MVS、SIFT 多线程、AVX2/FMA、Poisson、Delaunay 和测试，CUDA 架构为 89。
 
 CPU/通用 Release：
 
@@ -85,7 +93,8 @@ nvcc --version
 ```bash
 cmake -S . -B build-wsl-colite-cuda -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DCOLITE_BUILD_TESTS=ON \
-  -DCOLITE_ENABLE_CUDA_SIFT=ON -DCOLITE_ENABLE_CUDA_MVS=ON \
+  -DCOLITE_ENABLE_CUDA_SIFT=ON -DCOLITE_ENABLE_CUDA_MATCHER=ON \
+  -DCOLITE_ENABLE_CUDA_MVS=ON \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.2/bin/nvcc \
   -DCMAKE_CUDA_ARCHITECTURES=89
 ```
@@ -99,7 +108,7 @@ cmake --build build-wsl-colite-cuda --parallel 2
 ctest --test-dir build-wsl-colite-cuda --output-on-failure --parallel 2
 ```
 
-2026-07-18 最近一次 RGB 点云修改后为 289/289 通过，1 个“CUDA 不可用时应失败”的条件测试在 CUDA 可用环境中按设计跳过。
+2026-07-26 CUDA matcher、默认焦距、SfM 并行/缓存、PatchMatch 几何覆盖及 Stereo Fusion 优化后为 301/301，300 个通过，1 个“CUDA 不可用时应失败”的条件测试在 CUDA 可用环境中按设计跳过。House 实测摘要同时记录 `feature_backend cuda_vlfeat`、`cuda_sift_available 1`、`cuda_matcher_available 1` 和 `cpu_threads 8`，不可只根据构建目录名称判断 CUDA 是否启用。
 
 定向测试：
 

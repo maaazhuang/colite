@@ -304,7 +304,12 @@ MatrixRansacResult RunMatrixRansac(const std::size_t num_points,
 
     // One local-optimization step substantially stabilizes the eight-point
     // and homography minimal hypotheses without coupling this module to
-    // OpenCV calib3d.
+    // OpenCV calib3d. As in LO-RANSAC, only locally optimize a hypothesis
+    // that already improves the current support; refining every valid random
+    // sample repeatedly solves and scores the same large inlier set.
+    if (inliers.size() <= best.inlier_indices.size()) {
+      continue;
+    }
     if (inliers.size() >= sample_size) {
       const std::optional<Eigen::Matrix3d> local_model = estimator(inliers);
       if (local_model) {
@@ -414,6 +419,9 @@ MatrixRansacResult RunEssentialRansac(
       }
       model /= norm;
       std::vector<std::size_t> inliers = score_model(model);
+      if (inliers.size() <= best.inlier_indices.size()) {
+        continue;
+      }
       if (inliers.size() >= 8) {
         const std::optional<Eigen::Matrix3d> local =
             EstimateEssentialMatrix(points1, points2, inliers);
@@ -424,9 +432,6 @@ MatrixRansacResult RunEssentialRansac(
             inliers = std::move(local_inliers);
           }
         }
-      }
-      if (inliers.size() <= best.inlier_indices.size()) {
-        continue;
       }
       best.model = model;
       best.inlier_indices = std::move(inliers);

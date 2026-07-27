@@ -106,5 +106,54 @@ TEST(ObservationFilterTest,
   EXPECT_EQ(reconstruction.GetPoint3D(point_a_id).track.Length(), 2U);
 }
 
+TEST(ObservationFilterTest, FiltersOnlyPointsObservedBySelectedImages) {
+  const Camera camera = MakeCamera();
+  const Pose3 pose1 = CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0));
+  const Pose3 pose2 = CameraAt(Eigen::Vector3d(1.0, 0.0, 0.0));
+  const Pose3 pose3 = CameraAt(Eigen::Vector3d(2.0, 0.0, 0.0));
+  const Pose3 pose4 = CameraAt(Eigen::Vector3d(3.0, 0.0, 0.0));
+  const Eigen::Vector3d point_a(0.0, 0.1, 5.0);
+  const Eigen::Vector3d point_b(1.0, -0.1, 5.5);
+
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  Image image1 = MakeRegisteredImage(1, pose1);
+  Image image2 = MakeRegisteredImage(2, pose2);
+  Image image3 = MakeRegisteredImage(3, pose3);
+  Image image4 = MakeRegisteredImage(4, pose4);
+  AddProjectedObservation(camera, pose1, point_a, &image1);
+  AddProjectedObservation(camera, pose2, point_a, &image2);
+  AddProjectedObservation(camera, pose3, point_b, &image3);
+  AddProjectedObservation(camera, pose4, point_b, &image4);
+  image2.points2d[0].xy += Eigen::Vector2d(80.0, 0.0);
+  image4.points2d[0].xy += Eigen::Vector2d(-80.0, 0.0);
+  reconstruction.AddImage(image1);
+  reconstruction.AddImage(image2);
+  reconstruction.AddImage(image3);
+  reconstruction.AddImage(image4);
+
+  Track track_a;
+  track_a.AddElement(1, 0);
+  track_a.AddElement(2, 0);
+  const Point3DId point_a_id = reconstruction.AddPoint3D(point_a, track_a);
+  Track track_b;
+  track_b.AddElement(3, 0);
+  track_b.AddElement(4, 0);
+  const Point3DId point_b_id = reconstruction.AddPoint3D(point_b, track_b);
+
+  ObservationFilterOptions options;
+  options.max_reprojection_error_px = 2.0;
+  options.min_track_length = 2;
+  options.min_triangulation_angle_deg = 0.1;
+  const ObservationFilterSummary summary =
+      FilterObservationsAndPointsInImages(options, {1, 2}, &reconstruction);
+
+  EXPECT_EQ(summary.num_removed_observations, 1U);
+  EXPECT_EQ(summary.num_removed_points, 1U);
+  EXPECT_FALSE(reconstruction.ExistsPoint3D(point_a_id));
+  EXPECT_TRUE(reconstruction.ExistsPoint3D(point_b_id));
+  EXPECT_TRUE(reconstruction.GetImage(4).points2d[0].HasPoint3D());
+}
+
 }  // namespace
 }  // namespace colite

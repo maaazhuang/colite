@@ -28,6 +28,9 @@ struct ReconMvsControllerOptions {
   std::size_t patch_match_iterations = 3;
   std::size_t patch_match_pyramid_levels = 1;
   int patch_match_window_radius = 2;
+  bool patch_match_randomize_initial_normals = true;
+  float patch_match_initial_normal_hemisphere_degrees = 90.0F;
+  float patch_match_normal_perturbation_degrees = 57.2957795F;
   bool patch_match_bilateral_ncc = false;
   float patch_match_sigma_spatial = -1.0F;
   float patch_match_sigma_color = 0.2F;
@@ -60,10 +63,12 @@ struct ReconMvsControllerOptions {
   float fusion_max_relative_depth_error = 0.01F;
   float fusion_max_normal_error_degrees = 10.0F;
   float fusion_max_view_angle_degrees = 180.0F;
-  std::size_t fusion_source_pixel_search_radius = 1;
+  std::size_t fusion_source_pixel_search_radius = 0;
+  bool fusion_diagnostics = false;
   bool filter_dense_cloud = false;
   std::size_t dense_cloud_min_track_observations = 2;
   double dense_cloud_voxel_size = 0.0;
+  double dense_cloud_spatial_bounds_quantile = 0.0;
   bool mesh_dense_cloud = false;
   double mesh_max_edge_length = 0.0;
   double mesh_max_normal_angle_degrees = 30.0;

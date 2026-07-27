@@ -1,12 +1,27 @@
 #pragma once
 
 #include <cstddef>
+#include <map>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "colite/core/match_graph.h"
 #include "colite/core/reconstruction.h"
 
 namespace colite {
+
+// SfM 映射期间 MatchGraph 保持只读。预先构建一次观测对应关系，避免每次局部
+// 三角化都重新扫描并分配完整的 verified correspondence graph。
+struct IncrementalTriangulatorCache {
+  using ObservationKey = std::pair<ImageId, Point2DIdx>;
+  using CorrespondenceAdjacency =
+      std::map<ObservationKey, std::vector<ObservationKey>>;
+
+  explicit IncrementalTriangulatorCache(const MatchGraph& graph);
+
+  CorrespondenceAdjacency correspondence_adjacency;
+};
 
 // 增量三角化参数。命名和默认值参考 COLMAP
 // IncrementalTriangulator::Options。
@@ -49,7 +64,8 @@ IncrementalTriangulatorSummary TriangulateRegisteredImage(
     const MatchGraph& graph,
     ImageId image_id,
     const IncrementalTriangulatorOptions& options,
-    Reconstruction* reconstruction);
+    Reconstruction* reconstruction,
+    const IncrementalTriangulatorCache* cache = nullptr);
 
 // 为一张已注册图像补全已有 3D 点的观测。
 // 若目标图像的 2D 点尚未关联 3D，但它通过 verified match 连接到已注册邻居
@@ -65,6 +81,7 @@ IncrementalTriangulatorSummary CompleteTracksForRegisteredImage(
 IncrementalTriangulatorSummary CompleteAndMergeAllTracks(
     const MatchGraph& graph,
     const IncrementalTriangulatorOptions& options,
-    Reconstruction* reconstruction);
+    Reconstruction* reconstruction,
+    const IncrementalTriangulatorCache* cache = nullptr);
 
 }  // namespace colite

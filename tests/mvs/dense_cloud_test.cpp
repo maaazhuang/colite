@@ -53,6 +53,34 @@ TEST(DenseCloudFilterTest, KeepsOneRepresentativePerVoxel) {
   EXPECT_DOUBLE_EQ(filtered[1].xyz.x(), 0.20);
 }
 
+TEST(DenseCloudFilterTest, RemovesCoordinateWiseSpatialTailsWhenRequested) {
+  std::vector<FusedPoint> points;
+  std::vector<StereoFusionTrack> tracks;
+  for (int i = 0; i < 100; ++i) {
+    points.push_back(MakePoint(static_cast<double>(i), 0.0, 0.0));
+    tracks.emplace_back();
+    tracks.back().point_idx = static_cast<std::size_t>(i);
+    tracks.back().num_observations = 2;
+  }
+  points.push_back(MakePoint(-1000.0, 0.0, 0.0));
+  points.push_back(MakePoint(1000.0, 0.0, 0.0));
+  for (std::size_t i = 100; i < points.size(); ++i) {
+    tracks.emplace_back();
+    tracks.back().point_idx = i;
+    tracks.back().num_observations = 2;
+  }
+
+  DenseCloudFilterOptions options;
+  options.spatial_bounds_quantile = 0.01;
+  const DenseCloudFilterResult filtered =
+      FilterDenseCloudWithStats(points, tracks, options);
+
+  ASSERT_EQ(filtered.points.size(), 100U);
+  EXPECT_EQ(filtered.stats.num_removed_by_spatial_bounds, 2U);
+  EXPECT_DOUBLE_EQ(filtered.points.front().xyz.x(), 0.0);
+  EXPECT_DOUBLE_EQ(filtered.points.back().xyz.x(), 99.0);
+}
+
 TEST(DenseCloudMeshingTest, FourCoplanarPointsProduceTwoTriangles) {
   const std::vector<FusedPoint> points = {
       MakePoint(0.0, 0.0, 0.0), MakePoint(1.0, 0.0, 0.0),

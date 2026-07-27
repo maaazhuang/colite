@@ -201,5 +201,24 @@ TEST(DenseMapIoTest, WritesCostMapAsDebugText) {
   EXPECT_FALSE(loaded.IsValid(0, 1));
 }
 
+TEST(DenseMapIoTest, RoundTripsCostMapAsBinaryFloatData) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() /
+      "colite_cost_map_binary_io_test";
+  std::filesystem::create_directories(root);
+
+  DenseCostMap cost_map(3, 2);
+  cost_map.Set(0, 0, 0.25F);
+  cost_map.Set(1, 2, 0.75F);
+  WriteDenseCostMapBinary(root / "cost.bin", cost_map);
+
+  const DenseCostMap loaded = ReadDenseCostMapBinary(root / "cost.bin");
+  EXPECT_EQ(loaded.Width(), 3U);
+  EXPECT_EQ(loaded.Height(), 2U);
+  EXPECT_FLOAT_EQ(loaded.Get(0, 0), 0.25F);
+  EXPECT_FLOAT_EQ(loaded.Get(1, 2), 0.75F);
+  EXPECT_FALSE(loaded.IsValid(0, 1));
+}
+
 }  // namespace
 }  // namespace colite::mvs

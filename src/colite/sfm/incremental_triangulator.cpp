@@ -222,9 +222,9 @@ void AccumulateTrackUpdates(const IncrementalTriangulatorSummary& update,
   summary->num_merged_observations += update.num_merged_observations;
 }
 
-using ObservationKey = std::pair<ImageId, Point2DIdx>;
+using ObservationKey = IncrementalTriangulatorCache::ObservationKey;
 using CorrespondenceAdjacency =
-    std::map<ObservationKey, std::vector<ObservationKey>>;
+    IncrementalTriangulatorCache::CorrespondenceAdjacency;
 
 CorrespondenceAdjacency BuildCorrespondenceAdjacency(
     const MatchGraph& graph) {
@@ -703,11 +703,16 @@ void MergePointTrack(
 
 }  // namespace
 
+IncrementalTriangulatorCache::IncrementalTriangulatorCache(
+    const MatchGraph& graph)
+    : correspondence_adjacency(BuildCorrespondenceAdjacency(graph)) {}
+
 IncrementalTriangulatorSummary TriangulateRegisteredImage(
     const MatchGraph& graph,
     ImageId image_id,
     const IncrementalTriangulatorOptions& options,
-    Reconstruction* reconstruction) {
+    Reconstruction* reconstruction,
+    const IncrementalTriangulatorCache* cache) {
   IncrementalTriangulatorSummary summary;
   summary.image_id = image_id;
 
@@ -717,8 +722,11 @@ IncrementalTriangulatorSummary TriangulateRegisteredImage(
     return summary;
   }
 
-  const CorrespondenceAdjacency adjacency =
-      BuildCorrespondenceAdjacency(graph);
+  const CorrespondenceAdjacency local_adjacency =
+      cache == nullptr ? BuildCorrespondenceAdjacency(graph)
+                       : CorrespondenceAdjacency{};
+  const CorrespondenceAdjacency& adjacency =
+      cache == nullptr ? local_adjacency : cache->correspondence_adjacency;
   const Image& reference_image = reconstruction->GetImage(image_id);
   for (Point2DIdx point2d_idx = 0;
        point2d_idx < reference_image.points2d.size(); ++point2d_idx) {
@@ -826,14 +834,18 @@ IncrementalTriangulatorSummary CompleteTracksForRegisteredImage(
 IncrementalTriangulatorSummary CompleteAndMergeAllTracks(
     const MatchGraph& graph,
     const IncrementalTriangulatorOptions& options,
-    Reconstruction* reconstruction) {
+    Reconstruction* reconstruction,
+    const IncrementalTriangulatorCache* cache) {
   IncrementalTriangulatorSummary summary;
   if (reconstruction == nullptr) {
     summary.message = "Reconstruction is null";
     return summary;
   }
-  const CorrespondenceAdjacency adjacency =
-      BuildCorrespondenceAdjacency(graph);
+  const CorrespondenceAdjacency local_adjacency =
+      cache == nullptr ? BuildCorrespondenceAdjacency(graph)
+                       : CorrespondenceAdjacency{};
+  const CorrespondenceAdjacency& adjacency =
+      cache == nullptr ? local_adjacency : cache->correspondence_adjacency;
   for (std::size_t iteration = 0;
        iteration < options.max_track_update_iterations; ++iteration) {
     const std::size_t updates_before =
