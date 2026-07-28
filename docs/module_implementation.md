@@ -200,7 +200,18 @@ COLMAP binary 格式，避免每个融合点一次小 vector 分配。默认 180
 
 当前流程：标定视图评分 → 三角形 AABB BVH ray occlusion → 邻域 label smoothing → 同图相邻面 patch → atlas packing → UV/颜色烘焙 → 可选 inpaint 和跨视图颜色校正。
 
-BVH 线段求交排除当前面及共享目标顶点邻面。当前“任意更近遮挡即拒绝”比 COLMAP/CGAL 首交点语义更保守，假阳性较少但有效面召回偏低，是主要剩余差距。大网格应先简化并逐级增加 `visibility_resolution` 和 atlas 上限。
+BVH 线段求交排除当前面及共享目标顶点邻面。大网格应先简化，并根据纹理细节
+逐级增加 atlas 上限。
+
+BVH 遮挡判定使用 `occlusion_relative_tolerance` 作为目标端相对容差：默认
+1% 范围内的近共面交点按重建表面噪声处理，不再把屋顶、地面上的轻微层叠误判
+为遮挡；明显位于目标前方的表面仍拒绝。严格选择后，仅当至少两个边邻面已有
+纹理时，未选择面才会从邻面候选视图中选择一个仍满足完整投影和正面约束的视图。
+
+最终仍没有可靠相机视图的面不再把三个 UV 压到统一灰色 texel。Texturer 为每个
+此类面分配独立小 atlas patch，并对 Poisson/QEM 保留的 RGB 顶点色做重心插值。
+该 fallback 不改变网格拓扑、不穿透遮挡，也不会伪造相机纹理；其目标是消除
+退化 UV 形成的三角形/异形灰色孔洞。
 
 ## I/O 与颜色
 
@@ -211,7 +222,8 @@ BVH 线段求交排除当前面及共享目标顶点邻面。当前“任意更�
 
 ## 已知差距
 
-1. Texturer 保守遮挡导致有效面覆盖低于 COLMAP。
+1. Texturer 的 RGB 顶点色 fallback 能消除退化 UV 孔洞，但细节低于真实相机
+   投影；复杂遮挡场景的真实相机纹理召回和接缝仍需继续与 COLMAP 对齐。
 2. House SfM 的共享 Camera 局部 BA/全模型过滤错误和 guided matching 缺口均已修复；相同 CUDA VLFeat 8192 配置最终为 48,794 点、147,407 observations。与 COLMAP 的剩余差异主要是 descriptor 数、SIFT 实现和相机模型，而不是 GPS。
 3. House GUI High 等价 2400×1597、20 sources、radius 5 配置中，平面单应
    + FP32 ZNCC 将 PatchMatch 从 3537.21 s 降至 772.17 s，比同输入 COLMAP

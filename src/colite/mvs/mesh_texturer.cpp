@@ -1,6 +1,6 @@
 // View selection and atlas construction follow the BSD-licensed COLMAP 4.0
 // mesh texturer at an algorithmic level. This implementation is rewritten for
-// COLITE's camera, image, and mesh types and uses a software depth buffer.
+// COLITE's camera, image, and mesh types and uses software BVH ray occlusion.
 
 #include "colite/mvs/mesh_texturer.h"
 
@@ -79,7 +79,8 @@ class TriangleOcclusionBvh {
   bool IsOccluded(const Eigen::Vector3d& origin,
                   const Eigen::Vector3d& target,
                   std::size_t excluded_face,
-                  int target_vertex) const {
+                  int target_vertex,
+                  double relative_tolerance) const {
     constexpr double kEndpointEpsilon = 1e-4;
     const Eigen::Vector3d direction = target - origin;
     const double distance = direction.norm();
@@ -87,7 +88,13 @@ class TriangleOcclusionBvh {
         distance <= kEndpointEpsilon) {
       return false;
     }
-    const double maximum_t = 1.0 - kEndpointEpsilon / distance;
+    // A noisy reconstructed surface often contains neighboring triangles a
+    // fraction of a percent in front of the target. Treating every such hit
+    // as an occluder leaves isolated untextured triangles on otherwise
+    // continuous roofs and ground planes. Keep true foreground occluders, but
+    // accept intersections inside the configured endpoint-relative band.
+    const double maximum_t =
+        1.0 - std::max(kEndpointEpsilon / distance, relative_tolerance);
     std::vector<int> stack{0};
     while (!stack.empty()) {
       const int node_idx = stack.back();
@@ -290,6 +297,35 @@ Projection ProjectFace(const DenseTriangleMesh& mesh,
   return result;
 }
 
+bool IsFaceProjectable(const DenseTriangleMesh& mesh,
+                       std::size_t face_id,
+                       const PatchMatchView& view,
+                       const MeshTexturingOptions& options) {
+  const Projection projection = ProjectFace(mesh, face_id, view);
+  if (!projection.valid) return false;
+  int visible_vertices = 0;
+  for (const Eigen::Vector2f& pixel : projection.pixels) {
+    if (pixel.x() >= 0.0F && pixel.y() >= 0.0F &&
+        pixel.x() < static_cast<float>(view.camera.width) - 1.0F &&
+        pixel.y() < static_cast<float>(view.camera.height) - 1.0F) {
+      ++visible_vertices;
+    }
+  }
+  if (visible_vertices < options.min_visible_vertices) return false;
+
+  const Eigen::Vector3i& face = mesh.triangles[face_id];
+  const Eigen::Vector3d first = mesh.vertices[face.x()].xyz;
+  const Eigen::Vector3d second = mesh.vertices[face.y()].xyz;
+  const Eigen::Vector3d third = mesh.vertices[face.z()].xyz;
+  Eigen::Vector3d normal = (second - first).cross(third - first);
+  if (normal.squaredNorm() <= 1e-24) return false;
+  normal.normalize();
+  const Eigen::Vector3d centroid = (first + second + third) / 3.0;
+  const Eigen::Vector3d view_direction =
+      (view.cam_from_world.CameraCenter() - centroid).normalized();
+  return normal.dot(view_direction) >= options.min_cos_normal_angle;
+}
+
 Eigen::Vector3f Barycentric(const Eigen::Vector2f& point,
                             const std::array<Eigen::Vector2f, 3>& triangle) {
   const Eigen::Vector2f v0 = triangle[1] - triangle[0];
@@ -348,7 +384,8 @@ std::vector<int> SelectViews(const DenseTriangleMesh& mesh,
       for (int corner = 0; corner < 3; ++corner) {
         if (occlusion_bvh.IsOccluded(camera_center,
                                      mesh.vertices[face[corner]].xyz,
-                                     face_id, face[corner])) {
+                                     face_id, face[corner],
+                                     options.occlusion_relative_tolerance)) {
           occluded = true;
           break;
         }
@@ -402,6 +439,56 @@ std::vector<int> SelectViews(const DenseTriangleMesh& mesh,
     }
     selected = std::move(updated);
   }
+
+  // Strict ray tests can leave isolated, collapsed-UV triangles on a noisy
+  // but continuous reconstructed plane. Fill only holes supported by at least
+  // two textured edge-adjacent faces. Their labels form the candidate set;
+  // choose the valid projection with the largest image area while retaining
+  // image-boundary and front-facing checks. Requiring two supporting faces
+  // prevents expansion from a single silhouette or isolated back surface.
+  for (int iteration = 0;
+       iteration < options.view_selection_smoothing_iterations; ++iteration) {
+    std::vector<int> updated = selected;
+    bool changed = false;
+    for (std::size_t face_id = 0; face_id < selected.size(); ++face_id) {
+      if (selected[face_id] >= 0) continue;
+      std::unordered_map<int, int> candidate_views;
+      int num_selected_neighbors = 0;
+      for (const std::size_t neighbor : adjacency[face_id]) {
+        if (selected[neighbor] >= 0) {
+          ++num_selected_neighbors;
+          candidate_views.emplace(selected[neighbor], 0);
+        }
+      }
+      if (num_selected_neighbors < 2) continue;
+      int best_view = -1;
+      double best_area = -1.0;
+      for (const auto& [view_id, unused] : candidate_views) {
+        (void)unused;
+        if (!IsFaceProjectable(mesh, face_id, views[view_id].geometry,
+                               options)) {
+          continue;
+        }
+        const Projection projection =
+            ProjectFace(mesh, face_id, views[view_id].geometry);
+        const Eigen::Vector2f first =
+            projection.pixels[1] - projection.pixels[0];
+        const Eigen::Vector2f second =
+            projection.pixels[2] - projection.pixels[0];
+        const double area =
+            std::abs(first.x() * second.y() - first.y() * second.x());
+        if (area > best_area) {
+          best_view = view_id;
+          best_area = area;
+        }
+      }
+      if (best_view < 0) continue;
+      updated[face_id] = best_view;
+      changed = true;
+    }
+    selected = std::move(updated);
+    if (!changed) break;
+  }
   return selected;
 }
 
@@ -446,6 +533,26 @@ std::vector<FaceRegion> BuildRegions(
     regions.push_back(std::move(region));
   }
   return regions;
+}
+
+void AppendVertexColorFallbackRegions(
+    const std::vector<int>& selected,
+    std::vector<FaceRegion>* regions) {
+  constexpr float kFallbackTriangleSize = 4.0F;
+  for (std::size_t face_id = 0; face_id < selected.size(); ++face_id) {
+    if (selected[face_id] >= 0) continue;
+    FaceRegion region;
+    region.view_id = -1;
+    region.face_ids.push_back(face_id);
+    region.projections.push_back(
+        {Eigen::Vector2f(0.0F, 0.0F),
+         Eigen::Vector2f(kFallbackTriangleSize, 0.0F),
+         Eigen::Vector2f(0.0F, kFallbackTriangleSize)});
+    region.minimum = Eigen::Vector2f::Zero();
+    region.maximum =
+        Eigen::Vector2f::Constant(kFallbackTriangleSize);
+    regions->push_back(std::move(region));
+  }
 }
 
 bool PackRegions(std::vector<FaceRegion>* regions,
@@ -650,6 +757,7 @@ TexturedTriangleMesh TextureMesh(const DenseTriangleMesh& mesh,
   result.face_view_ids = SelectViews(mesh, views, adjacency, options);
   std::vector<FaceRegion> regions =
       BuildRegions(mesh, views, result.face_view_ids, adjacency);
+  AppendVertexColorFallbackRegions(result.face_view_ids, &regions);
   double atlas_scale = options.texture_scale;
   int atlas_size = options.atlas_size;
   while (!PackRegions(&regions, atlas_size, options.atlas_patch_padding,
@@ -688,10 +796,12 @@ TexturedTriangleMesh TextureMesh(const DenseTriangleMesh& mesh,
                                     options.color_correction_regularization)
           : std::vector<cv::Vec3d>(views.size(), cv::Vec3d(0.0, 0.0, 0.0));
   for (const FaceRegion& region : regions) {
-    const cv::Mat& source = views[region.view_id].image;
+    const cv::Mat* source =
+        region.view_id >= 0 ? &views[region.view_id].image : nullptr;
     for (std::size_t local_face = 0; local_face < region.face_ids.size();
          ++local_face) {
       const std::size_t face_id = region.face_ids[local_face];
+      const Eigen::Vector3i& mesh_face = mesh.triangles[face_id];
       std::array<Eigen::Vector2f, 3> atlas_triangle;
       for (int corner = 0; corner < 3; ++corner) {
         atlas_triangle[corner] =
@@ -727,13 +837,29 @@ TexturedTriangleMesh TextureMesh(const DenseTriangleMesh& mesh,
               weights.x() * region.projections[local_face][0] +
               weights.y() * region.projections[local_face][1] +
               weights.z() * region.projections[local_face][2];
-          if (source_pixel.x() < 0.0F || source_pixel.y() < 0.0F ||
-              source_pixel.x() >= source.cols - 1 ||
-              source_pixel.y() >= source.rows - 1) {
-            continue;
+          cv::Vec3b sampled;
+          cv::Vec3d offset(0.0, 0.0, 0.0);
+          if (source != nullptr) {
+            if (source_pixel.x() < 0.0F || source_pixel.y() < 0.0F ||
+                source_pixel.x() >= source->cols - 1 ||
+                source_pixel.y() >= source->rows - 1) {
+              continue;
+            }
+            sampled = BilinearSample(*source, source_pixel);
+            offset = view_color_offsets[region.view_id];
+          } else {
+            const Eigen::Vector3f color =
+                weights.x() *
+                    mesh.vertices[mesh_face[0]].color.cast<float>() +
+                weights.y() *
+                    mesh.vertices[mesh_face[1]].color.cast<float>() +
+                weights.z() *
+                    mesh.vertices[mesh_face[2]].color.cast<float>();
+            sampled = cv::Vec3b(
+                cv::saturate_cast<std::uint8_t>(color.z()),
+                cv::saturate_cast<std::uint8_t>(color.y()),
+                cv::saturate_cast<std::uint8_t>(color.x()));
           }
-          const cv::Vec3b sampled = BilinearSample(source, source_pixel);
-          const cv::Vec3d& offset = view_color_offsets[region.view_id];
           result.texture_atlas.at<cv::Vec3b>(y, x) = cv::Vec3b(
               cv::saturate_cast<std::uint8_t>(sampled[0] + offset[0]),
               cv::saturate_cast<std::uint8_t>(sampled[1] + offset[1]),

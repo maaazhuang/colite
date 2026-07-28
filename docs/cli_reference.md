@@ -268,6 +268,11 @@ $COLITE mesh_texturer \
 
 重要 `--MeshTextureMapping.` 默认：atlas 4096、max atlas 32768、padding 2、inpaint 5、scale 1、min cosine 0.1、min visible vertices 3、label smoothing 3、visibility resolution 1024、occlusion tolerance 0.01、color correction 1、regularization 0.1。
 
+`occlusion_relative_tolerance=0.01` 允许目标表面 1% 范围内的近共面交点，避免
+重建噪声造成孤立纹理孔洞；不建议在没有 A/B 的情况下继续放宽。没有可靠相机
+视图的面自动使用网格 RGB 顶点色生成非退化 fallback atlas patch，OBJ 仍保留
+全部三角形。
+
 大网格先用 `target_num_triangles=500`、`visibility_resolution=512` 验证，再逐级提高。
 
 ## 组合 MVS
