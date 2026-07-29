@@ -198,7 +198,7 @@ COLMAP binary 格式，避免每个融合点一次小 vector 分配。默认 180
 
 ## Mesh Texturer
 
-当前流程：标定视图评分 → 三角形 AABB BVH ray occlusion → 邻域 label smoothing → 同图相邻面 patch → atlas packing → UV/颜色烘焙 → 可选 inpaint 和跨视图颜色校正。
+当前流程：标定视图评分 → 三角形 AABB BVH ray occlusion → 邻域 label smoothing → 同图相邻面 patch → atlas packing → 全局相机曝光偏移 + 局部 seam 顶点偏移场 → UV/颜色烘焙 → 可选 inpaint。
 
 BVH 线段求交排除当前面及共享目标顶点邻面。大网格应先简化，并根据纹理细节
 逐级增加 atlas 上限。
@@ -213,6 +213,17 @@ BVH 遮挡判定使用 `occlusion_relative_tolerance` 作为目标端相对容�
 该 fallback 不改变网格拓扑、不穿透遮挡，也不会伪造相机纹理；其目标是消除
 退化 UV 形成的三角形/异形灰色孔洞。
 
+跨视图颜色校正分为两级。第一级求每个相机的常量 RGB 偏移，校正整体曝光；
+第二级只在不同视图 patch 的共享边顶点建立带正则的最小二乘残差约束，并在
+三角形内部按重心坐标插值局部偏移，从而处理同一对图像在平面不同位置出现的
+空间变化色差。House 的 seam 采样中，平均/中位 BGR L2 色差分别下降
+23.8%/35.1%，峰值内存基本不变。
+
+该实现依据 Waechter 2014 的全局 seam leveling 能量独立编写，并以
+BSD-3-Clause 的 COLMAP 行为作 A/B。OpenMVS 仅在公开 CLI/论文层面对
+global/local seam leveling、共面 virtual faces、孔洞闭合和 mesh refinement
+进行功能调研；不得复制或改写其 AGPL-3.0 核心源码进入 Colite。
+
 ## I/O 与颜色
 
 - 稀疏 `points3D.txt`/PLY 写真实 `Point3D.color`，不再固定白色。
@@ -223,7 +234,8 @@ BVH 遮挡判定使用 `occlusion_relative_tolerance` 作为目标端相对容�
 ## 已知差距
 
 1. Texturer 的 RGB 顶点色 fallback 能消除退化 UV 孔洞，但细节低于真实相机
-   投影；复杂遮挡场景的真实相机纹理召回和接缝仍需继续与 COLMAP 对齐。
+   投影；全局曝光 + 局部 seam 顶点场已降低跨视图色差，仍未实现局部窄带
+   Poisson seam blending 和共面区域级视图选择。
 2. House SfM 的共享 Camera 局部 BA/全模型过滤错误和 guided matching 缺口均已修复；相同 CUDA VLFeat 8192 配置最终为 48,794 点、147,407 observations。与 COLMAP 的剩余差异主要是 descriptor 数、SIFT 实现和相机模型，而不是 GPS。
 3. House GUI High 等价 2400×1597、20 sources、radius 5 配置中，平面单应
    + FP32 ZNCC 将 PatchMatch 从 3537.21 s 降至 772.17 s，比同输入 COLMAP

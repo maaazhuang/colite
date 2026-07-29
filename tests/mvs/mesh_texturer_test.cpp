@@ -6,6 +6,7 @@
 #include <string>
 
 #include <gtest/gtest.h>
+#include <opencv2/imgproc.hpp>
 
 #include "colite/core/camera.h"
 
@@ -48,6 +49,59 @@ MeshTextureView MakeTextureView() {
     }
   }
   return view;
+}
+
+DenseTriangleMesh MakeTwoViewSeamPlane() {
+  DenseTriangleMesh mesh;
+  for (const Eigen::Vector3d& position :
+       {Eigen::Vector3d(0.0, -1.0, 3.0),
+        Eigen::Vector3d(0.0, 1.0, 3.0),
+        Eigen::Vector3d(-1.9, 0.0, 3.0),
+        Eigen::Vector3d(1.9, 0.0, 3.0)}) {
+    FusedPoint vertex;
+    vertex.xyz = position;
+    vertex.normal = -Eigen::Vector3f::UnitZ();
+    vertex.color =
+        Eigen::Matrix<std::uint8_t, 3, 1>(127, 127, 127);
+    mesh.vertices.push_back(vertex);
+  }
+  mesh.triangles.emplace_back(0, 2, 1);
+  mesh.triangles.emplace_back(0, 1, 3);
+  return mesh;
+}
+
+MeshTextureView MakeShiftedGradientView(double camera_center_x,
+                                        bool reverse_gradient) {
+  MeshTextureView view = MakeTextureView();
+  view.geometry.cam_from_world.t_cw =
+      Eigen::Vector3d(-camera_center_x, 0.0, 0.0);
+  for (int y = 0; y < view.image.rows; ++y) {
+    const int gradient = reverse_gradient ? 255 - y * 4 : y * 4;
+    for (int x = 0; x < view.image.cols; ++x) {
+      view.image.at<cv::Vec3b>(y, x) =
+          cv::Vec3b(static_cast<std::uint8_t>(gradient),
+                    static_cast<std::uint8_t>(gradient),
+                    static_cast<std::uint8_t>(gradient));
+    }
+  }
+  return view;
+}
+
+cv::Vec3d SampleAtlas(const TexturedTriangleMesh& textured,
+                      std::size_t face_id,
+                      const Eigen::Vector3f& weights) {
+  Eigen::Vector2f uv = Eigen::Vector2f::Zero();
+  for (int corner = 0; corner < 3; ++corner) {
+    uv += weights[corner] * textured.face_uvs[face_id * 3 + corner];
+  }
+  cv::Mat sample;
+  cv::getRectSubPix(
+      textured.texture_atlas, cv::Size(1, 1),
+      cv::Point2f(uv.x() * textured.texture_atlas.cols,
+                  (1.0F - uv.y()) * textured.texture_atlas.rows),
+      sample);
+  const cv::Vec3b color = sample.at<cv::Vec3b>(0, 0);
+  return cv::Vec3d(color[0], color[1], color[2]);
 }
 
 TEST(MeshTexturingOptionsTest, ValidatesParameters) {
@@ -168,6 +222,44 @@ TEST(MeshTexturingTest, BakesVertexColorsForFacesWithoutVisibleView) {
   cv::Mat difference;
   cv::absdiff(textured.texture_atlas, cv::Scalar(127, 127, 127), difference);
   EXPECT_GT(cv::countNonZero(difference.reshape(1)), 0);
+}
+
+TEST(MeshTexturingTest, LocalSeamLevelingReducesSpatialColorDiscontinuity) {
+  MeshTexturingOptions options;
+  options.atlas_size = 128;
+  options.max_atlas_size = 128;
+  options.visibility_resolution = 64;
+  options.view_selection_smoothing_iterations = 0;
+  const DenseTriangleMesh mesh = MakeTwoViewSeamPlane();
+  const std::vector<MeshTextureView> views = {
+      MakeShiftedGradientView(-1.0, false),
+      MakeShiftedGradientView(1.0, true)};
+
+  options.apply_color_correction = false;
+  const TexturedTriangleMesh uncorrected =
+      TextureMesh(mesh, views, options);
+  ASSERT_EQ(uncorrected.face_view_ids[0], 0);
+  ASSERT_EQ(uncorrected.face_view_ids[1], 1);
+
+  options.apply_color_correction = true;
+  const TexturedTriangleMesh corrected = TextureMesh(mesh, views, options);
+  const std::array<std::pair<Eigen::Vector3f, Eigen::Vector3f>, 2>
+      seam_samples = {
+          std::make_pair(Eigen::Vector3f(0.96F, 0.02F, 0.02F),
+                         Eigen::Vector3f(0.96F, 0.02F, 0.02F)),
+          std::make_pair(Eigen::Vector3f(0.02F, 0.02F, 0.96F),
+                         Eigen::Vector3f(0.02F, 0.96F, 0.02F))};
+  double uncorrected_error = 0.0;
+  double corrected_error = 0.0;
+  for (const auto& [left_weights, right_weights] : seam_samples) {
+    uncorrected_error +=
+        cv::norm(SampleAtlas(uncorrected, 0, left_weights) -
+                 SampleAtlas(uncorrected, 1, right_weights));
+    corrected_error +=
+        cv::norm(SampleAtlas(corrected, 0, left_weights) -
+                 SampleAtlas(corrected, 1, right_weights));
+  }
+  EXPECT_LT(corrected_error, uncorrected_error * 0.35);
 }
 
 TEST(MeshTexturingTest, WritesObjMtlAndPng) {

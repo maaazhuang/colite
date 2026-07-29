@@ -635,6 +635,31 @@ PatchMatch/Fusion。原 OBJ 没有丢面或退化几何，但 21,388 个面被�
 命令、trim/tolerance A/B、拓扑/UV JSON 和最终 OBJ/PNG 位于
 `output/mvs_mesh_hole_fill_house_20260728/`。
 
+## House 平面纹理局部接缝连续性
+
+2026-07-28 在上述 112,107 面同一简化网格、同一相机、1% 遮挡容差和
+8 线程下，保留原有每相机常量曝光校正，并增加“纹理区域 × seam 顶点”的
+正则最小二乘残差场。分析脚本从 OBJ 中识别 atlas 两侧 UV 不连续的共享边，
+在每条边两端和中点向各自三角形内部采样，共统计 48,794 条 seam、
+146,382 对 BGR 样本。
+
+| BGR L2 接缝误差 | 仅全局相机偏移 | + 局部 seam 偏移场 | 变化 |
+|---|---:|---:|---:|
+| 均值 | 32.600 | **24.854** | **-23.8%** |
+| 中位数 | 18.962 | **12.303** | **-35.1%** |
+| P90 | 82.940 | **68.012** | **-18.0%** |
+| P95 | 110.368 | **92.889** | **-15.8%** |
+| 最大值 | 396.144 | **326.075** | **-17.7%** |
+
+纹理耗时由 7.53 s 增至 8.86 s（+17.7%，绝对增加 1.33 s），峰值 RSS 从
+1,041,852 KiB 变为 1,041,720 KiB，基本不变。全量 WSL CUDA 回归共
+307 项，306 通过、1 项按设计跳过、0 失败。命令、计时、JSON 和新 OBJ/PNG
+位于 `output/mvs_planar_continuity_house_20260728/`。
+
+许可证边界：局部偏移场依据 Waechter 2014 能量独立实现，COLMAP 4.0
+BSD-3-Clause 代码只用于行为核对；OpenMVS 的 AGPL-3.0 实现未移植，后续也
+仅采用论文/公开参数层面的 clean-room 设计。
+
 ## 历史默认大图 MVS 性能
 
 2026-07-18 House 36 图，默认 `resolution_level=1`（约 2296×1528）、CUDA
@@ -746,3 +771,27 @@ output/openmvs_cuda_house_YYYYMMDD/
 - 热缓存单次 wall time 不能代表稳定速度。
 - 不同工作尺寸、source 数、几何 pass 或上游位姿下的 PatchMatch/Fusion 点数不可直接横比。
 - 没有真值时，与 COLMAP 更接近只能说明行为对齐，不能证明几何更正确。
+
+## House COLMAP 4.0 Automatic High 基准
+
+`output/colmap4_auto_high_house_20260728/` 使用 WSL2 Ubuntu 22.04、RTX 4070
+SUPER、CUDA 13.2、8 线程和 36 张 4592×3056 house 图像完成了 COLMAP 4.0
+Automatic High、Colite 独立全流程、共用 COLMAP 相机的受控 MVS 和 Poisson
+交叉实验。MVS 上限 2400 px，实际约为原图一半尺寸。
+
+- COLMAP/Colite 均注册 36/36；稀疏点为 39,505/49,299，观测为
+  147,672/147,905，平均 track length 为 3.738/3.000。Colite 增加的是短轨迹，
+  不能仅按点数判优。
+- SfM 经 Sim(3) 对齐后的平均旋转差为 0.176°，平均相机中心误差为最大基线的
+  0.0874%。
+- 共用 COLMAP 相机时，COLMAP/Colite 稠密点为 2,667,152/2,073,041；
+  Colite 少 22.3%，主要优化目标仍是 PatchMatch 覆盖/过滤和 Fusion 接受率。
+- COLMAP/Colite PatchMatch 为 1450.6/809.3 s；Fusion 为约 22.5/45.0 s。
+  Colite PatchMatch 更快，但受控峰值 RSS 为 9.05 GiB，且 Fusion 仍慢约 2 倍。
+- 两套点云分别交叉输入两端 Poisson 后，顶点和面数差异均小于 0.001%，说明
+  原生 Poisson 网格差异主要由输入稠密点云造成，不应重写 Poisson 几何算法。
+- Colite Poisson 虽传入 `num_threads=8`，运行期曾观察到超过 800% CPU，
+  底层线程约束需要继续核查。
+
+完整参数、耗时、内存、GPU 采样、点云/网格/纹理路径和统计 JSON 见该输出目录的
+`测试说明.md`。

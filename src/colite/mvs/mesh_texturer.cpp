@@ -702,6 +702,161 @@ std::vector<cv::Vec3d> ComputeViewColorOffsets(
   return offsets;
 }
 
+std::vector<std::array<cv::Vec3d, 3>> ComputeLocalSeamColorOffsets(
+    const DenseTriangleMesh& mesh,
+    const std::vector<MeshTextureView>& views,
+    const std::vector<int>& selected,
+    const FaceAdjacency& adjacency,
+    const std::vector<FaceRegion>& regions,
+    const std::vector<cv::Vec3d>& view_offsets,
+    double regularization) {
+  std::vector<std::array<cv::Vec3d, 3>> face_offsets(
+      mesh.triangles.size(),
+      {cv::Vec3d(0.0, 0.0, 0.0), cv::Vec3d(0.0, 0.0, 0.0),
+       cv::Vec3d(0.0, 0.0, 0.0)});
+  if (views.size() < 2 || regions.empty()) return face_offsets;
+
+  std::vector<int> face_to_region(mesh.triangles.size(), -1);
+  for (std::size_t region_id = 0; region_id < regions.size(); ++region_id) {
+    if (regions[region_id].view_id < 0) continue;
+    for (const std::size_t face_id : regions[region_id].face_ids) {
+      face_to_region[face_id] = static_cast<int>(region_id);
+    }
+  }
+
+  struct SeamEquation {
+    std::size_t left_variable = 0;
+    std::size_t right_variable = 0;
+    cv::Vec3d difference = cv::Vec3d(0.0, 0.0, 0.0);
+  };
+  std::unordered_map<std::uint64_t, std::size_t> variable_by_key;
+  std::vector<SeamEquation> equations;
+  const auto variable_for = [&](int region_id, int vertex_id) {
+    const std::uint64_t key =
+        (static_cast<std::uint64_t>(static_cast<std::uint32_t>(region_id))
+         << 32) |
+        static_cast<std::uint32_t>(vertex_id);
+    const auto [it, inserted] =
+        variable_by_key.emplace(key, variable_by_key.size());
+    (void)inserted;
+    return it->second;
+  };
+  const auto sample_vertex = [&](int view_id, int vertex_id,
+                                 cv::Vec3d* color) {
+    const MeshTextureView& view = views[view_id];
+    const Eigen::Vector3d camera_point =
+        view.geometry.cam_from_world.TransformPoint(
+            mesh.vertices[vertex_id].xyz);
+    if (!camera_point.allFinite() || camera_point.z() <= 0.0) return false;
+    const Eigen::Vector2f pixel =
+        ProjectPoint(view.geometry.camera, camera_point).cast<float>();
+    if (pixel.x() < 0.0F || pixel.y() < 0.0F ||
+        pixel.x() >= view.image.cols - 1 ||
+        pixel.y() >= view.image.rows - 1) {
+      return false;
+    }
+    const cv::Vec3b sampled = BilinearSample(view.image, pixel);
+    *color = cv::Vec3d(sampled[0], sampled[1], sampled[2]) +
+             view_offsets[view_id];
+    return true;
+  };
+
+  for (std::size_t left_face = 0; left_face < mesh.triangles.size();
+       ++left_face) {
+    const int left_view = selected[left_face];
+    const int left_region = face_to_region[left_face];
+    if (left_view < 0 || left_region < 0) continue;
+    for (const std::size_t right_face : adjacency[left_face]) {
+      if (right_face <= left_face) continue;
+      const int right_view = selected[right_face];
+      const int right_region = face_to_region[right_face];
+      if (right_view < 0 || right_view == left_view || right_region < 0) {
+        continue;
+      }
+      const Eigen::Vector3i& left = mesh.triangles[left_face];
+      const Eigen::Vector3i& right = mesh.triangles[right_face];
+      for (int left_corner = 0; left_corner < 3; ++left_corner) {
+        const int vertex_id = left[left_corner];
+        bool shared = false;
+        for (int right_corner = 0; right_corner < 3; ++right_corner) {
+          shared |= right[right_corner] == vertex_id;
+        }
+        if (!shared) continue;
+        cv::Vec3d left_color;
+        cv::Vec3d right_color;
+        if (!sample_vertex(left_view, vertex_id, &left_color) ||
+            !sample_vertex(right_view, vertex_id, &right_color)) {
+          continue;
+        }
+        equations.push_back(
+            {variable_for(left_region, vertex_id),
+             variable_for(right_region, vertex_id),
+             right_color - left_color});
+      }
+    }
+  }
+  if (equations.empty()) return face_offsets;
+
+  const std::size_t num_variables = variable_by_key.size();
+  std::vector<Eigen::Triplet<double>> triplets;
+  triplets.reserve(equations.size() * 4 + num_variables);
+  Eigen::MatrixXd rhs = Eigen::MatrixXd::Zero(num_variables, 3);
+  for (const SeamEquation& equation : equations) {
+    const Eigen::Index left =
+        static_cast<Eigen::Index>(equation.left_variable);
+    const Eigen::Index right =
+        static_cast<Eigen::Index>(equation.right_variable);
+    triplets.emplace_back(left, left, 1.0);
+    triplets.emplace_back(right, right, 1.0);
+    triplets.emplace_back(left, right, -1.0);
+    triplets.emplace_back(right, left, -1.0);
+    for (int channel = 0; channel < 3; ++channel) {
+      rhs(left, channel) += equation.difference[channel];
+      rhs(right, channel) -= equation.difference[channel];
+    }
+  }
+  for (std::size_t variable = 0; variable < num_variables; ++variable) {
+    triplets.emplace_back(static_cast<Eigen::Index>(variable),
+                          static_cast<Eigen::Index>(variable),
+                          regularization);
+  }
+  Eigen::SparseMatrix<double> system(
+      static_cast<Eigen::Index>(num_variables),
+      static_cast<Eigen::Index>(num_variables));
+  system.setFromTriplets(triplets.begin(), triplets.end());
+  Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+  solver.compute(system);
+  if (solver.info() != Eigen::Success) return face_offsets;
+  const Eigen::MatrixXd solution = solver.solve(rhs);
+  if (solver.info() != Eigen::Success || !solution.allFinite()) {
+    return face_offsets;
+  }
+
+  constexpr double kMaximumLocalOffset = 64.0;
+  for (std::size_t face_id = 0; face_id < mesh.triangles.size(); ++face_id) {
+    const int region_id = face_to_region[face_id];
+    if (region_id < 0) continue;
+    for (int corner = 0; corner < 3; ++corner) {
+      const int vertex_id = mesh.triangles[face_id][corner];
+      const std::uint64_t key =
+          (static_cast<std::uint64_t>(
+               static_cast<std::uint32_t>(region_id))
+           << 32) |
+          static_cast<std::uint32_t>(vertex_id);
+      const auto variable_it = variable_by_key.find(key);
+      if (variable_it == variable_by_key.end()) continue;
+      const Eigen::Index variable =
+          static_cast<Eigen::Index>(variable_it->second);
+      for (int channel = 0; channel < 3; ++channel) {
+        face_offsets[face_id][corner][channel] =
+            std::clamp(solution(variable, channel), -kMaximumLocalOffset,
+                       kMaximumLocalOffset);
+      }
+    }
+  }
+  return face_offsets;
+}
+
 }  // namespace
 
 bool MeshTexturingOptions::Check() const {
@@ -795,6 +950,16 @@ TexturedTriangleMesh TextureMesh(const DenseTriangleMesh& mesh,
                                     adjacency,
                                     options.color_correction_regularization)
           : std::vector<cv::Vec3d>(views.size(), cv::Vec3d(0.0, 0.0, 0.0));
+  const std::vector<std::array<cv::Vec3d, 3>> local_seam_offsets =
+      options.apply_color_correction
+          ? ComputeLocalSeamColorOffsets(
+                mesh, views, result.face_view_ids, adjacency, regions,
+                view_color_offsets,
+                options.color_correction_regularization)
+          : std::vector<std::array<cv::Vec3d, 3>>(
+                mesh.triangles.size(),
+                {cv::Vec3d(0.0, 0.0, 0.0), cv::Vec3d(0.0, 0.0, 0.0),
+                 cv::Vec3d(0.0, 0.0, 0.0)});
   for (const FaceRegion& region : regions) {
     const cv::Mat* source =
         region.view_id >= 0 ? &views[region.view_id].image : nullptr;
@@ -847,6 +1012,10 @@ TexturedTriangleMesh TextureMesh(const DenseTriangleMesh& mesh,
             }
             sampled = BilinearSample(*source, source_pixel);
             offset = view_color_offsets[region.view_id];
+            for (int corner = 0; corner < 3; ++corner) {
+              offset += static_cast<double>(weights[corner]) *
+                        local_seam_offsets[face_id][corner];
+            }
           } else {
             const Eigen::Vector3f color =
                 weights.x() *
