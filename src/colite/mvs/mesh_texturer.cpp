@@ -347,6 +347,13 @@ std::vector<int> SelectViews(const DenseTriangleMesh& mesh,
   std::vector<std::vector<double>> scores(
       mesh.triangles.size(), std::vector<double>(views.size(), -1.0));
   const TriangleOcclusionBvh occlusion_bvh(mesh);
+  // COLMAP's CGAL any-intersection query is permissive when it happens to
+  // return the target face, while a fully strict nearest-hit test rejects
+  // legitimate faces on slightly noisy reconstructed planes. Keep the primary
+  // endpoint band tightly bounded to 0.5%; the wider configured tolerance is
+  // reserved for the topology-supported hole recovery below.
+  const double primary_occlusion_tolerance =
+      std::min(options.occlusion_relative_tolerance, 0.005);
   const auto process_view = [&](std::size_t view_id) {
     const PatchMatchView& view = views[view_id].geometry;
     const int source_width = static_cast<int>(view.camera.width);
@@ -385,7 +392,7 @@ std::vector<int> SelectViews(const DenseTriangleMesh& mesh,
         if (occlusion_bvh.IsOccluded(camera_center,
                                      mesh.vertices[face[corner]].xyz,
                                      face_id, face[corner],
-                                     options.occlusion_relative_tolerance)) {
+                                     primary_occlusion_tolerance)) {
           occluded = true;
           break;
         }
@@ -440,35 +447,162 @@ std::vector<int> SelectViews(const DenseTriangleMesh& mesh,
     selected = std::move(updated);
   }
 
+  // Local majority smoothing still leaves one-to-few-face view islands when
+  // projected area oscillates over a nearly planar surface. Every such island
+  // becomes an independent atlas chart and can appear as a triangular texture
+  // fragment. Merge a small component only if a neighboring view is valid for
+  // every face, retains at least half of the aggregate projected area, and is
+  // supported across a near-coplanar boundary. This preserves actual roof
+  // ridges and avoids replacing a good view with an occluded one.
+  if (options.view_selection_min_component_size > 0) {
+    constexpr double kMinimumNormalCosine = 0.94;  // about 20 degrees
+    constexpr double kMinimumRelativeProjectedArea = 0.5;
+    std::vector<Eigen::Vector3d> face_normals(
+        mesh.triangles.size(), Eigen::Vector3d::Zero());
+    for (std::size_t face_id = 0; face_id < mesh.triangles.size(); ++face_id) {
+      const Eigen::Vector3i& face = mesh.triangles[face_id];
+      Eigen::Vector3d normal =
+          (mesh.vertices[face.y()].xyz - mesh.vertices[face.x()].xyz)
+              .cross(mesh.vertices[face.z()].xyz -
+                     mesh.vertices[face.x()].xyz);
+      if (normal.squaredNorm() > 1e-24) {
+        face_normals[face_id] = normal.normalized();
+      }
+    }
+    for (int pass = 0; pass < 4; ++pass) {
+      std::vector<bool> visited(selected.size(), false);
+      bool changed = false;
+      for (std::size_t seed = 0; seed < selected.size(); ++seed) {
+        if (visited[seed] || selected[seed] < 0) continue;
+        const int source_view = selected[seed];
+        std::vector<std::size_t> component;
+        std::queue<std::size_t> queue;
+        queue.push(seed);
+        visited[seed] = true;
+        while (!queue.empty()) {
+          const std::size_t face_id = queue.front();
+          queue.pop();
+          component.push_back(face_id);
+          for (const std::size_t neighbor : adjacency[face_id]) {
+            if (!visited[neighbor] && selected[neighbor] == source_view) {
+              visited[neighbor] = true;
+              queue.push(neighbor);
+            }
+          }
+        }
+        if (component.size() >= static_cast<std::size_t>(
+                                    options.view_selection_min_component_size)) {
+          continue;
+        }
+
+        std::unordered_map<int, int> boundary_support;
+        for (const std::size_t face_id : component) {
+          for (const std::size_t neighbor : adjacency[face_id]) {
+            const int candidate = selected[neighbor];
+            if (candidate < 0 || candidate == source_view ||
+                face_normals[face_id].dot(face_normals[neighbor]) <
+                    kMinimumNormalCosine) {
+              continue;
+            }
+            ++boundary_support[candidate];
+          }
+        }
+
+        double source_area = 0.0;
+        for (const std::size_t face_id : component) {
+          source_area += scores[face_id][source_view];
+        }
+        int best_view = -1;
+        int best_support = 1;
+        double best_relative_area = 0.0;
+        for (const auto& [candidate, support] : boundary_support) {
+          if (support < 2) continue;
+          double candidate_area = 0.0;
+          bool valid_for_component = true;
+          for (const std::size_t face_id : component) {
+            if (scores[face_id][candidate] < 0.0) {
+              valid_for_component = false;
+              break;
+            }
+            candidate_area += scores[face_id][candidate];
+          }
+          if (!valid_for_component) continue;
+          const double relative_area =
+              candidate_area / std::max(source_area, 1e-12);
+          if (relative_area < kMinimumRelativeProjectedArea) continue;
+          if (support > best_support ||
+              (support == best_support &&
+               relative_area > best_relative_area)) {
+            best_view = candidate;
+            best_support = support;
+            best_relative_area = relative_area;
+          }
+        }
+        if (best_view < 0) continue;
+        for (const std::size_t face_id : component) {
+          selected[face_id] = best_view;
+        }
+        changed = true;
+      }
+      if (!changed) break;
+    }
+  }
+
   // Strict ray tests can leave isolated, collapsed-UV triangles on a noisy
   // but continuous reconstructed plane. Fill only holes supported by at least
   // two textured edge-adjacent faces. Their labels form the candidate set;
   // choose the valid projection with the largest image area while retaining
   // image-boundary and front-facing checks. Requiring two supporting faces
   // prevents expansion from a single silhouette or isolated back surface.
+  constexpr int kMaximumSupportedHoleFillIterations = 64;
   for (int iteration = 0;
-       iteration < options.view_selection_smoothing_iterations; ++iteration) {
+       iteration < kMaximumSupportedHoleFillIterations; ++iteration) {
     std::vector<int> updated = selected;
     bool changed = false;
     for (std::size_t face_id = 0; face_id < selected.size(); ++face_id) {
       if (selected[face_id] >= 0) continue;
       std::unordered_map<int, int> candidate_views;
-      int num_selected_neighbors = 0;
       for (const std::size_t neighbor : adjacency[face_id]) {
-        if (selected[neighbor] >= 0) {
-          ++num_selected_neighbors;
-          candidate_views.emplace(selected[neighbor], 0);
+        if (selected[neighbor] < 0) continue;
+        const Eigen::Vector3i& face = mesh.triangles[face_id];
+        const Eigen::Vector3i& neighbor_face = mesh.triangles[neighbor];
+        Eigen::Vector3d normal =
+            (mesh.vertices[face.y()].xyz - mesh.vertices[face.x()].xyz)
+                .cross(mesh.vertices[face.z()].xyz -
+                       mesh.vertices[face.x()].xyz);
+        Eigen::Vector3d neighbor_normal =
+            (mesh.vertices[neighbor_face.y()].xyz -
+             mesh.vertices[neighbor_face.x()].xyz)
+                .cross(mesh.vertices[neighbor_face.z()].xyz -
+                       mesh.vertices[neighbor_face.x()].xyz);
+        if (normal.squaredNorm() <= 1e-24 ||
+            neighbor_normal.squaredNorm() <= 1e-24 ||
+            normal.normalized().dot(neighbor_normal.normalized()) < 0.94) {
+          continue;
         }
+        ++candidate_views[selected[neighbor]];
       }
-      if (num_selected_neighbors < 2) continue;
       int best_view = -1;
       double best_area = -1.0;
-      for (const auto& [view_id, unused] : candidate_views) {
-        (void)unused;
+      for (const auto& [view_id, support] : candidate_views) {
+        if (support < 2) continue;
         if (!IsFaceProjectable(mesh, face_id, views[view_id].geometry,
                                options)) {
           continue;
         }
+        const Eigen::Vector3i& face = mesh.triangles[face_id];
+        const Eigen::Vector3d camera_center =
+            views[view_id].geometry.cam_from_world.CameraCenter();
+        bool occluded = false;
+        for (int corner = 0; corner < 3; ++corner) {
+          if (occlusion_bvh.IsOccluded(
+                  camera_center, mesh.vertices[face[corner]].xyz, face_id,
+                  face[corner], options.occlusion_relative_tolerance)) {
+            occluded = true;
+            break;
+          }
+        }
+        if (occluded) continue;
         const Projection projection =
             ProjectFace(mesh, face_id, views[view_id].geometry);
         const Eigen::Vector2f first =
@@ -868,6 +1002,7 @@ bool MeshTexturingOptions::Check() const {
          min_cos_normal_angle <= 1.0 &&
          min_visible_vertices >= 1 && min_visible_vertices <= 3 &&
          view_selection_smoothing_iterations >= 0 &&
+         view_selection_min_component_size >= 0 &&
          visibility_resolution >= 16 &&
          std::isfinite(occlusion_relative_tolerance) &&
          occlusion_relative_tolerance >= 0.0 &&
@@ -912,7 +1047,9 @@ TexturedTriangleMesh TextureMesh(const DenseTriangleMesh& mesh,
   result.face_view_ids = SelectViews(mesh, views, adjacency, options);
   std::vector<FaceRegion> regions =
       BuildRegions(mesh, views, result.face_view_ids, adjacency);
-  AppendVertexColorFallbackRegions(result.face_view_ids, &regions);
+  if (options.use_vertex_color_fallback) {
+    AppendVertexColorFallbackRegions(result.face_view_ids, &regions);
+  }
   double atlas_scale = options.texture_scale;
   int atlas_size = options.atlas_size;
   while (!PackRegions(&regions, atlas_size, options.atlas_patch_padding,
@@ -937,10 +1074,11 @@ TexturedTriangleMesh TextureMesh(const DenseTriangleMesh& mesh,
                                  CV_8UC3, cv::Scalar(127, 127, 127));
   cv::Mat mask(atlas_height, atlas_size, CV_8UC1,
                cv::Scalar(0));
-  const float fallback_u =
-      (options.atlas_patch_padding + 0.5F) / atlas_size;
-  const float fallback_v =
-      1.0F - (options.atlas_patch_padding + 0.5F) / atlas_height;
+  // Pixel (0, 0) is outside every packed region and retains the neutral atlas
+  // background. Its center remains valid even when there are no regions and
+  // the atlas is only one pixel high.
+  const float fallback_u = 0.5F / atlas_size;
+  const float fallback_v = 1.0F - 0.5F / atlas_height;
   for (Eigen::Vector2f& uv : result.face_uvs) {
     uv = Eigen::Vector2f(fallback_u, fallback_v);
   }

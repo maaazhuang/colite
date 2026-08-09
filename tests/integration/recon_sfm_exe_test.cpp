@@ -59,6 +59,11 @@ TEST(ReconSfmExeTest, PrintsHelp) {
   EXPECT_NE(out.str().find("Usage:"), std::string::npos);
   EXPECT_NE(out.str().find("--feature_extractor"), std::string::npos);
   EXPECT_NE(out.str().find("--feature_num_threads"), std::string::npos);
+  EXPECT_NE(out.str().find("--camera_mode"), std::string::npos);
+  EXPECT_NE(out.str().find("--camera_model"), std::string::npos);
+  EXPECT_NE(out.str().find("--camera_params"), std::string::npos);
+  EXPECT_NE(out.str().find("--default_focal_length_factor"),
+            std::string::npos);
   EXPECT_NE(out.str().find("--ba_refine_focal_length"), std::string::npos);
   EXPECT_NE(out.str().find("--ba_refine_principal_point"), std::string::npos);
   EXPECT_NE(out.str().find("--ba_refine_extra_params"), std::string::npos);

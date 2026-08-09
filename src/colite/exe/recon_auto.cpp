@@ -75,6 +75,9 @@ int RunReconAuto(const std::vector<std::string>& args,
              "[--stop_after sfm|undistort|stereo|fusion|mesh|simplify|texture] "
              "[--mesher poisson|delaunay|none] [--simplify 0|1] "
              "[--texture 0|1] "
+             "[--sfm.camera_model SIMPLE_RADIAL] "
+             "[--sfm.camera_params CSV] "
+             "[--sfm.camera_mode auto|single|per_folder|per_image] "
              "[--sfm.<option> value] [--mvs.<option> value] "
              "[--resume|--force] [--dry_run]\n";
       return 0;
@@ -120,9 +123,26 @@ int RunReconAuto(const std::vector<std::string>& args,
       std::vector<std::string> sfm_args{args.front(), "--image_path", images.string(),
                                         "--output_path", sfm.string()};
       AppendOptionsWithPrefix(values, "--sfm.", &sfm_args, true);
-      StageSpec spec{"recon_sfm", root, {images},
-                     {sfm / "cameras.txt", sfm / "images.txt", sfm / "points3D.txt"},
-                     sfm_args};
+      if (stage.resume) sfm_args.push_back("--resume");
+      if (stage.force) sfm_args.push_back("--force");
+      const ColmapModelFormat sfm_format = ColmapModelFormatFromString(
+          values.count("--sfm.output_format")
+              ? values.at("--sfm.output_format")
+              : "both");
+      std::vector<std::filesystem::path> sfm_outputs{sfm / "points3D.ply"};
+      if (sfm_format == ColmapModelFormat::kText ||
+          sfm_format == ColmapModelFormat::kTextAndBinary) {
+        sfm_outputs.insert(sfm_outputs.end(),
+                           {sfm / "cameras.txt", sfm / "images.txt",
+                            sfm / "points3D.txt"});
+      }
+      if (sfm_format == ColmapModelFormat::kBinary ||
+          sfm_format == ColmapModelFormat::kTextAndBinary) {
+        sfm_outputs.insert(sfm_outputs.end(),
+                           {sfm / "cameras.bin", sfm / "images.bin",
+                            sfm / "points3D.bin"});
+      }
+      StageSpec spec{"recon_sfm", root, {images}, sfm_outputs, sfm_args};
       const int result = RunStage(spec, stage,
           [&] { return RunReconSfm(sfm_args, out, err); }, out, err);
       if (result) return result;

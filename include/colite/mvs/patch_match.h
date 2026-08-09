@@ -57,6 +57,10 @@ struct PatchMatchCostOptions {
   float min_variance = 1e-8F;
   // 几何一致性软约束权重。为 0 时保持纯光度 PatchMatch 行为。
   float geometric_consistency_weight = 0.0F;
+  // Decouple the geometric term from photometric source ranking and use a
+  // robust lower-half consensus across valid source depth maps. This avoids
+  // a single photometrically lucky source dominating weak-texture regions.
+  bool robust_geometric_aggregation = true;
   // Truncation in pixels for the COLMAP-style forward-backward geometric
   // reprojection cost used during the second PatchMatch pass.
   float geometric_max_reprojection_error = 3.0F;
@@ -155,6 +159,11 @@ struct PatchMatchNormalRefinementSummary {
 struct PatchMatchSourceSelectionOptions {
   bool dynamic_probability = false;
   bool directional_hmm = false;
+  // Modulate source CDF weights with COLMAP-style triangulation-angle,
+  // incident-angle, and local homography-resolution priors.
+  bool geometric_priors = false;
+  float min_triangulation_angle_degrees = 1.0F;
+  float incident_angle_sigma = 0.9F;
   // COLMAP-style Monte Carlo samples drawn from the per-pixel source CDF.
   // Zero keeps the legacy best-K aggregation path.
   std::size_t num_samples = 0;
@@ -415,6 +424,10 @@ struct StereoFusionOptions {
   std::size_t source_pixel_search_radius = 0;
   bool require_mutual_consistency = false;
   bool require_consistency_graph = true;
+  // Geometrically filtered persisted maps have already used the graph as a
+  // validity mask. Fusion can then revisit the ordered source views and apply
+  // its own projection/depth/normal checks, matching COLMAP's default fuser.
+  bool prefer_fallback_source_images = false;
   // Production controllers follow COLMAP's image-level traversal and do not
   // revisit earlier reference images after their fusion pass completes.
   // Keep the core API opt-in so diagnostics/tests can still inspect both
@@ -496,6 +509,10 @@ struct StereoFusionViewData {
   NormalMap normal_map;
   DenseCostMap cost_map;
   ConsistencyGraph consistency_graph;
+  // Used when persisted depth maps do not contain a geometric consistency
+  // graph (for example, COLMAP photometric PatchMatch output). The ordered
+  // source list is evaluated with the same projection/depth/normal checks.
+  std::vector<ImageId> fallback_source_image_ids;
 };
 
 using StereoFusionViewLoader =
@@ -622,6 +639,10 @@ PatchMatchNormalRefinementSummary RefineNormalMapFromDepth(
     const PatchMatchNormalRefinementOptions& options,
     NormalMap* normal_map);
 
+std::size_t OrientNormalMapTowardsCamera(
+    const PatchMatchView& reference_view,
+    NormalMap* normal_map);
+
 PatchMatchStereoResult RunPatchMatchStereoForImage(
     const PatchMatchView& reference_view,
     const std::vector<PatchMatchView>& source_views,
@@ -658,6 +679,19 @@ RunPatchMatchStereoForImageWithSourceDepthsAndCudaWorkspace(
     const MvsImage& reference_image,
     const std::vector<MvsImage>& source_images,
     const std::vector<DenseDepthMap>& source_depth_maps,
+    float depth_min,
+    float depth_max,
+    CudaPatchMatchWorkspace* cuda_workspace,
+    const PatchMatchStereoOptions& options = {},
+    const PatchMatchMaps* initial_maps = nullptr);
+
+PatchMatchStereoResult
+RunPatchMatchStereoForImageWithSourceDepthPointersAndCudaWorkspace(
+    const PatchMatchView& reference_view,
+    const std::vector<PatchMatchView>& source_views,
+    const MvsImage& reference_image,
+    const std::vector<MvsImage>& source_images,
+    const std::vector<const DenseDepthMap*>& source_depth_maps,
     float depth_min,
     float depth_max,
     CudaPatchMatchWorkspace* cuda_workspace,

@@ -10,7 +10,6 @@
 #include <stdexcept>
 #include <utility>
 
-#include <Eigen/LU>
 #include <opencv2/imgproc.hpp>
 
 namespace colite::mvs {
@@ -166,50 +165,19 @@ std::optional<Eigen::Vector2d> UndistortPixel(
       !source_camera.VerifyParams() || !undistorted_camera.VerifyParams()) {
     return std::nullopt;
   }
-  const Eigen::Matrix3d calibration = source_camera.CalibrationMatrix();
-  Eigen::Vector2d normalized(
-      (source_pixel.x() - calibration(0, 2)) / calibration(0, 0),
-      (source_pixel.y() - calibration(1, 2)) / calibration(1, 1));
-  constexpr double kStep = 1e-6;
-  for (int iteration = 0; iteration < 30; ++iteration) {
-    Eigen::Vector2d projected;
-    Eigen::Vector2d projected_x;
-    Eigen::Vector2d projected_y;
-    try {
-      projected = ProjectPoint(
-          source_camera,
-          Eigen::Vector3d(normalized.x(), normalized.y(), 1.0));
-      projected_x = ProjectPoint(
-          source_camera,
-          Eigen::Vector3d(normalized.x() + kStep, normalized.y(), 1.0));
-      projected_y = ProjectPoint(
-          source_camera,
-          Eigen::Vector3d(normalized.x(), normalized.y() + kStep, 1.0));
-    } catch (const std::exception&) {
-      return std::nullopt;
-    }
-    const Eigen::Vector2d residual = projected - source_pixel;
-    if (residual.squaredNorm() < 1e-18) break;
-    Eigen::Matrix2d jacobian;
-    jacobian.col(0) = (projected_x - projected) / kStep;
-    jacobian.col(1) = (projected_y - projected) / kStep;
-    if (!jacobian.allFinite() || std::abs(jacobian.determinant()) < 1e-14) {
-      return std::nullopt;
-    }
-    const Eigen::Vector2d update = jacobian.fullPivLu().solve(residual);
-    if (!update.allFinite()) return std::nullopt;
-    normalized -= update;
-    if (update.squaredNorm() < 1e-20) break;
-  }
-  try {
-    const Eigen::Vector2d output = ProjectPoint(
-        undistorted_camera,
-        Eigen::Vector3d(normalized.x(), normalized.y(), 1.0));
-    return output.allFinite() ? std::optional<Eigen::Vector2d>(output)
-                              : std::nullopt;
-  } catch (const std::exception&) {
+  Eigen::Vector3d ray;
+  if (!UnprojectPixelWithCameraParams(
+          source_camera.model_id, source_camera.params.data(), source_pixel,
+          1.0, &ray)) {
     return std::nullopt;
   }
+  Eigen::Vector2d output;
+  if (!ProjectPointWithCameraParams(
+          undistorted_camera.model_id, undistorted_camera.params.data(), ray,
+          &output)) {
+    return std::nullopt;
+  }
+  return output;
 }
 
 UndistortedImage UndistortImage(const Camera& camera,

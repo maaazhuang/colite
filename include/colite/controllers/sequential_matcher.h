@@ -5,6 +5,7 @@
 
 #include "colite/matching/descriptor_matcher.h"
 #include "colite/matching/pair_generator.h"
+#include "colite/matching/weak_pair_rematcher.h"
 
 namespace colite::controllers {
 
@@ -24,6 +25,9 @@ struct SequentialMatcherControllerOptions {
   DescriptorMatcherBackend matcher_backend = DescriptorMatcherBackend::kFlann;
   double max_ratio = 0.8;
   bool mutual_check = true;
+  bool guided_matching = false;
+  double guided_match_ratio = 0.8;
+  std::size_t guided_min_inlier_gain = 10;
 };
 
 struct SequentialMatcherControllerSummary {
@@ -34,6 +38,7 @@ struct SequentialMatcherControllerSummary {
   std::size_t num_pairs = 0;
   std::size_t num_verified_pairs = 0;
   std::size_t num_verified_inliers = 0;
+  WeakPairRematchingSummary guided_matching;
   MatchingPairGeneratorSummary pair_generation;
 };
 

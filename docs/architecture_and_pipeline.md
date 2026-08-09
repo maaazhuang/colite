@@ -70,9 +70,22 @@ SFM_WORKSPACE/
     points3D.txt
     points3D.ply
     summary.txt
+    models.txt
+    models/
+      0/
+        cameras.txt
+        images.txt
+        points3D.txt
+        points3D.ply
+      1/
+        ...
 ```
 
-特征、匹配、几何和 sparse 阶段使用配置 hash 缓存。修改算法语义时必须更新对应的 `algorithm_version`，否则可能误用旧缓存。性能测试必须使用新的 workspace 或明确清理对应 stage 缓存。
+`sparse/` 根目录始终保留注册图像最多的主模型，以兼容既有 MVS 输入；所有模型按规模排序写入
+`sparse/models/<index>/`，`models.txt` 是模型索引。特征、匹配、几何和 sparse
+阶段使用配置 hash 缓存，缓存会校验每个编号模型的完整输出。修改算法语义时必须更新对应的
+`algorithm_version`，否则可能误用旧缓存。性能测试必须使用新的 workspace 或明确清理对应
+stage 缓存。
 
 ## MVS 与完整流程产物
 
@@ -127,13 +140,22 @@ manifest 保存 schema、状态、输入指纹、参数指纹、耗时和声明�
 
 ## SfM 数据流
 
-1. 解码图像和相机先验，提取统一 `FeatureSet`。
+1. 递归枚举图像并保留相对路径，解码每张图像的尺寸及 EXIF Make、Model、
+   35 mm 等效焦距、物理焦距和焦平面分辨率。默认 Auto 模式按
+   `Make + Model + 焦距标识 + width + height` 分组；元数据不完整的图像不与
+   其他图像猜测共享。可选 Single、Per-folder、Per-image；随后提取统一
+   `FeatureSet`。
 2. pair generator 生成 exhaustive/sequential/spatial/vocabulary 候选。
 3. BF/FLANN 匹配，执行 ratio、cross-check、两视图几何和 guided rematch。
-4. Incremental Mapper 选择初始对并注册图像。
+4. Reconstruction Manager 按 verified 图的连通分量依次运行 Incremental Mapper；若提供已有
+   COLMAP text model，则先按图像名重映射 ID，恢复位姿、内参、点和 track，再继续注册新增或
+   尚未注册的图像。
 5. `IncrementalTriangulator` 先 Continue，再用 point-centric multi-view Create 建点。
 6. track complete/merge、局部 BA、过滤和全局 BA 交替执行。
-7. 从所有注册观测提取稀疏点 RGB，导出 COLMAP text model 和 PLY。
+7. 不同局部模型间若能从 verified 匹配建立足够的 3D-3D 对应，则用鲁棒 Sim(3) 对齐并合并
+   图像、点和观测，再执行一次增量补注册及全局精化；不能可靠对齐的模型保持独立。
+8. 从所有注册观测提取稀疏点 RGB，分别导出多个 COLMAP text model 和 PLY，并将最大模型同步
+   写到兼容根目录。
 
 ## MVS 数据流
 

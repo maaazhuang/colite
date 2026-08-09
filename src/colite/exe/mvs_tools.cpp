@@ -19,6 +19,7 @@
 #include "colite/mvs/mesh_texturer.h"
 #include "colite/mvs/patch_match.h"
 #include "colite/exe/stage.h"
+#include "colite/io/sfm_workspace.h"
 
 namespace colite::exe {
 namespace {
@@ -107,132 +108,24 @@ struct ModelImage {
   mvs::PatchMatchView view;
 };
 
-template <typename T>
-T ReadBinary(std::istream& stream) {
-  T value{};
-  stream.read(reinterpret_cast<char*>(&value), sizeof(value));
-  if (!stream) throw std::runtime_error("Unexpected end of COLMAP binary model");
-  return value;
-}
-
-std::string ReadNullTerminated(std::istream& stream) {
-  std::string value;
-  char character = 0;
-  while (stream.get(character) && character != '\0') value.push_back(character);
-  if (!stream) throw std::runtime_error("Invalid COLMAP binary image name");
-  return value;
-}
-
-std::vector<std::string> DataLines(const std::filesystem::path& path) {
-  std::ifstream file(path);
-  if (!file) throw std::runtime_error("Failed to open model file: " + path.string());
-  std::vector<std::string> lines;
-  std::string line;
-  while (std::getline(file, line)) {
-    if (!line.empty() && line.front() != '#') lines.push_back(line);
-  }
-  return lines;
-}
-
-std::vector<std::string> ImageEntryLines(const std::filesystem::path& path) {
-  std::ifstream file(path);
-  if (!file) throw std::runtime_error("Failed to open model file: " + path.string());
-  std::vector<std::string> lines;
-  std::string line;
-  while (std::getline(file, line)) {
-    if (!line.empty() && line.back() == '\r') line.pop_back();
-    if (!line.empty() && line.front() == '#') continue;
-    // Preserve empty observation rows: COLMAP stores exactly two rows/image.
-    lines.push_back(line);
-  }
-  return lines;
-}
-
 std::vector<ModelImage> ReadModelImages(const std::filesystem::path& model_path,
                                         bool load_pixels,
                                         const std::filesystem::path& image_path,
                                         std::vector<mvs::MeshTextureView>* textures) {
-  std::unordered_map<CameraId, Camera> cameras;
+  const Reconstruction reconstruction = ReadColmapReconstruction(model_path);
   std::vector<ModelImage> images;
-  if (std::filesystem::exists(model_path / "cameras.txt")) {
-    for (const std::string& line : DataLines(model_path / "cameras.txt")) {
-      std::istringstream stream(line);
-      Camera camera;
-      std::string model;
-      stream >> camera.id >> model >> camera.width >> camera.height;
-      camera.model_id = CameraModelNameToId(model);
-      double parameter = 0.0;
-      while (stream >> parameter) camera.params.push_back(parameter);
-      if (!camera.VerifyParams()) throw std::runtime_error("Invalid camera: " + line);
-      cameras.emplace(camera.id, std::move(camera));
+  images.reserve(reconstruction.RegisteredImageIds().size());
+  for (const ImageId image_id : reconstruction.RegisteredImageIds()) {
+    const Image& source = reconstruction.GetImage(image_id);
+    if (!source.cam_from_world.has_value()) {
+      throw std::runtime_error("Registered model image has no pose");
     }
-    const std::vector<std::string> lines =
-        ImageEntryLines(model_path / "images.txt");
-    if (lines.size() % 2 != 0) {
-      throw std::runtime_error("images.txt must contain two data lines per image");
-    }
-    images.reserve(lines.size() / 2);
-    for (std::size_t i = 0; i < lines.size(); i += 2) {
-      std::istringstream stream(lines[i]);
-      ImageId image_id = kInvalidImageId;
-      CameraId camera_id = kInvalidCameraId;
-      Pose3 pose;
-      ModelImage image;
-      stream >> image_id >> pose.q_cw.w() >> pose.q_cw.x() >> pose.q_cw.y() >>
-          pose.q_cw.z() >> pose.t_cw.x() >> pose.t_cw.y() >> pose.t_cw.z() >>
-          camera_id >> image.name;
-      const auto camera = cameras.find(camera_id);
-      if (!stream || camera == cameras.end()) {
-        throw std::runtime_error("Invalid image: " + lines[i]);
-      }
-      image.view.image_id = image_id;
-      image.view.camera = camera->second;
-      image.view.cam_from_world = pose;
-      images.push_back(std::move(image));
-    }
-  } else {
-    std::ifstream camera_file(model_path / "cameras.bin", std::ios::binary);
-    std::ifstream image_file(model_path / "images.bin", std::ios::binary);
-    if (!camera_file || !image_file) {
-      throw std::runtime_error("Model requires cameras/images .txt or .bin files");
-    }
-    const std::uint64_t num_cameras = ReadBinary<std::uint64_t>(camera_file);
-    for (std::uint64_t i = 0; i < num_cameras; ++i) {
-      Camera camera;
-      camera.id = ReadBinary<std::uint32_t>(camera_file);
-      camera.model_id = static_cast<CameraModelId>(ReadBinary<std::int32_t>(camera_file));
-      camera.width = static_cast<std::uint32_t>(ReadBinary<std::uint64_t>(camera_file));
-      camera.height = static_cast<std::uint32_t>(ReadBinary<std::uint64_t>(camera_file));
-      camera.params.resize(GetCameraModelSpec(camera.model_id).param_names.size());
-      for (double& parameter : camera.params) parameter = ReadBinary<double>(camera_file);
-      if (!camera.VerifyParams()) throw std::runtime_error("Invalid binary camera");
-      cameras.emplace(camera.id, std::move(camera));
-    }
-    const std::uint64_t num_images = ReadBinary<std::uint64_t>(image_file);
-    images.reserve(static_cast<std::size_t>(num_images));
-    for (std::uint64_t i = 0; i < num_images; ++i) {
-      ModelImage image;
-      Pose3 pose;
-      image.view.image_id = ReadBinary<std::uint32_t>(image_file);
-      pose.q_cw.w() = ReadBinary<double>(image_file);
-      pose.q_cw.x() = ReadBinary<double>(image_file);
-      pose.q_cw.y() = ReadBinary<double>(image_file);
-      pose.q_cw.z() = ReadBinary<double>(image_file);
-      pose.t_cw.x() = ReadBinary<double>(image_file);
-      pose.t_cw.y() = ReadBinary<double>(image_file);
-      pose.t_cw.z() = ReadBinary<double>(image_file);
-      const CameraId camera_id = ReadBinary<std::uint32_t>(image_file);
-      image.name = ReadNullTerminated(image_file);
-      const std::uint64_t num_points = ReadBinary<std::uint64_t>(image_file);
-      image_file.seekg(static_cast<std::streamoff>(num_points * 24), std::ios::cur);
-      const auto camera = cameras.find(camera_id);
-      if (!image_file || camera == cameras.end()) {
-        throw std::runtime_error("Invalid binary image");
-      }
-      image.view.camera = camera->second;
-      image.view.cam_from_world = pose;
-      images.push_back(std::move(image));
-    }
+    ModelImage image;
+    image.name = source.name;
+    image.view.image_id = source.id;
+    image.view.camera = reconstruction.GetCamera(source.camera_id);
+    image.view.cam_from_world = *source.cam_from_world;
+    images.push_back(std::move(image));
   }
   for (const ModelImage& image : images) {
     if (load_pixels) {
@@ -407,12 +300,18 @@ int RunMeshTexturer(const std::vector<std::string>& argv,
     options.min_cos_normal_angle = Number(args, "--MeshTextureMapping.min_cos_normal_angle", options.min_cos_normal_angle);
     options.min_visible_vertices = Number(args, "--MeshTextureMapping.min_visible_vertices", options.min_visible_vertices);
     options.view_selection_smoothing_iterations = Number(args, "--MeshTextureMapping.view_selection_smoothing_iterations", options.view_selection_smoothing_iterations);
+    options.view_selection_min_component_size = Number(
+        args, "--MeshTextureMapping.view_selection_min_component_size",
+        options.view_selection_min_component_size);
     options.visibility_resolution = Number(
         args, "--MeshTextureMapping.visibility_resolution",
         options.visibility_resolution);
     options.occlusion_relative_tolerance = Number(
         args, "--MeshTextureMapping.occlusion_relative_tolerance",
         options.occlusion_relative_tolerance);
+    options.use_vertex_color_fallback = Number<int>(
+        args, "--MeshTextureMapping.use_vertex_color_fallback",
+        options.use_vertex_color_fallback ? 1 : 0) != 0;
     options.apply_color_correction = Number<int>(args, "--MeshTextureMapping.apply_color_correction", 1) != 0;
     options.color_correction_regularization = Number(args, "--MeshTextureMapping.color_correction_regularization", options.color_correction_regularization);
     options.num_threads = Number(args, "--MeshTextureMapping.num_threads", options.num_threads);

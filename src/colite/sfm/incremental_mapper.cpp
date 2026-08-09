@@ -1,6 +1,7 @@
 #include "colite/sfm/incremental_mapper.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <map>
 #include <optional>
@@ -12,6 +13,12 @@
 
 namespace colite {
 namespace {
+
+using MappingClock = std::chrono::steady_clock;
+
+double ElapsedSeconds(const MappingClock::time_point start) {
+  return std::chrono::duration<double>(MappingClock::now() - start).count();
+}
 
 struct ImageCandidate {
   ImageId image_id = kInvalidImageId;
@@ -124,11 +131,16 @@ std::vector<ImageCandidate> CollectImageCandidates(
     const MatchGraph& graph,
     const IncrementalMapperOptions& options,
     const Reconstruction& reconstruction,
+    const std::set<ImageId>* allowed_image_ids = nullptr,
     const std::map<ImageId, std::size_t>* registration_trials = nullptr,
     std::size_t max_num_registration_trials_per_image = 0) {
   std::vector<ImageCandidate> candidates;
   for (const auto& [image_id, image] : reconstruction.Images()) {
     (void)image;
+    if (allowed_image_ids != nullptr && !allowed_image_ids->empty() &&
+        allowed_image_ids->count(image_id) == 0) {
+      continue;
+    }
     ImageCandidate candidate =
         AnalyzeImageCandidate(graph, image_id, reconstruction);
     if (registration_trials != nullptr) {
@@ -326,21 +338,38 @@ ObservationFilterSummary FilterNewlyCreatedPoints(
     return summary;
   }
 
+  struct ObservationToDelete {
+    Point3DId point3d_id;
+    ImageId image_id;
+    Point2DIdx point2d_idx;
+  };
+  std::vector<ObservationToDelete> observations_to_delete;
+  for (const auto& [point3d_id, point3d] : reconstruction->Points3D()) {
+    if (point_ids_before.find(point3d_id) != point_ids_before.end()) {
+      continue;
+    }
+    for (const TrackElement& element : point3d.track.elements) {
+      if (HasLargeReprojectionError(*reconstruction, point3d, element,
+                                    options.max_reprojection_error_px)) {
+        observations_to_delete.push_back(
+            {point3d_id, element.image_id, element.point2d_idx});
+      }
+    }
+  }
+  for (const ObservationToDelete& observation : observations_to_delete) {
+    if (reconstruction->DeleteObservation(observation.point3d_id,
+                                          observation.image_id,
+                                          observation.point2d_idx)) {
+      ++summary.num_removed_observations;
+    }
+  }
+
   std::vector<Point3DId> points_to_delete;
   for (const auto& [point3d_id, point3d] : reconstruction->Points3D()) {
     if (point_ids_before.find(point3d_id) != point_ids_before.end()) {
       continue;
     }
-    bool has_bad_observation = false;
-    for (const TrackElement& element : point3d.track.elements) {
-      if (HasLargeReprojectionError(*reconstruction, point3d, element,
-                                    options.max_reprojection_error_px)) {
-        has_bad_observation = true;
-        break;
-      }
-    }
-    if (has_bad_observation ||
-        point3d.track.Length() < options.min_track_length ||
+    if (point3d.track.Length() < options.min_track_length ||
         MaxTriangulationAngleDegrees(*reconstruction, point3d) <
             options.min_triangulation_angle_deg) {
       points_to_delete.push_back(point3d_id);
@@ -398,40 +427,59 @@ IncrementalMapperSummary RegisterNextImage(
       options.registration.max_reprojection_error_px;
 
   // 1. 通过已注册图像上的 2D-3D 关联估计新图像位姿。
+  auto stage_start = MappingClock::now();
   summary.registration =
       RegisterImageWithExistingPoints(graph, image_id, options.registration,
                                       reconstruction);
+  summary.registration_seconds = ElapsedSeconds(stage_start);
   if (!summary.registration.success) {
     summary.message = summary.registration.message;
     return summary;
   }
 
   // 2. 先把新图像能挂到已有 3D 点上的观测补齐，再创建新的 track。
+  stage_start = MappingClock::now();
   summary.track_completion = CompleteTracksForRegisteredImage(
       graph, image_id, options.triangulation, reconstruction);
+  summary.track_completion_seconds = ElapsedSeconds(stage_start);
+  stage_start = MappingClock::now();
   summary.triangulation = TriangulateRegisteredImage(
       graph, image_id, options.triangulation, reconstruction,
       triangulator_cache);
+  summary.triangulation_seconds = ElapsedSeconds(stage_start);
   const ObservationFilterOptions* local_retriangulation_filter =
       options.run_local_retriangulation_filter
           ? &options.local_retriangulation_filter
           : nullptr;
+  stage_start = MappingClock::now();
   summary.local_retriangulation = RetriangulateLocalNeighborhood(
       graph, image_id, options.triangulation, local_retriangulation_filter,
       reconstruction, triangulator_cache);
+  summary.local_retriangulation_seconds = ElapsedSeconds(stage_start);
 
   // 3. 对新图像及其共视邻域做局部 BA，消化 PnP 和三角化带来的误差。
   if (options.run_local_bundle_adjustment) {
+    stage_start = MappingClock::now();
     summary.local_bundle_adjustment = AdjustLocalBundle(
         image_id, options.local_bundle_adjustment, reconstruction);
+    summary.local_bundle_adjustment_seconds = ElapsedSeconds(stage_start);
     if (!summary.local_bundle_adjustment.success) {
       summary.message = summary.local_bundle_adjustment.message;
       return summary;
     }
+
+    stage_start = MappingClock::now();
+    const IncrementalTriangulatorSummary post_ba_tracks =
+        CompleteTracksForRegisteredImage(
+            graph, image_id, options.triangulation, reconstruction);
+    summary.track_completion_seconds += ElapsedSeconds(stage_start);
+    AccumulateTriangulationSummary(post_ba_tracks,
+                                   &summary.track_completion);
   }
 
   // 4. BA 后过滤坏观测和不稳定 3D 点，减少错误 track 继续污染后续注册。
   if (options.run_observation_filter) {
+    stage_start = MappingClock::now();
     std::set<ImageId> adjusted_image_ids =
         summary.local_bundle_adjustment.local_image_ids;
     adjusted_image_ids.insert(
@@ -442,6 +490,7 @@ IncrementalMapperSummary RegisterNextImage(
     }
     summary.observation_filter = FilterObservationsAndPointsInImages(
         options.observation_filter, adjusted_image_ids, reconstruction);
+    summary.observation_filter_seconds = ElapsedSeconds(stage_start);
     if (!summary.observation_filter.success) {
       summary.message = summary.observation_filter.message;
       return summary;
@@ -482,20 +531,28 @@ IncrementalTriangulatorSummary RetriangulateLocalNeighborhood(
   // COLMAP 的增量三角化会围绕新注册图像反复 complete/merge/create。这里先做
   // 保守的局部版本：新图像和强邻居都重跑一轮，使邻居-邻居遗漏 track 进入局部 BA。
   for (const ImageId local_image_id : local_image_ids) {
-    const IncrementalTriangulatorSummary completion =
-        CompleteTracksForRegisteredImage(graph, local_image_id, options,
-                                         reconstruction);
-    summary.num_completed_observations += completion.num_completed_observations;
-    summary.num_merged_points += completion.num_merged_points;
-    summary.num_merged_observations += completion.num_merged_observations;
-
+    // TriangulateRegisteredImage already continues observations before
+    // creating points and runs completion/merge iterations after creation.
+    // Calling CompleteTracksForRegisteredImage immediately beforehand scans
+    // the same verified pairs twice for every local neighbor.
     const IncrementalTriangulatorSummary triangulation =
         TriangulateRegisteredImage(graph, local_image_id, options,
                                    reconstruction, triangulator_cache);
     summary.num_created_points += triangulation.num_created_points;
     summary.num_created_observations +=
         triangulation.num_created_observations;
+    summary.num_completed_observations +=
+        triangulation.num_completed_observations;
+    summary.num_merged_points += triangulation.num_merged_points;
+    summary.num_merged_observations +=
+        triangulation.num_merged_observations;
   }
+  const IncrementalTriangulatorSummary completion =
+      CompleteTracksForRegisteredImage(graph, image_id, options,
+                                       reconstruction);
+  summary.num_completed_observations += completion.num_completed_observations;
+  summary.num_merged_points += completion.num_merged_points;
+  summary.num_merged_observations += completion.num_merged_observations;
 
   if (local_filter_options != nullptr) {
     const ObservationFilterSummary filter_summary = FilterNewlyCreatedPoints(
@@ -555,8 +612,15 @@ IncrementalMappingSummary RunIncrementalMapping(
   }
 
   if (reconstruction->RegisteredImageIds().empty()) {
+    IncrementalInitializerOptions initialization_options =
+        options.initialization;
+    if (!options.allowed_image_ids.empty()) {
+      initialization_options.allowed_image_ids = options.allowed_image_ids;
+    }
+    const auto initialization_start = MappingClock::now();
     summary.initialization = InitializeReconstructionFromBestPair(
-        graph, options.initialization, reconstruction);
+        graph, initialization_options, reconstruction);
+    summary.initialization_seconds = ElapsedSeconds(initialization_start);
     if (!summary.initialization.success) {
       summary.num_registered_images =
           reconstruction->RegisteredImageIds().size();
@@ -569,10 +633,13 @@ IncrementalMappingSummary RunIncrementalMapping(
   const IncrementalTriangulatorCache triangulator_cache(graph);
   std::map<ImageId, std::size_t> registration_trials;
   for (std::size_t i = 0; i < options.max_num_registrations; ++i) {
+    const auto candidate_start = MappingClock::now();
     const std::vector<ImageCandidate> candidates =
         CollectImageCandidates(graph, options.mapper, *reconstruction,
+                               &options.allowed_image_ids,
                                &registration_trials,
                                options.max_num_registration_trials_per_image);
+    summary.candidate_selection_seconds += ElapsedSeconds(candidate_start);
     if (candidates.empty()) {
       break;
     }
@@ -610,26 +677,39 @@ IncrementalMappingSummary RunIncrementalMapping(
     }
   }
 
+  IncrementalTriangulatorOptions bounded_completion_options =
+      options.mapper.triangulation;
+  bounded_completion_options.complete_max_transitivity = std::min(
+      bounded_completion_options.complete_max_transitivity, std::size_t{4});
+
   if (options.run_global_track_completion &&
       reconstruction->RegisteredImageIds().size() >= 2) {
+    auto stage_start = MappingClock::now();
     summary.global_track_completion = CompleteAndMergeAllTracks(
         graph, options.mapper.triangulation, reconstruction,
         &triangulator_cache);
+    summary.global_track_completion_seconds += ElapsedSeconds(stage_start);
+    stage_start = MappingClock::now();
     summary.global_retriangulation = RetriangulateAllRegisteredImages(
         graph, options.mapper.triangulation, reconstruction,
         &triangulator_cache);
+    summary.global_retriangulation_seconds = ElapsedSeconds(stage_start);
+    stage_start = MappingClock::now();
     const IncrementalTriangulatorSummary post_retriangulation_tracks =
-        CompleteAndMergeAllTracks(graph, options.mapper.triangulation,
+        CompleteAndMergeAllTracks(graph, bounded_completion_options,
                                   reconstruction, &triangulator_cache);
     AccumulateTriangulationSummary(post_retriangulation_tracks,
                                    &summary.global_track_completion);
+    summary.global_track_completion_seconds += ElapsedSeconds(stage_start);
   }
 
   if (options.run_global_bundle_adjustment &&
       reconstruction->RegisteredImageIds().size() >= 2 &&
       !reconstruction->Points3D().empty()) {
+    auto stage_start = MappingClock::now();
     summary.global_bundle_adjustment = AdjustGlobalBundle(
         options.global_bundle_adjustment, reconstruction);
+    summary.global_bundle_adjustment_seconds = ElapsedSeconds(stage_start);
     if (!summary.global_bundle_adjustment.success) {
       summary.num_registered_images =
           reconstruction->RegisteredImageIds().size();
@@ -639,8 +719,9 @@ IncrementalMappingSummary RunIncrementalMapping(
     }
 
     if (options.run_global_track_completion) {
+      stage_start = MappingClock::now();
       const IncrementalTriangulatorSummary post_ba_tracks =
-          CompleteAndMergeAllTracks(graph, options.mapper.triangulation,
+          CompleteAndMergeAllTracks(graph, bounded_completion_options,
                                     reconstruction, &triangulator_cache);
       summary.global_track_completion.num_completed_observations +=
           post_ba_tracks.num_completed_observations;
@@ -648,11 +729,27 @@ IncrementalMappingSummary RunIncrementalMapping(
           post_ba_tracks.num_merged_points;
       summary.global_track_completion.num_merged_observations +=
           post_ba_tracks.num_merged_observations;
+      summary.global_track_completion_seconds += ElapsedSeconds(stage_start);
+    }
+
+    if (options.run_pose_guided_track_completion) {
+      stage_start = MappingClock::now();
+      summary.pose_guided_track_completion =
+          CompleteTracksByPoseAndDescriptors(
+              graph, bounded_completion_options, reconstruction);
+      summary.pose_guided_track_completion_seconds =
+          ElapsedSeconds(stage_start);
+      AccumulateTriangulationSummary(summary.pose_guided_track_completion,
+                                     &summary.global_track_completion);
+      summary.global_track_completion_seconds +=
+          summary.pose_guided_track_completion_seconds;
     }
 
     if (options.run_global_observation_filter) {
+      stage_start = MappingClock::now();
       summary.global_observation_filter = FilterObservationsAndPoints(
           options.global_observation_filter, reconstruction);
+      summary.global_observation_filter_seconds = ElapsedSeconds(stage_start);
       if (!summary.global_observation_filter.success) {
         summary.num_registered_images =
             reconstruction->RegisteredImageIds().size();
@@ -660,19 +757,46 @@ IncrementalMappingSummary RunIncrementalMapping(
         summary.message = summary.global_observation_filter.message;
         return summary;
       }
+
+      if (options.run_global_track_completion) {
+        stage_start = MappingClock::now();
+        const IncrementalTriangulatorSummary post_filter_tracks =
+            CompleteAndMergeAllTracks(graph, bounded_completion_options,
+                                      reconstruction, &triangulator_cache);
+        AccumulateTriangulationSummary(post_filter_tracks,
+                                       &summary.global_track_completion);
+        summary.global_track_completion_seconds += ElapsedSeconds(stage_start);
+      }
     }
 
     if (options.run_final_global_bundle_adjustment &&
         reconstruction->RegisteredImageIds().size() >= 2 &&
         !reconstruction->Points3D().empty()) {
+      stage_start = MappingClock::now();
       summary.final_global_bundle_adjustment = AdjustGlobalBundle(
           options.global_bundle_adjustment, reconstruction);
+      summary.final_global_bundle_adjustment_seconds =
+          ElapsedSeconds(stage_start);
       if (!summary.final_global_bundle_adjustment.success) {
         summary.num_registered_images =
             reconstruction->RegisteredImageIds().size();
         summary.num_points3d = reconstruction->Points3D().size();
         summary.message = summary.final_global_bundle_adjustment.message;
         return summary;
+      }
+
+      if (options.run_global_track_completion) {
+        stage_start = MappingClock::now();
+        // The final BA changes both camera intrinsics and 3D positions. Run a
+        // conservative all-inlier completion/merge pass on these final
+        // parameters; every added/merged observation is still required to
+        // satisfy the normal 4 px gate, and no point creation occurs here.
+        const IncrementalTriangulatorSummary final_tracks =
+            CompleteAndMergeAllTracks(graph, bounded_completion_options,
+                                      reconstruction, &triangulator_cache);
+        AccumulateTriangulationSummary(final_tracks,
+                                       &summary.global_track_completion);
+        summary.global_track_completion_seconds += ElapsedSeconds(stage_start);
       }
     }
   }

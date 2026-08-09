@@ -180,6 +180,42 @@ TEST(DenseMapIoTest, RoundTripsDepthAndNormalMapsAsBinary) {
   EXPECT_FALSE(loaded_normal.IsValid(0, 1));
 }
 
+TEST(DenseMapIoTest, ReadsColmapDepthAndNormalBinaryMaps) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() /
+      "colite_colmap_dense_map_binary_test";
+  std::filesystem::create_directories(root);
+
+  {
+    std::ofstream file(root / "depth.geometric.bin", std::ios::binary);
+    file << "2&1&1&";
+    const float values[] = {2.5F, 4.5F};
+    file.write(reinterpret_cast<const char*>(values), sizeof(values));
+  }
+  const DenseDepthMap depth =
+      ReadDenseDepthMapBinary(root / "depth.geometric.bin");
+  EXPECT_EQ(depth.Width(), 2U);
+  EXPECT_EQ(depth.Height(), 1U);
+  EXPECT_FLOAT_EQ(depth.Get(0, 0), 2.5F);
+  EXPECT_FLOAT_EQ(depth.Get(0, 1), 4.5F);
+  EXPECT_FLOAT_EQ(depth.DepthMin(), 2.5F);
+  EXPECT_FLOAT_EQ(depth.DepthMax(), 4.5F);
+
+  {
+    std::ofstream file(root / "normal.geometric.bin", std::ios::binary);
+    file << "1&2&3&";
+    // COLMAP serializes the complete x, y, then z channel.
+    const float values[] = {0.0F, 1.0F, 0.0F, 0.0F, -1.0F, 0.0F};
+    file.write(reinterpret_cast<const char*>(values), sizeof(values));
+  }
+  const NormalMap normal =
+      ReadNormalMapBinary(root / "normal.geometric.bin");
+  EXPECT_EQ(normal.Width(), 1U);
+  EXPECT_EQ(normal.Height(), 2U);
+  EXPECT_FLOAT_EQ(normal.Get(0, 0).z(), -1.0F);
+  EXPECT_FLOAT_EQ(normal.Get(1, 0).x(), 1.0F);
+}
+
 TEST(DenseMapIoTest, WritesCostMapAsDebugText) {
   const std::filesystem::path root =
       std::filesystem::temp_directory_path() / "colite_cost_map_io_test";

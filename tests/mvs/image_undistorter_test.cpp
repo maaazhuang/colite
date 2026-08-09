@@ -15,6 +15,10 @@ Camera MakeCamera(CameraModelId model_id) {
   camera.width = 80;
   camera.height = 60;
   camera.params = InitializeCameraParams(model_id, 60.0, 80, 60);
+  for (const std::size_t idx :
+       GetCameraModelSpec(model_id).distortion_idxs) {
+    camera.params[idx] = model_id == CameraModelId::kFOV ? 0.3 : 0.0005;
+  }
   return camera;
 }
 

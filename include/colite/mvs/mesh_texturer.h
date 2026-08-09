@@ -22,8 +22,15 @@ struct MeshTexturingOptions {
   double min_cos_normal_angle = 0.1;
   int min_visible_vertices = 3;
   int view_selection_smoothing_iterations = 3;
+  // Relabel smaller near-coplanar view islands when one neighboring view is
+  // valid for the complete island. Set to 0 to disable.
+  int view_selection_min_component_size = 64;
   int visibility_resolution = 1024;
   double occlusion_relative_tolerance = 0.01;
+  // Per-face vertex-color atlas patches expose rejected triangles as visible
+  // texture fragments. Keep them opt-in; rejected faces otherwise sample the
+  // neutral atlas background, matching COLMAP's conservative behavior.
+  bool use_vertex_color_fallback = false;
   bool apply_color_correction = true;
   double color_correction_regularization = 0.1;
   int num_threads = -1;

@@ -1,4 +1,5 @@
 add_executable(colite_core_tests
+  controllers/sfm_camera_setup_test.cpp
   core/camera_test.cpp
   core/geometry_test.cpp
   core/match_graph_test.cpp
@@ -13,6 +14,7 @@ add_executable(colite_core_tests
   integration/sfm_dependency_boundary_test.cpp
   matching/descriptor_matcher_test.cpp
   matching/guided_matching_test.cpp
+  matching/match_graph_consistency_test.cpp
   matching/pair_generator_test.cpp
   matching/two_view_geometry_batch_test.cpp
   matching/two_view_geometry_verifier_test.cpp
@@ -33,6 +35,7 @@ add_executable(colite_core_tests
   sfm/local_bundle_adjuster_test.cpp
   sfm/observation_manager_test.cpp
   sfm/observation_filter_test.cpp
+  sfm/reconstruction_manager_test.cpp
 )
 
 add_library(vlfeat_original_reference OBJECT

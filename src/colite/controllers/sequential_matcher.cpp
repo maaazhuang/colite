@@ -15,6 +15,8 @@
 #include "colite/core/parallel.h"
 #include "colite/io/sfm_workspace.h"
 #include "colite/matching/two_view_geometry_batch.h"
+#include "colite/matching/match_graph_consistency.h"
+#include "colite/matching/weak_pair_rematcher.h"
 
 namespace colite::controllers {
 namespace {
@@ -119,11 +121,17 @@ std::vector<std::pair<std::string, std::string>> RawMatchCacheEntries(
 }
 
 std::vector<std::pair<std::string, std::string>> GeometryCacheEntries(
+    const SequentialMatcherControllerOptions& options,
     const std::string& raw_match_hash) {
   return {{"stage", "geometry"},
           {"raw_match_hash", raw_match_hash},
+          {"guided_matching", options.guided_matching ? "1" : "0"},
+          {"guided_match_ratio", ToConfigValue(options.guided_match_ratio)},
+          {"guided_min_inlier_gain",
+           std::to_string(options.guided_min_inlier_gain)},
           {"keep_degenerate", "1"},
-          {"algorithm_version", "five_point_adaptive_lo_ransac_v3"},
+          {"algorithm_version",
+           "five_point_adaptive_lo_ransac_consistent_tracks_v4"},
           {"min_num_iterations", "100"},
           {"max_num_iterations", "10000"},
           {"confidence", "0.999"}};
@@ -174,7 +182,7 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
   const std::string raw_match_hash =
       StableConfigHash(RawMatchCacheEntries(options_, images, feature_hash));
   const std::string geometry_hash =
-      StableConfigHash(GeometryCacheEntries(raw_match_hash));
+      StableConfigHash(GeometryCacheEntries(options_, raw_match_hash));
 
   MatchingPairGeneratorOptions pair_options;
   pair_options.strategy = options_.matching_strategy;
@@ -303,9 +311,35 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
         std::stoull(metadata.values.at("verified_pairs")));
     summary.num_verified_inliers = static_cast<std::size_t>(
         std::stoull(metadata.values.at("verified_inliers")));
+    const auto read_guided_size = [&](const std::string& key) {
+      const auto it = metadata.values.find(key);
+      return it == metadata.values.end()
+                 ? std::size_t{0}
+                 : static_cast<std::size_t>(std::stoull(it->second));
+    };
+    summary.guided_matching.num_checked_pairs =
+        read_guided_size("guided_checked_pairs");
+    summary.guided_matching.num_rematched_pairs =
+        read_guided_size("guided_rematched_pairs");
+    summary.guided_matching.num_improved_pairs =
+        read_guided_size("guided_improved_pairs");
     summary.geometry_cache_hit = true;
   } else {
     VerifyMatchGraphGeometries(cameras_by_image, &graph, geometry_options);
+    if (options_.guided_matching) {
+      WeakPairRematchingOptions guided_options;
+      guided_options.nearby_image_window = 0;
+      guided_options.min_inlier_gain = options_.guided_min_inlier_gain;
+      guided_options.relaxed_matching = matching_options;
+      guided_options.relaxed_matching.max_ratio = options_.guided_match_ratio;
+      guided_options.relaxed_matching.mutual_check = true;
+      guided_options.guided_matching.max_sampson_error_px =
+          geometry_options.geometry_options.max_error_px;
+      guided_options.verification = geometry_options.geometry_options;
+      summary.guided_matching =
+          RematchWeakImagePairs(cameras_by_image, guided_options, &graph);
+    }
+    EnforceVerifiedMatchGraphConsistency(&graph);
     WriteWorkspaceVerifiedGeometries(options_.workspace_path, graph);
 
     for (const auto& [pair, geometry] : graph.verified_geometries) {
@@ -320,7 +354,13 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
     WriteWorkspaceCacheMetadata(
         options_.workspace_path, "geometry", geometry_hash,
         {{"verified_pairs", std::to_string(summary.num_verified_pairs)},
-         {"verified_inliers", std::to_string(summary.num_verified_inliers)}},
+         {"verified_inliers", std::to_string(summary.num_verified_inliers)},
+         {"guided_checked_pairs", std::to_string(
+              summary.guided_matching.num_checked_pairs)},
+         {"guided_rematched_pairs", std::to_string(
+              summary.guided_matching.num_rematched_pairs)},
+         {"guided_improved_pairs", std::to_string(
+              summary.guided_matching.num_improved_pairs)}},
         {"matches/verified_matches.tsv"});
   }
 
@@ -331,6 +371,12 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
   summary_file << "pairs " << summary.num_pairs << "\n"
                << "verified_pairs " << summary.num_verified_pairs << "\n"
                << "verified_inliers " << summary.num_verified_inliers
+               << "\nguided_checked_pairs "
+               << summary.guided_matching.num_checked_pairs
+               << "\nguided_rematched_pairs "
+               << summary.guided_matching.num_rematched_pairs
+               << "\nguided_improved_pairs "
+               << summary.guided_matching.num_improved_pairs
                << "\nretrieval_pairs "
                << summary.pair_generation.num_retrieval_pairs
                << "\nsequential_guard_pairs "

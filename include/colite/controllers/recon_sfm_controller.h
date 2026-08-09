@@ -9,7 +9,9 @@
 
 #include "colite/core/match_graph.h"
 #include "colite/core/reconstruction.h"
+#include "colite/controllers/sfm_camera_setup.h"
 #include "colite/features/sift_extractor.h"
+#include "colite/io/sfm_workspace.h"
 #include "colite/matching/descriptor_matcher.h"
 #include "colite/sfm/incremental_mapper.h"
 
@@ -18,7 +20,17 @@ namespace colite::controllers {
 struct ReconSfmControllerOptions {
   std::filesystem::path image_path;
   std::filesystem::path output_path;
+  std::filesystem::path input_model_path;
+  ColmapModelFormat input_model_format = ColmapModelFormat::kAuto;
+  ColmapModelFormat output_model_format =
+      ColmapModelFormat::kTextAndBinary;
+  bool resume = false;
+  bool force = false;
   double focal_length = 0.0;
+  CameraSharingMode camera_sharing_mode = CameraSharingMode::kAuto;
+  CameraModelId camera_model_id = CameraModelId::kSimpleRadial;
+  std::vector<double> camera_params;
+  double default_focal_length_factor = 1.2;
   int max_num_features = 4096;
   int feature_num_threads = -1;
   SiftBackend feature_backend = SiftBackend::kAuto;
@@ -27,8 +39,13 @@ struct ReconSfmControllerOptions {
   // requested by the caller.
   std::size_t nearby_match_window = 0;
   double nearby_match_ratio = 0.8;
+  double guided_match_ratio = 0.95;
   std::size_t max_registration_trials_per_image = 3;
   std::size_t max_initialization_trials = 3;
+  bool multiple_models = true;
+  bool merge_models = true;
+  std::size_t max_num_models = 50;
+  std::size_t min_num_images_per_model = 2;
   double registration_retry_reprojection_error_multiplier = 1.5;
   double registration_retry_max_reprojection_error_px = 8.0;
   CameraParameterGroup ba_refine_camera_params = CameraParameterGroup::kNone;
@@ -57,10 +74,22 @@ struct ReconSfmRunStats {
   double initial_focal_length = 0.0;
   std::string initial_focal_source;
   bool has_prior_focal_length = false;
+  std::string camera_sharing_mode;
+  std::size_t num_cameras = 0;
+  std::size_t num_prior_focal_images = 0;
+  double min_initial_focal_length = 0.0;
+  double max_initial_focal_length = 0.0;
   int cpu_threads = 1;
   std::size_t num_extracted_features = 0;
   std::size_t num_raw_matches = 0;
   std::size_t num_verified_inliers = 0;
+  std::size_t num_verified_inliers_before_consistency = 0;
+  std::size_t num_pair_match_conflicts_removed = 0;
+  std::size_t num_component_match_conflicts_removed = 0;
+  std::size_t num_conflicted_match_components = 0;
+  std::size_t num_conflicting_match_observations = 0;
+  std::size_t num_sparse_models = 0;
+  std::size_t num_unregistered_images = 0;
   std::size_t num_weak_pairs_checked = 0;
   std::size_t num_weak_pairs_rematched = 0;
   std::size_t num_weak_pairs_improved = 0;

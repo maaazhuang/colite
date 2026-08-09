@@ -115,6 +115,9 @@ TEST(MeshTexturingOptionsTest, ValidatesParameters) {
   options.texture_scale = 1.0;
   options.min_cos_normal_angle = 1.1;
   EXPECT_FALSE(options.Check());
+  options.min_cos_normal_angle = 0.1;
+  options.view_selection_min_component_size = -1;
+  EXPECT_FALSE(options.Check());
 }
 
 TEST(MeshTexturingTest, SelectsViewAndBakesAtlas) {
@@ -167,10 +170,10 @@ TEST(MeshTexturingTest, RejectsOccludedBackPlane) {
   EXPECT_EQ(textured.face_view_ids[3], -1);
 }
 
-TEST(MeshTexturingTest, ToleratesNearCoplanarSelfOcclusion) {
+TEST(MeshTexturingTest, DoesNotRecoverUnsupportedNearCoplanarSurface) {
   DenseTriangleMesh mesh = MakeTexturingPlane();
   DenseTriangleMesh near_plane = MakeTexturingPlane();
-  for (FusedPoint& vertex : near_plane.vertices) vertex.xyz.z() = 3.015;
+  for (FusedPoint& vertex : near_plane.vertices) vertex.xyz.z() = 3.03;
   const int offset = static_cast<int>(mesh.vertices.size());
   mesh.vertices.insert(mesh.vertices.end(), near_plane.vertices.begin(),
                        near_plane.vertices.end());
@@ -184,14 +187,29 @@ TEST(MeshTexturingTest, ToleratesNearCoplanarSelfOcclusion) {
   options.occlusion_relative_tolerance = 0.01;
   const TexturedTriangleMesh tolerant =
       TextureMesh(mesh, {MakeTextureView()}, options);
-  EXPECT_EQ(tolerant.face_view_ids[2], 0);
-  EXPECT_EQ(tolerant.face_view_ids[3], 0);
+  EXPECT_EQ(tolerant.face_view_ids[2], -1);
+  EXPECT_EQ(tolerant.face_view_ids[3], -1);
 
   options.occlusion_relative_tolerance = 0.0;
   const TexturedTriangleMesh strict =
       TextureMesh(mesh, {MakeTextureView()}, options);
   EXPECT_EQ(strict.face_view_ids[2], -1);
   EXPECT_EQ(strict.face_view_ids[3], -1);
+}
+
+TEST(MeshTexturingTest, LeavesRejectedFacesOnNeutralAtlasByDefault) {
+  const TexturedTriangleMesh textured =
+      TextureMesh(MakeTexturingPlane(), {});
+  ASSERT_EQ(textured.face_view_ids.size(), 2U);
+  const Eigen::Vector2f fallback_uv = textured.face_uvs.front();
+  EXPECT_GE(fallback_uv.minCoeff(), 0.0F);
+  EXPECT_LE(fallback_uv.maxCoeff(), 1.0F);
+  for (std::size_t face_id = 0; face_id < 2; ++face_id) {
+    EXPECT_EQ(textured.face_view_ids[face_id], -1);
+    EXPECT_EQ(textured.face_uvs[face_id * 3], fallback_uv);
+    EXPECT_EQ(textured.face_uvs[face_id * 3 + 1], fallback_uv);
+    EXPECT_EQ(textured.face_uvs[face_id * 3 + 2], fallback_uv);
+  }
 }
 
 TEST(MeshTexturingTest, BakesVertexColorsForFacesWithoutVisibleView) {
@@ -204,6 +222,7 @@ TEST(MeshTexturingTest, BakesVertexColorsForFacesWithoutVisibleView) {
       Eigen::Matrix<std::uint8_t, 3, 1>(200, 30, 40);
   MeshTexturingOptions options;
   options.atlas_size = 64;
+  options.use_vertex_color_fallback = true;
   const TexturedTriangleMesh textured = TextureMesh(mesh, {}, options);
   ASSERT_EQ(textured.face_view_ids.size(), 2U);
   EXPECT_EQ(textured.face_view_ids[0], -1);

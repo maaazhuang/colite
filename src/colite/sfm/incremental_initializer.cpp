@@ -23,6 +23,14 @@ bool IsUsableInitialGeometry(const TwoViewGeometry& geometry,
              options.min_triangulation_angle_deg;
 }
 
+bool IsAllowedInitialPair(
+    const ImagePair& pair,
+    const IncrementalInitializerOptions& options) {
+  return options.allowed_image_ids.empty() ||
+         (options.allowed_image_ids.count(pair.image_id1) != 0 &&
+          options.allowed_image_ids.count(pair.image_id2) != 0);
+}
+
 void EnsureImageAndCameraExist(const Reconstruction& reconstruction,
                                ImageId image_id) {
   if (!reconstruction.ExistsImage(image_id)) {
@@ -165,7 +173,8 @@ std::vector<ImagePair> SelectInitialImagePairCandidates(
   std::vector<std::pair<ImagePair, const TwoViewGeometry*>> candidates;
 
   for (const auto& [pair, geometry] : graph.verified_geometries) {
-    if (!IsUsableInitialGeometry(geometry, options)) {
+    if (!IsAllowedInitialPair(pair, options) ||
+        !IsUsableInitialGeometry(geometry, options)) {
       continue;
     }
     candidates.emplace_back(pair, &geometry);
@@ -215,6 +224,10 @@ IncrementalInitializerSummary InitializeReconstructionFromPair(
     Reconstruction* reconstruction) {
   IncrementalInitializerSummary summary;
   summary.initial_pair = initial_pair;
+  if (!IsAllowedInitialPair(initial_pair, options)) {
+    summary.message = "Initial pair is outside the allowed image set";
+    return summary;
+  }
 
   const TwoViewGeometry* geometry =
       FindVerifiedGeometry(graph, initial_pair.image_id1, initial_pair.image_id2);

@@ -9,11 +9,17 @@
 
 namespace colite::mvs {
 
+enum class SourceSelectionMode {
+  kWeighted,
+  kColmap,
+};
+
 // MVS 源视图候选。第一版按共享稀疏点数量排序，后续会加入三角角、尺度和视角约束。
 struct SourceImageScore {
   ImageId image_id = kInvalidImageId;
   std::size_t num_shared_points = 0;
   double mean_triangulation_angle_degrees = 0.0;
+  double triangulation_angle_percentile_degrees = 0.0;
   double mean_scale_ratio = 0.0;
   double coverage_score = 0.0;
   double score = 0.0;
@@ -46,6 +52,8 @@ struct ImageMvsSummary {
 struct MvsPipelineOptions {
   std::size_t max_num_source_images = 8;
   std::size_t min_num_shared_points = 1;
+  SourceSelectionMode source_selection_mode = SourceSelectionMode::kWeighted;
+  double triangulation_angle_percentile = 75.0;
   double min_triangulation_angle_degrees = 1.0;
   double max_triangulation_angle_degrees = 30.0;
   double triangulation_angle_weight = 1.0;

@@ -1,5 +1,6 @@
 #include "colite/exe/recon_sfm.h"
 
+#include <cmath>
 #include <exception>
 #include <ostream>
 #include <set>
@@ -28,6 +29,13 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --focal_length <px>       Initial focal length. If omitted, use "
          "JPEG EXIF 35mm/focal-plane prior when available, otherwise "
          "1.2 * max(width, height); EXIF values are marked as priors.\n"
+      << "  --camera_model <name>     Camera model, default SIMPLE_RADIAL.\n"
+      << "  --camera_params <csv>     Explicit parameters in model order.\n"
+      << "  --camera_mode <auto|single|per_folder|per_image>\n"
+         "                            Default auto groups complete EXIF camera "
+         "identities; shared/individual are compatibility aliases.\n"
+      << "  --default_focal_length_factor <f>\n"
+         "                            Missing-EXIF focal factor, default 1.2.\n"
       << "  --max_num_features <n>   SIFT feature limit, default 4096.\n"
       << "  --feature_num_threads <n>\n"
          "                            CPU feature extraction threads, default -1 "
@@ -41,12 +49,25 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
          "within this file-order window, default 0 disables it.\n"
       << "  --nearby_match_ratio <r> Relaxed Lowe ratio for neighboring pairs, "
          "default 0.8.\n"
+      << "  --guided_match_ratio <r> Lowe ratio for geometry-guided matching, "
+         "default 0.95; use 0.8 for COLMAP High same-descriptor studies.\n"
       << "  --max_registration_trials_per_image <n>\n"
          "                            Maximum registration attempts per image, "
          "default 3.\n"
       << "  --max_initialization_trials <n>\n"
          "                            Maximum initial image-pair candidates to "
          "try, default 3.\n"
+      << "  --input_model_path <dir> Continue from an existing COLMAP model.\n"
+      << "  --input_format <auto|txt|bin>\n"
+         "                            Input model format, default auto.\n"
+      << "  --output_format <txt|bin|both>\n"
+         "                            Sparse model format, default both.\n"
+      << "  --resume                  Reuse valid feature/frontend/sparse stages.\n"
+      << "  --force                   Recompute all SfM stages.\n"
+      << "  --multiple_models <0|1>  Reconstruct remaining components, default 1.\n"
+      << "  --merge_models <0|1>     Merge Sim(3)-alignable models, default 1.\n"
+      << "  --max_num_models <n>     Maximum sparse models, default 50.\n"
+      << "  --min_model_size <n>     Minimum registered images per model, default 2.\n"
       << "  --registration_retry_error_multiplier <r>\n"
          "                            PnP reprojection threshold multiplier per "
          "failed retry, default 1.5.\n"
@@ -61,7 +82,7 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
          "default 0.\n"
       << "  --ba_refine_extra_params <0|1>\n"
          "                            Refine distortion/extra camera params in "
-         "local/global BA, default 0.\n"
+         "local/global BA, default 1.\n"
       << "  --ba_refine_params <names>\n"
          "                            Comma-separated camera params to refine, "
          "e.g. fx,fy,k1,p2.\n";
@@ -121,12 +142,46 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
       options.show_help = true;
     } else if (arg == "--version") {
       options.show_version = true;
+    } else if (arg == "--resume") {
+      options.resume = true;
+    } else if (arg == "--force") {
+      options.force = true;
     } else if (arg == "--image_path") {
       options.image_path = RequireValue(args, &i, arg);
     } else if (arg == "--output_path") {
       options.output_path = RequireValue(args, &i, arg);
+    } else if (arg == "--input_model_path") {
+      options.input_model_path = RequireValue(args, &i, arg);
+    } else if (arg == "--input_format") {
+      options.input_model_format =
+          ColmapModelFormatFromString(RequireValue(args, &i, arg));
+      if (options.input_model_format == ColmapModelFormat::kTextAndBinary) {
+        throw std::invalid_argument("--input_format does not accept both");
+      }
+    } else if (arg == "--output_format") {
+      options.output_model_format =
+          ColmapModelFormatFromString(RequireValue(args, &i, arg));
+      if (options.output_model_format == ColmapModelFormat::kAuto) {
+        throw std::invalid_argument("--output_format does not accept auto");
+      }
     } else if (arg == "--focal_length") {
       options.focal_length = std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--camera_model") {
+      options.camera_model_id =
+          CameraModelNameToId(RequireValue(args, &i, arg));
+      if (!ExistsCameraModel(options.camera_model_id)) {
+        throw std::invalid_argument("Unsupported camera model");
+      }
+    } else if (arg == "--camera_params") {
+      options.camera_params =
+          controllers::ParseCameraParams(RequireValue(args, &i, arg));
+    } else if (arg == "--camera_mode") {
+      options.camera_sharing_mode =
+          controllers::CameraSharingModeFromName(
+              RequireValue(args, &i, arg));
+    } else if (arg == "--default_focal_length_factor") {
+      options.default_focal_length_factor =
+          std::stod(RequireValue(args, &i, arg));
     } else if (arg == "--max_num_features") {
       options.max_num_features = std::stoi(RequireValue(args, &i, arg));
     } else if (arg == "--feature_num_threads") {
@@ -139,11 +194,25 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
           static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
     } else if (arg == "--nearby_match_ratio") {
       options.nearby_match_ratio = std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--guided_match_ratio") {
+      options.guided_match_ratio = std::stod(RequireValue(args, &i, arg));
     } else if (arg == "--max_registration_trials_per_image") {
       options.max_registration_trials_per_image =
           static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
     } else if (arg == "--max_initialization_trials") {
       options.max_initialization_trials =
+          static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
+    } else if (arg == "--multiple_models") {
+      options.multiple_models =
+          ParseBoolFlagValue(RequireValue(args, &i, arg), arg);
+    } else if (arg == "--merge_models") {
+      options.merge_models =
+          ParseBoolFlagValue(RequireValue(args, &i, arg), arg);
+    } else if (arg == "--max_num_models") {
+      options.max_num_models =
+          static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
+    } else if (arg == "--min_model_size") {
+      options.min_num_images_per_model =
           static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
     } else if (arg == "--registration_retry_error_multiplier") {
       options.registration_retry_reprojection_error_multiplier =
@@ -186,6 +255,9 @@ void ValidateOptions(const ReconSfmCliOptions& options) {
   if (options.show_help || options.show_version) {
     return;
   }
+  if (options.resume && options.force) {
+    throw std::invalid_argument("--resume and --force are mutually exclusive");
+  }
   if (options.image_path.empty()) {
     throw std::invalid_argument("Missing required argument --image_path");
   }
@@ -198,8 +270,26 @@ void ValidateOptions(const ReconSfmCliOptions& options) {
   if (options.focal_length < 0.0) {
     throw std::invalid_argument("--focal_length must be non-negative");
   }
+  if (!ExistsCameraModel(options.camera_model_id)) {
+    throw std::invalid_argument("--camera_model is unsupported");
+  }
+  if (!std::isfinite(options.default_focal_length_factor) ||
+      options.default_focal_length_factor <= 0.0) {
+    throw std::invalid_argument(
+        "--default_focal_length_factor must be positive");
+  }
+  if (!options.camera_params.empty() &&
+      options.camera_params.size() !=
+          GetCameraModelSpec(options.camera_model_id).param_names.size()) {
+    throw std::invalid_argument(
+        "--camera_params count does not match --camera_model");
+  }
   if (options.nearby_match_ratio <= 0.0 || options.nearby_match_ratio > 1.0) {
     throw std::invalid_argument("--nearby_match_ratio must be in (0, 1]");
+  }
+  if (options.guided_match_ratio <= 0.0 ||
+      options.guided_match_ratio > 1.0) {
+    throw std::invalid_argument("--guided_match_ratio must be in (0, 1]");
   }
   if (options.max_registration_trials_per_image == 0) {
     throw std::invalid_argument(
@@ -207,6 +297,11 @@ void ValidateOptions(const ReconSfmCliOptions& options) {
   }
   if (options.max_initialization_trials == 0) {
     throw std::invalid_argument("--max_initialization_trials must be positive");
+  }
+  if (options.max_num_models == 0 ||
+      options.min_num_images_per_model < 2) {
+    throw std::invalid_argument(
+        "--max_num_models must be positive and --min_model_size >= 2");
   }
   if (options.registration_retry_reprojection_error_multiplier < 1.0) {
     throw std::invalid_argument(
@@ -223,17 +318,33 @@ controllers::ReconSfmControllerOptions ToControllerOptions(
   controllers::ReconSfmControllerOptions controller_options;
   controller_options.image_path = options.image_path;
   controller_options.output_path = options.output_path;
+  controller_options.input_model_path = options.input_model_path;
+  controller_options.input_model_format = options.input_model_format;
+  controller_options.output_model_format = options.output_model_format;
+  controller_options.resume = options.resume;
+  controller_options.force = options.force;
   controller_options.focal_length = options.focal_length;
+  controller_options.camera_sharing_mode = options.camera_sharing_mode;
+  controller_options.camera_model_id = options.camera_model_id;
+  controller_options.camera_params = options.camera_params;
+  controller_options.default_focal_length_factor =
+      options.default_focal_length_factor;
   controller_options.max_num_features = options.max_num_features;
   controller_options.feature_num_threads = options.feature_num_threads;
   controller_options.feature_backend = options.feature_backend;
   controller_options.matcher_backend = options.matcher_backend;
   controller_options.nearby_match_window = options.nearby_match_window;
   controller_options.nearby_match_ratio = options.nearby_match_ratio;
+  controller_options.guided_match_ratio = options.guided_match_ratio;
   controller_options.max_registration_trials_per_image =
       options.max_registration_trials_per_image;
   controller_options.max_initialization_trials =
       options.max_initialization_trials;
+  controller_options.multiple_models = options.multiple_models;
+  controller_options.merge_models = options.merge_models;
+  controller_options.max_num_models = options.max_num_models;
+  controller_options.min_num_images_per_model =
+      options.min_num_images_per_model;
   controller_options.registration_retry_reprojection_error_multiplier =
       options.registration_retry_reprojection_error_multiplier;
   controller_options.registration_retry_max_reprojection_error_px =

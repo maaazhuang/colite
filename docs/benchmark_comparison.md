@@ -608,7 +608,11 @@ COLMAP 为 0.2461，修复后 Colite 为 **0.1641**；该全场景指标包含�
 完整命令、A/B、中间 dense maps、点云、网格、纹理、时间/RSS/GPU 日志和 JSON
 位于 `output/mvs_mesh_planarity_house_20260727/`。
 
-### GUI High 纹理三角形孔洞修复（2026-07-28）
+### 历史 GUI High 纹理三角形孔洞方案（2026-07-28，已废弃）
+
+后续同网格 A/B 证明该方案通过过度接受可疑投影和逐三角 fallback 换取接近
+100% 的 UV 覆盖，正是平面三角纹理碎片的主要来源。以下数据仅保留为历史对照，
+当前默认行为以“House 同网格视图碎片修复（2026-07-29）”一节为准。
 
 复用上一节修复后的 63,328 顶点/112,107 面 trim 10 简化网格，不重跑
 PatchMatch/Fusion。原 OBJ 没有丢面或退化几何，但 21,388 个面被严格 BVH
@@ -659,6 +663,29 @@ PatchMatch/Fusion。原 OBJ 没有丢面或退化几何，但 21,388 个面被�
 许可证边界：局部偏移场依据 Waechter 2014 能量独立实现，COLMAP 4.0
 BSD-3-Clause 代码只用于行为核对；OpenMVS 的 AGPL-3.0 实现未移植，后续也
 仅采用论文/公开参数层面的 clean-room 设计。
+
+## House 同网格视图碎片修复（2026-07-29）
+
+固定上述 112,107 面网格、相机和去畸变图像，对提交 `eac2246` 的 Colite 与
+WSL COLMAP 4.0 做同网格 A/B。修复前 Colite 将完整 1% 端点容差用于所有面，
+并逐三角烘焙遮挡拒绝面的 RGB fallback；因此有效 UV 面达到 99.90%，但产生
+23,264 个 atlas charts 和 17,142 个单面 charts。
+
+修复后主选择的端点带限制为 0.5%，完整 1% 容差只用于近共面、同视图双邻面
+支持且再次通过 BVH 的孔洞恢复；小于 64 面的近共面视图孤岛在整块候选有效且
+总投影面积至少保留 50% 时合并，逐三角 fallback 默认关闭。
+
+| 指标 | 修复前 Colite | 修复后 Colite | COLMAP 4.0 |
+|---|---:|---:|---:|
+| 有效纹理面比例 | 99.90% | **87.96%** | 88.82% |
+| atlas chart | 23,264 | **11,300** | 14,742 |
+| 单面 chart | 17,142 | **7,003** | 7,872 |
+| 不超过 3 面 chart | 20,271 | **9,438** | 11,590 |
+| 纹理流形边缝边率 | 31.12% | **17.10%** | 23.01% |
+
+修复后与 COLMAP 的纹理面交并比为 94.28%，覆盖率只差 0.86 个百分点；纹理
+耗时 6.05 s，峰值 RSS 1,014,392 KiB。完整参数扫描、日志、JSON 和最终
+OBJ/PNG 位于 `output/texture_view_fragmentation_house_20260729/`。
 
 ## 历史默认大图 MVS 性能
 
@@ -795,3 +822,287 @@ Automatic High、Colite 独立全流程、共用 COLMAP 相机的受控 MVS 和 
 
 完整参数、耗时、内存、GPU 采样、点云/网格/纹理路径和统计 JSON 见该输出目录的
 `测试说明.md`。
+
+## House High PatchMatch/Fusion 交叉诊断（2026-07-29）
+
+复用 `output/colmap4_auto_high_house_20260728/` 的同一套 COLMAP 相机、2400×1597 图像和 High 参数，在 `output/mvs_fusion_cross_house_20260729/` 完成深度图、法线图和 Fusion 后端交叉。
+
+| 深度/法线输入 | Fusion | RGB 点数 |
+|---|---|---:|
+| Colite（修复前逐像素 graph） | Colite | 2,073,022 |
+| Colite（20 源图遍历） | Colite | 2,298,163 |
+| Colite（再统一法线朝向） | Colite | 2,386,766 |
+| Colite | COLMAP 4.0 | 2,395,492 |
+| COLMAP | Colite | 2,591,903 |
+| COLMAP | COLMAP 4.0 | 2,667,152 |
+
+结论：
+
+- 已完成几何过滤后再次只沿逐像素 consistency graph 遍历会重复约束。改为 20 张有序重叠源图投影验证后增加 225,141 点，Fusion core 从 62.04 秒降到 46.15 秒。
+- PatchMatch 平面代价不能区分 `n/-n`。统一法线朝向参考相机后再增加 88,603 点；同一 Colite 输入下两套 Fusion 只差 8,726 点（0.36%），Fusion 点数差距基本消除。
+- COLMAP 输入经 Colite Fusion 为 2,591,903 点，相对 COLMAP 自身少 2.82%，主要来自重叠图像选择和边界认领细节。
+- 修复后受控 Colite 相对 COLMAP High 仍少 10.51%。深度×法线交叉显示，换用 COLMAP 法线可把 Colite 深度提升到 2,498,004 点，而 COLMAP 深度配 Colite 法线为 2,202,333 点；但符号修复后两套原生组合的法线角 P50 已接近（22.28°/22.66°），Colite 图的投影拒绝仍高 16.3%。下一质量热点是 PatchMatch 深度/平面法线的跨视图重投影一致性，不能把混合实验简单解释为单独法线方差。
+- 四邻域深度差分法线只得到 2,105,576 点，屋瓦/深度噪声会放大局部法线抖动，因此该方案被否定。
+
+完整脚本、命令、拒绝计数、误差分布、耗时、内存和点云见 `output/mvs_fusion_cross_house_20260729/测试说明.md`。
+
+## Building-18 每图/共享相机策略（2026-07-30，历史消融）
+
+此项记录默认 Auto 策略落地前的 Per-image/Single 消融。SfM 图像导入从“第一张
+图的尺寸和 EXIF 强制共享给全部图像”改为支持每图独立 Camera。使用 18 张同设备、同尺寸、同 EXIF 的
+building-18，固定 CUDA VLFeat 8192、CUDA matcher、8 线程和相同 Mapper：
+
+| 指标 | Individual | Shared |
+|---|---:|---:|
+| 注册 | 18/18 | 18/18 |
+| Camera | 18 | 1 |
+| 点 / 观测 | 25,378 / 90,457 | 25,681 / 90,961 |
+| 平均 track | 3.5644 | 3.5420 |
+| 平均重投影 | 0.62582 px | 0.63007 px |
+| wall / RSS | 29.21 s / 885,808 KiB | 29.33 s / 886,516 KiB |
+
+两组前端 descriptor、raw match 和 verified inlier 完全一致；Individual BA 后
+焦距范围 2501.25–2625.60 px，未出现发散。混合尺寸和逐图 EXIF 的确定性测试
+共 29 项通过。完整日志和模型位于：
+
+- `output/sfm_camera_policy_mixed_20260730/`
+- `output/sfm_camera_policy_building18_20260730/`
+
+### Fusion 候选解耦与 PatchMatch 源采样先验（2026-07-29）
+
+进一步核对 COLMAP 4.0 后确认，PatchMatch 的 20 个 source 与 Fusion 默认检查
+50 个重叠图像是两套独立参数。Colite 原先共用一个上限，使 Fusion 提前截断。
+现在 Fusion 按共享稀疏点数独立重算最多 50 个候选，最小三角化角为 0°：
+
+- 同一 Colite maps 从 20 候选的 2,386,766 点增至 2,473,488（+3.63%）。
+- 同一 COLMAP maps 经 Colite Fusion 得到 2,666,592 点，对比 COLMAP 自身
+  2,667,152 点仅少 560（-0.02%）。Fusion 主算法的点数差距已基本闭合。
+
+PatchMatch 源视图名单也新增 `colmap` 模式：75% 分位三角化角至少 1°，再按
+共享点数排序。House 的 720 个候选槽位与原 weighted 模式重合 98.61%，800 px
+实验中只额外提升 0.34%，说明名单不是主要瓶颈。真正有效的是 CUDA CDF source
+采样加入 COLMAP 式三角化角、入射角和局部单应分辨率先验：
+
+| 800 px 组合 | PatchMatch | 平均代价 | Fusion 点 |
+|---|---:|---:|---:|
+| 原实现 | 98.05 s | 0.26348 | 287,344 |
+| 几何先验 | 98.23 s | 0.22492 | 303,978 |
+| COLMAP 名单 + 几何先验 | 98.94 s | 0.22484 | 305,007 |
+
+几何先验以 0.18 秒代价增加 5.79% 融合点，已作为 CUDA PatchMatch 生产默认；
+可用 `--patch_match_no_colmap_source_priors` 做兼容 A/B。全尺寸 2400×1597
+冷启动验证使用 COLMAP source mode、20 个 PatchMatch source、50 个 Fusion
+candidates 和原有 10°法向阈值：
+
+| High 指标 | 优化后 Colite | 旧 Colite（50 candidates） | COLMAP 4.0 |
+|---|---:|---:|---:|
+| PatchMatch wall | 849.40 s | 约 809.3 s | 1450.6 s |
+| PatchMatch 峰值 RSS | 9,142,008 KiB | 约 9.05 GiB | 未重跑 |
+| Fusion wall / core | 68.52 / 54.64 s | 未单列 | 约 22.5 s |
+| Fusion 峰值 RSS | 8,729,516 KiB | 未单列 | 未重跑 |
+| RGB+normal 点 | **2,641,922** | 2,473,488 | 2,667,152 |
+
+全尺寸点数提升 168,434（+6.81%），距 COLMAP 仅 -0.95%；PatchMatch 仍比
+COLMAP 快约 41.4%。当前质量差距已从原始受控基准的 22.3% 收敛到 1%内。
+后续 MVS 优先级转为 Fusion 50-view 工作集的时间/内存优化，以及在不破坏
+10°严格法向一致性的前提下继续降低平面法线近阈值抖动。完整 A/B 和原始产物见：
+
+- `output/mvs_source_selection_house_20260729/`
+- `output/mvs_patchmatch_source_priors_house_20260729/`
+- `output/mvs_patchmatch_priors_house_high_20260729/`
+
+## House SfM 长轨迹优化（2026-07-30，Per-image 消融）
+
+在当时的 `per_image` 配置、每图 EXIF、CUDA VLFeat SIFT 8192、CUDA matcher、
+8 线程和增量式 SfM 下，严格重跑当前代码基线后，Colite 为 44,292 点、
+131,478 观测、平均 track 2.968。通过联合多视图 merge、单冲突观测稳健合并、
+逐观测局部过滤，以及局部 BA/全局过滤/最终 BA 后重新 complete/merge，最终得到
+40,043 点、134,389 观测和平均 track 3.356；观测增加 2.21%，`track>=4` 的观测
+占比由 41.96% 提升到 52.41%。唯一视图平均 track 由 2.925 提升到 3.284。
+
+COLMAP 4.0 参考为 39,505 点、147,672 观测、平均 track 3.738。当前点数已接近，
+剩余差距主要是少 13,283 个观测，而不是点数过多；同图重复观测仍为 2,886，对比
+COLMAP 的 330，表明下一优化重点应是 verified/guided 匹配图的一对多冲突一致化，
+不应继续靠强制 merge 压低点数。完整消融、命令、时间、内存、模型和分布 JSON
+位于 `output/sfm_long_tracks_house_20260730/`。
+
+## House guided/verified 匹配图一致性（2026-07-30）
+
+使用 `data/house`、CUDA VLFeat 风格 SIFT、8192 特征、CUDA exhaustive/guided matcher、
+8 CPU 线程、Per-image cameras 和增量式 SfM。相对长轨迹优化 v8：
+
+| 指标 | v8 | pose-aware 一致性 | 变化 |
+|---|---:|---:|---:|
+| 注册图像 | 36 | 36 | 0 |
+| 稀疏点 | 40,043 | 40,353 | +310 |
+| 唯一视图观测 | 131,503 | 132,309 | +806 |
+| 同图重复观测 | 2,886 | 0 | -100% |
+| 唯一视图平均 track | 3.2840 | 3.2788 | -0.0052 |
+| track≥4 观测 | 67,222 | 67,334 | +112 |
+| SfM wall | 100.65 s | 106.81 s | +6.16 s |
+
+House 的 332,718 条 verified edges 在 pair 内没有一对多冲突，但形成 1,527 个含同图竞争的
+跨图组件。硬拆全局组件会删除 84k–109k 条 verified edges，并将最终观测降到
+108k–117k，故未采用。最终实现保留 verified 证据，在 PnP/complete/merge 阶段按已知位姿
+与重投影误差消解冲突。
+
+## 12相机模型与默认 Auto 策略对照（2026-07-30）
+
+现有12种模型已补齐统一投影、稳健反投影、BA、去畸变、参数合法性和读写测试；
+COLMAP 4.0 成功对含全部12模型的合成 text model 完成 binary 往返，模型名、
+参数数量和数值保持一致。完整 CTest 为343/343通过。
+
+默认由历史 `PINHOLE + per_image + 不优化畸变` 改为
+`SIMPLE_RADIAL + auto + 优化焦距/畸变`。House 冷启动中 Colite 与 COLMAP 4.0
+都把36张图按 EXIF Auto 分成1个 Camera，初始焦距均为3059.4539605 px：
+
+| 指标 | Colite | COLMAP 4.0 |
+|---|---:|---:|
+| 注册 / Camera | 36 / 1 | 36 / 1 |
+| 稀疏点 / 观测 | 46,221 / 145,708 | 40,508 / 150,729 |
+| 平均 track | 3.15242 | 3.72097 |
+| track=2 / track≥4 点 | 28,308 / 11,226 | 14,559 / 15,085 |
+| 平均重投影 | 1.13199 px | 1.14578 px |
+| SfM wall | 133.41 s | 78.43 s |
+
+相机分组和初始焦距已完全对齐，最终焦距仅差0.17%。Colite 仍表现为点更多但
+短轨迹比例高、总观测少；差距主要来自 descriptor/匹配集合及多视图轨迹处理，
+不是 EXIF 或默认焦距。完整模型、命令和资源日志位于：
+
+- `output/camera_models_colmap4_ab_20260730/`
+- `output/camera_models_house_colmap4_20260730/`
+## P0–P5 收口验证（2026-08-01，跳过 P1）
+
+本轮按确认目标执行 P0、P2–P5，明确冻结 P1 的 SIFT 特征上限与多方向语义。
+
+- P0：SfM 模型支持 COLMAP 兼容 TXT、BIN、both 和 auto 读取；12 个现有相机模型、
+  位姿、RGB、Point2D/Point3D、track 与含空格相对路径完成往返测试。`recon_sfm`
+  持久化相机/图像、逐图特征、raw matches、verified geometry 和阶段哈希，支持
+  `--resume`/`--force`；主要 MVS 阶段可读取已完成稀疏模型与 dense maps 继续执行。
+- P2：严格一图一观测后 House 为约 46.2k 点、145.7k 观测、平均 track 3.15，
+  相对旧基线约 2.97 明显提高。未达到 3.7 的剩余差距来自冻结的 P1 匹配拓扑，
+  不再以同图重复观测或删点伪造长轨迹。
+- P3：按图像稠密 correspondence adjacency 将 Mapper 76.39→73.87 s；COLMAP
+  4.0 Mapper 为 54.55 s。限制重三角化、unordered adjacency 和 AutoDiff BA
+  均因质量或耗时退化而回退。
+- P4：保留既有视图流式落盘、有界 Fusion cache 和 binary float 输出。packed
+  normal 在 240 s 未完成（旧基准 115.18 s），缩小 worker cache 会触发 I/O
+  抖动，均回退；下一步必须是 tile cache/source-affinity 级重构。
+- P5：800 px House 中，共面邻居传播虽增点 2.92%，但 24-NN 平面残差 median
+  0.12006→0.13898；顺序 sweep 7 分钟未完成；边缘感知法线平滑使点数下降
+  3.58% 且残差升至 0.12552。三项均回退，避免把错误深度平滑成连续伪面。
+
+最终 CUDA Release 全量测试为 344/344 通过，另有 1 项因 CUDA 当前可用而条件
+跳过，总耗时 14.19 s。原始命令、计时、RSS、点云和平面度 JSON 位于：
+`output/p0_resume_baseline_20260801/`、`output/sfm_p3_*_house_20260801/`、
+`output/mvs_p4_packed_normal_fusion_house_20260801/` 和
+`output/mvs_p5_planar_support_house_20260801/`。
+
+## House guided ratio 与前端拓扑隔离（2026-08-09）
+
+使用 COLMAP 4.0 House 数据库的同一套关键点和描述子隔离测试后，Colite CUDA 原始匹配得到 223,256 条边，完整包含 COLMAP 的 223,043 条边，召回率 100%、精确率 99.9046%。因此 CUDA descriptor matcher 不是 Colite 自有图偏稀的原因。
+
+COLMAP High 在 guided matching 中继续使用 `max_ratio=0.8`。同描述子 A/B 中，Colite ratio 0.8/0.9/0.95 相对 COLMAP verified 图的 precision 分别为 84.14%/53.51%/34.88%，Jaccard 为 71.37%/48.91%/32.94%，确认旧的隐式 0.95 不能代表 COLMAP High 同描述子语义。CLI 现开放独立 `--guided_match_ratio`，不再把 guided 比率隐式绑定到 nearby matching。
+
+但 Colite 自有 CUDA VLFeat 严格 8192 特征/图时，全局 ratio 0.8/0.9/0.94 最终仅保留 79,351/114,910/139,555 observations，均低于 0.95 生产基线 146,640；对应 mean track 为 4.080/3.479/3.230。故 `recon_sfm` 暂保留 0.95 默认值以满足“观测总数不下降”，standalone matcher 的同描述子默认值为 0.8。跨图冲突硬剪枝也只得到 123,012 observations，已回退。
+
+描述子 uint8/512 量化只使 raw matches 从 71,907 变为 71,909，可排除量化。CPU VLFeat 虽得到 232,513 raw matches，但实际平均输出 12,120 特征/图；COLMAP House 也因多方向语义平均超过 10k，而当前 CUDA 分支固定 8192。该差异属于本轮冻结的 P1（特征上限与多方向语义），不能通过扩容特征解决。
+
+在保持 P1 冻结后，首轮图内 completion 对前四跳无候选的目标自适应扩展到六跳；随后新增最终位姿双描述子补全：已有 Point3D 投影到尚未观测的注册图像，只接受 2 px 邻域内、与至少两条现有轨迹描述子的归一化角距离第二优值不超过 0.301 rad 的未分配特征，再经过全局过滤和最终 BA。最终确定性复跑得到 46,058 点、152,013 observations、mean track **3.300469**、重复观测 0，平均重投影误差 1.118657 px；其中 pose-guided 阶段新增 5,196 observations，仅耗时 0.105 s。Mapper 61.989 s，为 COLMAP 54.55 s 的 1.136×。相对 146,640 / 3.179876 基线增加 5,373 observations，达到阶段目标且未靠删点或重复观测抬高指标。完整原始记录见 `output/p2_matcher_colmap_descriptors_*_house_20260809/`、`output/p2_guided_ratio*_house*_20260809/`、`output/p2_completion_adaptive_depth6_house_20260809/`、`output/p2_pose_guided_completion_angle0301_house_20260809/` 和 `output/p2_pose_guided_completion_final_house_20260809/`。
+
+## P0/P2 第二轮性能与资源验收（2026-08-01）
+
+本轮固定 House、8 CPU 线程、CUDA SIFT/CUDA matcher/CUDA PatchMatch、增量式 SfM，
+继续冻结 P1 的 SIFT 8192 上限与多方向语义。三个 P0 与两个 P2 的验收结果如下：
+
+| 项目 | Colite 结果 | COLMAP 4.0 参考 | 状态 |
+|---|---:|---:|---|
+| P0 Fusion（2296 px） | 30.63 s，3.74 GiB | 28.54 s | 达标，1.073× |
+| P0 MVS 峰值内存（2296 px 全流程） | 6,146,208 KiB / 17:16.21 | 初始 Colite 7,435,184 KiB / 16:46.41 | 首阶段达标，5.86 GiB |
+| P0 PatchMatch 平面度 | 2,492,697 点，median/P95 0.14450/0.37018 | 旧 Colite 0.18413/0.41458 | 达标，-21.52%/-10.71% |
+| P2 Mapper | 61.989 s | 54.55 s | 达标，1.136× |
+| P2 SfM 长轨迹 | 152,013 观测，mean track 3.300469，重复观测 0 | mean track 3.738 | 首阶段达标，观测较旧基线 +5,373 |
+
+Fusion 不再加载几何过滤后已无判定用途的 consistency graph。内存式 MVS 将
+PatchMatch depth/normal/cost 的所有权直接移交给 Fusion，CUDA refinement 通过
+非拥有指针引用 source depth；大图只保留一个 refinement workspace，并在 CPU
+consistency graph 构建前释放 device/pinned workspace。该组合将全流程峰值压到
+5.53 GiB，同时 Fusion core 保持 29.42 s。
+
+Mapper 的主要收益来自三处：全局 complete/merge 第一轮扫描全部点、后续仅扫描
+真正发生 complete/merge 的 dirty points；默认 SIMPLE_PINHOLE、PINHOLE 和
+SIMPLE_RADIAL 路径使用投影、相机参数及归一化四元数解析 Jacobian；首轮 graph
+completion 对前四跳无候选的目标自适应扩展至六跳。全局 BA 后的 pose-guided 阶段再以
+最终位姿、2 px 重投影窗口和双描述子一致性保守补全观测。House 最终保持 46,058 点，
+观测由旧基线 146,640 增至 152,013，平均重投影误差 1.118657 px，未以删点、重复观测
+或减少 BA 换取指标和耗时。
+
+长轨迹方面，基于空间邻近或硬拆跨图冲突组件的强制合并会引入缺乏匹配证据的错误轨迹，
+均已拒绝。最终位姿补全只接受轨迹中至少两条描述子共同支持的未分配特征，新增 5,196 个
+观测仅耗时 0.105 s，将 mean track 提升到 3.300469，达到冻结 P1 条件下的首阶段目标。
+
+完整目标、命令与原始结果位于：
+
+- `output/optimization_p0_p2_house_20260801/`
+- `output/p0_fusion_graphless_house_20260801/`
+- `output/p0_mvs_bounded_workspace_house2296_20260801/`
+- `output/p0_patchmatch_geom_weight06_house800_20260801/`
+- `output/p0_patchmatch_geom_weight10_filter1_house800_20260801/`
+- `output/p2_mapper_quaternion_jacobian_house_20260801/`
+- `output/p2_pose_guided_completion_final_house_20260809/`
+
+### 2026-08-02 继续优化结果
+
+PatchMatch 旧 CUDA 路径把 `1.0` 同时当作光度无效哨兵和组合代价上界；几何项叠加后
+大于 1 的合法 source 因而被误删。单独改为非有限哨兵可恢复覆盖率，但会暴露 source
+深度噪声。最终组合进一步把几何项从光度 source 排名中解耦，以有效 source-depth
+重投影误差的较低一半均值形成稳健跨视图共识。2296px 相对旧有界 workspace 基线：
+
+- 点数 2,441,416→2,492,697（+2.10%），观测 49,035,385→51,376,638（+4.77%）；
+- median 0.184127→0.144495（-21.52%），P95 0.414580→0.370183（-10.71%）；
+- wall 17:13.50→17:16.21（+0.26%），RSS 5.53→5.86 GiB，仍低于 6 GiB。
+
+SfM 全局 completion 可穿越已关联/冲突中间观测寻找后续安全候选。逐 Point3D 五跳 BFS
+虽增加 1,050 观测，但使 Mapper 升到 80.35 s。最终实现改为 8 线程只读计算四跳
+Point2D proposals、按误差确定性串行提交，得到 46,140 点、146,531 观测、mean
+3.175791、重复观测 0；Mapper 61.921 s。最终模型的一跳 verified 上限只剩 1 个可补
+观测和 1 对 disjoint merge，说明冻结 P1 后无法在不引入无证据合并的情况下达到 3.3。
+
+对同一最终模型继续做冲突消解与空间合并上限审计：同图冲突 6,258 个中，仅 132 个
+候选能以至少 0.25 px 改善当前观测；4,442 对“删除同图冲突后可合并”的轨迹会累计
+丢失 7,064 个观测，mean 仅到 3.1847。6 px 空间邻近虽然可在数字上提供 1,870 次
+不丢观测合并，但 3,462 个几何候选中仅 100 个具有四跳以内 verified 路径，其余会把
+同一表面上的不同特征错误折叠。上述两种统计优化均被拒绝，生产结果维持 3.175791。
+verified 图本身存在一个 170,496 特征节点、37,576 个现有 3D 点的巨型重复纹理组件，
+因此也不能按完整连通分量建轨；若继续冲击 3.3，必须解除 P1 冻结并改善描述子匹配
+拓扑，而不是继续放宽 Mapper 的几何门槛。
+
+完整结果位于：
+
+- `output/p0_patchmatch_robust_geom_house2296_20260802/`
+- `output/p2_track_parallel_depth4_house_20260802/`
+- `output/p2_mapper_quaternion_jacobian_house_20260801/verified_merge_upper_bound.json`
+
+### House P2 匹配图归因与单次第五跳（2026-08-09）
+
+COLMAP 4.0 数据库有 367,448 条 verified 边，Colite 自有图为 333,097 条；边数仅差
+10.3%，但无三角闭环支持的比例分别为 26.8% 和 55.6%，三角支持 >=3 的边分别为
+174,498 和 74,222。将 COLMAP 图原样转换给 Colite Mapper 后，Colite 输出
+40,495 点、154,880 观测、mean track 3.824670、同图重复观测 0；COLMAP 模型为
+39,505 点、147,672 观测、mean 3.738058。这证明当前 Mapper 能利用长轨迹证据，
+自有结果未达 3.3 的主因是冻结 P1 后的 verified 图闭环拓扑。
+
+不修改 P1 的生产改进仅在第一次全局 complete/merge 对四跳内无安全候选的目标搜索
+第五跳，后续 BA/过滤后的 completion 仍固定四跳。House 得到 46,115 点、146,640
+观测、mean 3.179876、重复观测 0，Mapper 61.653 s；相对四跳基线增加 109 观测，
+同时比 61.921 s 略快。完整命令和数据位于：
+
+- `output/p2_track_colmap_graph_audit_house_20260802/`
+- `output/p2_track_single_extended_pass_house_20260809/`
+
+另外测试了不改变 SIFT 数量的两跳闭环补边：候选必须有至少两个共同中间特征，且
+通过描述子 0.7 和最终相机几何 2 px 门槛。22,863 条补边若从初始化开始启用会使
+mean 3.179876→3.177407；仅用于已完成模型续建时，相对严格控制组也只净增 35 个
+观测、mean +0.000550，wall 增加 0.56 s。该方案收益不足，未进入生产路径；原始
+数据位于 `output/p2_track_cycle_closure_house_20260809/` 和
+`output/p2_track_cycle_closure_postmap_mapper_house_20260809/`。

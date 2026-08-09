@@ -1,10 +1,12 @@
 #include "colite/features/sift_extractor.h"
 
 #include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 #include <limits>
 #include <tuple>
 #include <vector>
@@ -68,6 +70,23 @@ TEST(SiftExtractorTest, ExtractsFeaturesFromSyntheticImage) {
   EXPECT_EQ(features.descriptors.rows(),
             static_cast<Eigen::Index>(features.keypoints.size()));
   EXPECT_EQ(features.descriptors.cols(), 128);
+}
+
+TEST(SiftExtractorTest, ListsImagesRecursivelyWithStablePaths) {
+  const std::filesystem::path root =
+      std::filesystem::temp_directory_path() /
+      "colite_recursive_image_listing_test";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root / "a");
+  std::filesystem::create_directories(root / "b");
+  ASSERT_TRUE(cv::imwrite((root / "a" / "same.png").string(),
+                          MakeSyntheticImage()));
+  ASSERT_TRUE(cv::imwrite((root / "b" / "same.png").string(),
+                          MakeSyntheticImage()));
+  const std::vector<std::filesystem::path> images = ListImageFiles(root);
+  ASSERT_EQ(images.size(), 2U);
+  EXPECT_EQ(images[0], root / "a" / "same.png");
+  EXPECT_EQ(images[1], root / "b" / "same.png");
 }
 
 TEST(SiftExtractorTest, CvSiftHandlesKernelWiderThanSmallestPyramidLevel) {

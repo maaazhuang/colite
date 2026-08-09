@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <ostream>
 #include <queue>
@@ -31,10 +32,13 @@
 #include "colite/core/reconstruction.h"
 #include "colite/features/sift_extractor.h"
 #include "colite/io/camera_prior.h"
+#include "colite/io/sfm_workspace.h"
 #include "colite/matching/descriptor_matcher.h"
+#include "colite/matching/match_graph_consistency.h"
 #include "colite/matching/two_view_geometry_batch.h"
 #include "colite/matching/weak_pair_rematcher.h"
 #include "colite/sfm/incremental_mapper.h"
+#include "colite/sfm/reconstruction_manager.h"
 
 namespace colite::controllers {
 
@@ -79,53 +83,6 @@ class ScopedParallelThreads {
  private:
   int previous_num_threads_;
 };
-
-Camera MakeCameraFromImage(const std::filesystem::path& image_path,
-                           double focal_length) {
-  const cv::Mat image = cv::imread(image_path.string(), cv::IMREAD_COLOR);
-  if (image.empty()) {
-    throw std::runtime_error("Failed to read image: " + image_path.string());
-  }
-
-  Camera camera;
-  camera.id = 1;
-  camera.model_id = CameraModelId::kPinhole;
-  camera.width = static_cast<std::uint32_t>(image.cols);
-  camera.height = static_cast<std::uint32_t>(image.rows);
-  const InitialFocalLengthEstimate focal =
-      colite::EstimateInitialFocalLengthPriorFromImage(image_path,
-                                                       focal_length);
-  camera.params = InitializeCameraParams(
-      camera.model_id, focal.pixels, camera.width, camera.height);
-  camera.has_prior_focal_length = focal.has_prior;
-  return camera;
-}
-
-void EnsureSameImageSize(const std::vector<std::filesystem::path>& image_paths,
-                         const Camera& camera) {
-  for (const std::filesystem::path& image_path : image_paths) {
-    const cv::Mat image = cv::imread(image_path.string(), cv::IMREAD_COLOR);
-    if (image.empty()) {
-      throw std::runtime_error("Failed to read image: " + image_path.string());
-    }
-    if (image.cols != static_cast<int>(camera.width) ||
-        image.rows != static_cast<int>(camera.height)) {
-      throw std::runtime_error(
-          "All images must have the same size in the first CLI version.");
-    }
-  }
-}
-
-Image MakeImage(ImageId image_id,
-                CameraId camera_id,
-                const std::filesystem::path& image_path) {
-  Image image;
-  image.id = image_id;
-  image.camera_id = camera_id;
-  image.name = image_path.filename().string();
-  image.file_path = image_path.string();
-  return image;
-}
 
 std::optional<Eigen::Vector3d> SampleRgbBilinear(const cv::Mat& image_bgr,
                                                   double x,
@@ -664,6 +621,14 @@ void WriteRunSummary(const std::filesystem::path& output_path,
                << "\n"
                << "has_prior_focal_length "
                << (run_stats.has_prior_focal_length ? 1 : 0) << "\n"
+               << "camera_mode " << run_stats.camera_sharing_mode << "\n"
+               << "num_cameras " << run_stats.num_cameras << "\n"
+               << "num_prior_focal_images "
+               << run_stats.num_prior_focal_images << "\n"
+               << "min_initial_focal_length "
+               << run_stats.min_initial_focal_length << "\n"
+               << "max_initial_focal_length "
+               << run_stats.max_initial_focal_length << "\n"
                << "cpu_threads " << run_stats.cpu_threads << "\n"
                << "matcher_backend " << run_stats.matcher_backend << "\n"
                << "num_extracted_features "
@@ -671,6 +636,19 @@ void WriteRunSummary(const std::filesystem::path& output_path,
                << "num_raw_matches " << run_stats.num_raw_matches << "\n"
                << "num_verified_inliers " << run_stats.num_verified_inliers
                << "\n"
+               << "num_verified_inliers_before_consistency "
+               << run_stats.num_verified_inliers_before_consistency << "\n"
+               << "pair_match_conflicts_removed "
+               << run_stats.num_pair_match_conflicts_removed << "\n"
+               << "component_match_conflicts_removed "
+               << run_stats.num_component_match_conflicts_removed << "\n"
+               << "conflicted_match_components "
+               << run_stats.num_conflicted_match_components << "\n"
+               << "conflicting_match_observations "
+               << run_stats.num_conflicting_match_observations << "\n"
+               << "sparse_models " << run_stats.num_sparse_models << "\n"
+               << "unregistered_images "
+               << run_stats.num_unregistered_images << "\n"
                << "feature_extraction_seconds "
                << run_stats.feature_extraction_seconds << "\n"
                << "frontend_pipeline_seconds "
@@ -694,6 +672,48 @@ void WriteRunSummary(const std::filesystem::path& output_path,
                << "\n"
                << "incremental_mapping_seconds "
                << run_stats.incremental_mapping_seconds << "\n"
+               << "mapper_initialization_seconds "
+               << summary.initialization_seconds << "\n"
+               << "mapper_candidate_selection_seconds "
+               << summary.candidate_selection_seconds << "\n";
+  double registration_seconds = 0.0;
+  double track_completion_seconds = 0.0;
+  double triangulation_seconds = 0.0;
+  double local_retriangulation_seconds = 0.0;
+  double local_ba_seconds = 0.0;
+  double local_filter_seconds = 0.0;
+  for (const IncrementalMapperSummary& registration : summary.registrations) {
+    registration_seconds += registration.registration_seconds;
+    track_completion_seconds += registration.track_completion_seconds;
+    triangulation_seconds += registration.triangulation_seconds;
+    local_retriangulation_seconds +=
+        registration.local_retriangulation_seconds;
+    local_ba_seconds += registration.local_bundle_adjustment_seconds;
+    local_filter_seconds += registration.observation_filter_seconds;
+  }
+  summary_file << "mapper_registration_seconds " << registration_seconds
+               << "\n"
+               << "mapper_track_completion_seconds "
+               << track_completion_seconds << "\n"
+               << "mapper_triangulation_seconds " << triangulation_seconds
+               << "\n"
+               << "mapper_local_retriangulation_seconds "
+               << local_retriangulation_seconds << "\n"
+               << "mapper_local_ba_seconds " << local_ba_seconds << "\n"
+               << "mapper_local_filter_seconds " << local_filter_seconds
+               << "\n"
+               << "mapper_global_track_completion_seconds "
+               << summary.global_track_completion_seconds << "\n"
+               << "mapper_pose_guided_track_completion_seconds "
+               << summary.pose_guided_track_completion_seconds << "\n"
+               << "mapper_global_retriangulation_seconds "
+               << summary.global_retriangulation_seconds << "\n"
+               << "mapper_global_ba_seconds "
+               << summary.global_bundle_adjustment_seconds << "\n"
+               << "mapper_global_filter_seconds "
+               << summary.global_observation_filter_seconds << "\n"
+               << "mapper_final_global_ba_seconds "
+               << summary.final_global_bundle_adjustment_seconds << "\n"
                << "color_extraction_seconds "
                << run_stats.color_extraction_seconds << "\n"
                << "output_write_seconds " << run_stats.output_write_seconds
@@ -710,6 +730,10 @@ void WriteRunSummary(const std::filesystem::path& output_path,
                << "\n"
                << "global_completed_observations "
                << summary.global_track_completion.num_completed_observations
+               << "\n"
+               << "pose_guided_completed_observations "
+               << summary.pose_guided_track_completion
+                      .num_completed_observations
                << "\n"
                << "global_merged_points "
                << summary.global_track_completion.num_merged_points << "\n"
@@ -1056,16 +1080,142 @@ std::vector<FeatureSet> ExtractFeaturesForImages(
   return features;
 }
 
+std::string ReconFeatureConfigHash(
+    const ReconSfmControllerOptions& options,
+    const std::vector<std::filesystem::path>& image_paths) {
+  std::vector<std::pair<std::string, std::string>> entries = {
+      {"stage", "features"},
+      {"algorithm_version", "recon_sfm_features_v1"},
+      {"feature_backend", std::to_string(static_cast<int>(options.feature_backend))},
+      {"max_num_features", std::to_string(options.max_num_features)},
+      {"camera_mode",
+       std::string(CameraSharingModeName(options.camera_sharing_mode))},
+      {"camera_model", std::to_string(static_cast<int>(options.camera_model_id))},
+      {"focal_length", std::to_string(options.focal_length)},
+      {"default_focal_factor", std::to_string(options.default_focal_length_factor)}};
+  for (std::size_t idx = 0; idx < options.camera_params.size(); ++idx) {
+    entries.emplace_back("camera_param_" + std::to_string(idx),
+                         std::to_string(options.camera_params[idx]));
+  }
+  for (std::size_t idx = 0; idx < image_paths.size(); ++idx) {
+    const std::filesystem::path& path = image_paths[idx];
+    const std::string prefix = "image_" + std::to_string(idx) + "_";
+    entries.emplace_back(prefix + "path", path.generic_string());
+    entries.emplace_back(prefix + "size",
+                         std::to_string(std::filesystem::file_size(path)));
+    entries.emplace_back(
+        prefix + "mtime",
+        std::to_string(std::filesystem::last_write_time(path)
+                           .time_since_epoch()
+                           .count()));
+  }
+  return StableConfigHash(entries);
+}
+
+std::string ReconFrontendConfigHash(
+    const ReconSfmControllerOptions& options,
+    const std::string& feature_hash) {
+  return StableConfigHash(
+      {{"stage", "geometry"},
+       {"algorithm_version", "recon_sfm_guided_consistency_v2"},
+       {"feature_hash", feature_hash},
+       {"matcher_backend", std::to_string(static_cast<int>(options.matcher_backend))},
+       {"nearby_window", std::to_string(options.nearby_match_window)},
+       {"nearby_ratio", std::to_string(options.nearby_match_ratio)},
+       {"guided_ratio", std::to_string(options.guided_match_ratio)}});
+}
+
+std::string ReconSparseConfigHash(
+    const ReconSfmControllerOptions& options,
+    const std::string& frontend_hash) {
+  return StableConfigHash(
+      {{"stage", "recon_sfm"},
+       {"algorithm_version", "recon_sfm_resume_multimodel_v6_pose_guided_tracks"},
+       {"frontend_hash", frontend_hash},
+       {"input_model", options.input_model_path.generic_string()},
+       {"input_format", ColmapModelFormatToString(options.input_model_format)},
+       {"output_format", ColmapModelFormatToString(options.output_model_format)},
+       {"multiple_models", options.multiple_models ? "1" : "0"},
+       {"merge_models", options.merge_models ? "1" : "0"},
+       {"max_num_models", std::to_string(options.max_num_models)},
+       {"min_model_size", std::to_string(options.min_num_images_per_model)},
+       {"max_registration_trials",
+        std::to_string(options.max_registration_trials_per_image)},
+       {"max_initialization_trials",
+        std::to_string(options.max_initialization_trials)},
+       {"ba_groups",
+        std::to_string(static_cast<int>(options.ba_refine_camera_params))}});
+}
+
+std::vector<std::filesystem::path> ReconFeatureRequiredFiles(
+    const std::vector<ImageId>& image_ids) {
+  std::vector<std::filesystem::path> files{"cameras.txt", "images.tsv"};
+  for (const ImageId image_id : image_ids) {
+    files.push_back(std::filesystem::path("features") /
+                    (std::to_string(image_id) + ".bin"));
+  }
+  return files;
+}
+
+std::vector<std::filesystem::path> ReconOutputRequiredFiles(
+    const ColmapModelFormat format, const std::size_t num_models) {
+  std::vector<std::filesystem::path> files{
+      "../points3D.ply", "../summary.txt", "../models.txt"};
+  if (format == ColmapModelFormat::kText ||
+      format == ColmapModelFormat::kTextAndBinary) {
+    files.insert(files.end(), {"../cameras.txt", "../images.txt",
+                               "../points3D.txt"});
+  }
+  if (format == ColmapModelFormat::kBinary ||
+      format == ColmapModelFormat::kTextAndBinary) {
+    files.insert(files.end(), {"../cameras.bin", "../images.bin",
+                               "../points3D.bin"});
+  }
+  for (std::size_t model_idx = 0; model_idx < num_models; ++model_idx) {
+    const std::filesystem::path model =
+        std::filesystem::path("../models") / std::to_string(model_idx);
+    files.push_back(model / "points3D.ply");
+    files.push_back(model / "summary.txt");
+    if (format == ColmapModelFormat::kText ||
+        format == ColmapModelFormat::kTextAndBinary) {
+      files.insert(files.end(), {model / "cameras.txt", model / "images.txt",
+                                 model / "points3D.txt"});
+    }
+    if (format == ColmapModelFormat::kBinary ||
+        format == ColmapModelFormat::kTextAndBinary) {
+      files.insert(files.end(), {model / "cameras.bin", model / "images.bin",
+                                 model / "points3D.bin"});
+    }
+  }
+  return files;
+}
+
 }  // namespace
 
 int ReconSfmController::Run(std::ostream& out) const {
   const ReconSfmControllerOptions& options = options_;
   const std::filesystem::path image_dir(options.image_path);
   const std::filesystem::path output_dir(options.output_path);
+  const std::filesystem::path workspace_dir = output_dir / "workspace";
   const std::vector<std::filesystem::path> image_paths =
       ListImageFiles(image_dir);
   if (image_paths.size() < 2) {
     throw std::runtime_error("Need at least two input images.");
+  }
+  const std::string feature_hash =
+      ReconFeatureConfigHash(options, image_paths);
+  const std::string frontend_hash =
+      ReconFrontendConfigHash(options, feature_hash);
+  const std::string sparse_hash =
+      ReconSparseConfigHash(options, frontend_hash);
+  if (options.resume && !options.force && options.input_model_path.empty() &&
+      WorkspaceCacheIsValid(workspace_dir, "recon_sfm", sparse_hash)) {
+    const WorkspaceCacheMetadata metadata =
+        ReadWorkspaceCacheMetadata(workspace_dir, "recon_sfm");
+    out << "SfM cache hit: 1\n"
+        << "Registered images: " << metadata.values.at("registered_images")
+        << "\nPoints3D: " << metadata.values.at("points3d") << "\n";
+    return 0;
   }
 
   const int cpu_threads =
@@ -1074,8 +1224,16 @@ int ReconSfmController::Run(std::ostream& out) const {
   const ScopedParallelThreads run_thread_scope(cpu_threads);
   const auto total_start = std::chrono::steady_clock::now();
 
-  Camera camera = MakeCameraFromImage(image_paths.front(), options.focal_length);
-  EnsureSameImageSize(image_paths, camera);
+  SfmCameraSetupOptions camera_options;
+  camera_options.sharing_mode = options.camera_sharing_mode;
+  camera_options.model_id = options.camera_model_id;
+  camera_options.focal_length = options.focal_length;
+  camera_options.camera_params = options.camera_params;
+  camera_options.image_root = options.image_path;
+  camera_options.default_focal_length_factor =
+      options.default_focal_length_factor;
+  const SfmCameraSetup camera_setup =
+      BuildSfmCameraSetup(image_paths, camera_options);
 
   SiftExtractionOptions sift_options;
   sift_options.max_num_features = options.max_num_features;
@@ -1083,24 +1241,56 @@ int ReconSfmController::Run(std::ostream& out) const {
 
   MatchGraph graph;
   Reconstruction reconstruction;
-  reconstruction.AddCamera(camera);
+  for (const Camera& camera : camera_setup.cameras) {
+    reconstruction.AddCamera(camera);
+  }
 
   std::vector<ImageId> image_ids;
   image_ids.reserve(image_paths.size());
   for (std::size_t i = 0; i < image_paths.size(); ++i) {
     const ImageId image_id = static_cast<ImageId>(i + 1);
     image_ids.push_back(image_id);
-    reconstruction.AddImage(MakeImage(image_id, camera.id, image_paths[i]));
+    reconstruction.AddImage(camera_setup.images[i]);
+  }
+  WriteWorkspaceCameras(workspace_dir, camera_setup.cameras);
+  WriteWorkspaceImages(workspace_dir, camera_setup.images);
+  if (!options.input_model_path.empty()) {
+    reconstruction = ApplyColmapModel(reconstruction,
+                                      options.input_model_path,
+                                      options.input_model_format);
   }
 
-  const auto feature_start = std::chrono::steady_clock::now();
-  const std::vector<FeatureSet> extracted_features = ExtractFeaturesForImages(
-      image_paths, sift_options, options.feature_num_threads);
-  const auto feature_end = std::chrono::steady_clock::now();
-  const double feature_extraction_seconds =
-      std::chrono::duration<double>(feature_end - feature_start).count();
-  for (std::size_t i = 0; i < extracted_features.size(); ++i) {
-    SetFeatures(&graph, image_ids[i], extracted_features[i]);
+  double feature_extraction_seconds = 0.0;
+  bool feature_cache_hit = false;
+  if (options.resume && !options.force &&
+      WorkspaceCacheIsValid(workspace_dir, "features", feature_hash)) {
+    ReadWorkspaceFeatureSets(workspace_dir, &graph);
+    feature_cache_hit = true;
+  } else {
+    const auto feature_start = std::chrono::steady_clock::now();
+    const std::vector<FeatureSet> extracted_features =
+        ExtractFeaturesForImages(image_paths, sift_options,
+                                 options.feature_num_threads);
+    feature_extraction_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - feature_start).count();
+    for (std::size_t i = 0; i < extracted_features.size(); ++i) {
+      SetFeatures(&graph, image_ids[i], extracted_features[i]);
+      WriteWorkspaceFeatureSet(workspace_dir, image_ids[i],
+                               extracted_features[i]);
+    }
+    WriteWorkspaceCacheMetadata(
+        workspace_dir, "features", feature_hash,
+        {{"images", std::to_string(image_ids.size())},
+         {"features", [&]() {
+            std::size_t count = 0;
+            for (const FeatureSet& features : extracted_features) {
+              count += features.keypoints.size();
+            }
+            return std::to_string(count);
+          }()},
+         {"feature_extraction_seconds",
+          std::to_string(feature_extraction_seconds)}},
+        ReconFeatureRequiredFiles(image_ids));
   }
 
 
@@ -1110,18 +1300,47 @@ int ReconSfmController::Run(std::ostream& out) const {
   run_stats.feature_backend = SiftBackendName(resolved_feature_backend);
   run_stats.cuda_sift_available = IsCudaSiftAvailable();
   run_stats.cuda_matcher_available = IsCudaDescriptorMatcherAvailable();
-  const InitialFocalLengthEstimate initial_focal =
-      EstimateInitialFocalLengthPriorFromImage(image_paths.front(),
-                                               options.focal_length);
-  run_stats.initial_focal_length = initial_focal.pixels;
-  run_stats.initial_focal_source =
-      InitialFocalLengthSourceName(initial_focal.source);
-  run_stats.has_prior_focal_length = initial_focal.has_prior;
+  const InitialFocalLengthEstimate& initial_focal =
+      camera_setup.focal_estimates.front();
+  if (camera_setup.cameras.size() == 1) {
+    run_stats.initial_focal_length =
+        camera_setup.cameras.front().MeanFocalLength();
+    run_stats.initial_focal_source =
+        options.focal_length > 0.0
+            ? "user"
+            : (camera_setup.cameras.front().has_prior_focal_length
+                   ? "shared_exif_median"
+                   : "image_size_default");
+    run_stats.has_prior_focal_length =
+        camera_setup.cameras.front().has_prior_focal_length;
+  } else {
+    run_stats.initial_focal_length = initial_focal.pixels;
+    run_stats.initial_focal_source =
+        InitialFocalLengthSourceName(initial_focal.source);
+    run_stats.has_prior_focal_length = initial_focal.has_prior;
+  }
+  run_stats.camera_sharing_mode =
+      CameraSharingModeName(options.camera_sharing_mode);
+  run_stats.num_cameras = camera_setup.cameras.size();
+  run_stats.min_initial_focal_length = initial_focal.pixels;
+  run_stats.max_initial_focal_length = initial_focal.pixels;
+  for (const InitialFocalLengthEstimate& focal :
+       camera_setup.focal_estimates) {
+    run_stats.min_initial_focal_length =
+        std::min(run_stats.min_initial_focal_length, focal.pixels);
+    run_stats.max_initial_focal_length =
+        std::max(run_stats.max_initial_focal_length, focal.pixels);
+    if (focal.has_prior) {
+      ++run_stats.num_prior_focal_images;
+    }
+  }
   run_stats.cpu_threads = cpu_threads;
   run_stats.feature_extraction_seconds = feature_extraction_seconds;
-  for (const FeatureSet& features : extracted_features) {
+  for (const auto& [image_id, features] : graph.features) {
+    (void)image_id;
     run_stats.num_extracted_features += features.keypoints.size();
   }
+  out << "Feature cache hit: " << (feature_cache_hit ? 1 : 0) << "\n";
 
   DescriptorMatchingOptions matching_options;
   matching_options.backend = options.matcher_backend;
@@ -1142,7 +1361,9 @@ int ReconSfmController::Run(std::ostream& out) const {
 
   std::map<ImageId, Camera> cameras_by_image;
   for (const ImageId image_id : image_ids) {
-    cameras_by_image.emplace(image_id, camera);
+    const Image& image = reconstruction.GetImage(image_id);
+    cameras_by_image.emplace(
+        image_id, reconstruction.GetCamera(image.camera_id));
   }
   TwoViewGeometryBatchOptions geometry_options;
   geometry_options.keep_degenerate = true;
@@ -1153,15 +1374,24 @@ int ReconSfmController::Run(std::ostream& out) const {
   weak_pair_options.nearby_image_window = 0;
   weak_pair_options.min_inlier_gain = 10;
   weak_pair_options.relaxed_matching = matching_options;
-  weak_pair_options.relaxed_matching.max_ratio =
-      std::max(options.nearby_match_ratio, 0.95);
+  weak_pair_options.relaxed_matching.max_ratio = options.guided_match_ratio;
   weak_pair_options.relaxed_matching.mutual_check = true;
   weak_pair_options.guided_matching.max_sampson_error_px =
       geometry_options.geometry_options.max_error_px;
   weak_pair_options.verification = geometry_options.geometry_options;
   WeakPairRematchingSummary weak_pair_summary;
 
-  if (matching_options.backend ==
+  const bool frontend_cache_hit =
+      options.resume && !options.force &&
+      WorkspaceCacheIsValid(workspace_dir, "geometry", frontend_hash);
+  if (frontend_cache_hit) {
+    ReadWorkspaceMatches(workspace_dir, &graph);
+    ReadWorkspaceVerifiedGeometries(workspace_dir, &graph);
+    const WorkspaceCacheMetadata metadata =
+        ReadWorkspaceCacheMetadata(workspace_dir, "geometry");
+    run_stats.num_raw_matches =
+        static_cast<std::size_t>(std::stoull(metadata.values.at("raw_matches")));
+  } else if (matching_options.backend ==
       DescriptorMatcherBackend::kCudaBruteForce) {
     const FrontendPipelineSummary pipeline_summary =
         RunCudaFrontendPipeline(image_ids, cameras_by_image, matching_options,
@@ -1210,10 +1440,39 @@ int ReconSfmController::Run(std::ostream& out) const {
       weak_pair_summary.descriptor_search_work_seconds;
   run_stats.weak_geometry_verification_work_seconds =
       weak_pair_summary.geometry_verification_work_seconds;
+  const MatchGraphConsistencySummary consistency_summary =
+      EnforceVerifiedMatchGraphConsistency(&graph);
+  run_stats.num_verified_inliers_before_consistency =
+      consistency_summary.num_input_edges;
+  run_stats.num_pair_match_conflicts_removed =
+      consistency_summary.num_invalid_edges +
+      consistency_summary.num_exact_duplicate_edges +
+      consistency_summary.num_pair_conflict_edges;
+  run_stats.num_component_match_conflicts_removed =
+      consistency_summary.num_cross_component_conflict_edges;
+  run_stats.num_conflicted_match_components =
+      consistency_summary.num_input_conflicted_components;
+  run_stats.num_conflicting_match_observations =
+      consistency_summary.num_input_conflicting_observations;
   for (const auto& [pair, geometry] : graph.verified_geometries) {
     (void)pair;
     run_stats.num_verified_inliers += geometry.inlier_matches.size();
   }
+  if (!frontend_cache_hit) {
+    WriteWorkspaceMatches(workspace_dir, graph);
+    WriteWorkspaceVerifiedGeometries(workspace_dir, graph);
+    WriteWorkspaceCacheMetadata(
+        workspace_dir, "matching", frontend_hash,
+        {{"raw_matches", std::to_string(run_stats.num_raw_matches)}},
+        {"matches/raw_matches.tsv"});
+    WriteWorkspaceCacheMetadata(
+        workspace_dir, "geometry", frontend_hash,
+        {{"raw_matches", std::to_string(run_stats.num_raw_matches)},
+         {"verified_inliers",
+          std::to_string(run_stats.num_verified_inliers)}},
+        {"matches/raw_matches.tsv", "matches/verified_matches.tsv"});
+  }
+  out << "Frontend cache hit: " << (frontend_cache_hit ? 1 : 0) << "\n";
 
   IncrementalMappingOptions mapping_options;
   // 局部 re-triangulation 比首次建点更积极，因此单独增加一层角度分层：
@@ -1239,34 +1498,97 @@ int ReconSfmController::Run(std::ostream& out) const {
   mapping_options.registration_retry_max_reprojection_error_px =
       options.registration_retry_max_reprojection_error_px;
   const auto mapping_start = std::chrono::steady_clock::now();
-  IncrementalMappingSummary summary =
-      RunIncrementalMapping(graph, mapping_options, &reconstruction);
+  MultiModelMappingOptions multi_options;
+  multi_options.mapping = mapping_options;
+  multi_options.max_num_models =
+      options.multiple_models ? options.max_num_models : 1;
+  multi_options.min_num_images_per_model =
+      options.min_num_images_per_model;
+  multi_options.merge_models = options.merge_models;
+  MultiModelMappingResult mapping_result = RunIncrementalMappingMultiple(
+      graph, multi_options, std::move(reconstruction));
+  if (mapping_result.models.empty()) {
+    throw std::runtime_error("SfM did not produce a valid sparse model");
+  }
+  std::vector<std::size_t> model_order(mapping_result.models.size());
+  std::iota(model_order.begin(), model_order.end(), std::size_t{0});
+  std::sort(model_order.begin(), model_order.end(),
+            [&](std::size_t lhs, std::size_t rhs) {
+              return mapping_result.models[lhs].RegisteredImageIds().size() >
+                     mapping_result.models[rhs].RegisteredImageIds().size();
+            });
+  Reconstruction& primary =
+      mapping_result.models[model_order.front()];
+  IncrementalMappingSummary& summary =
+      mapping_result.mapping_summaries[model_order.front()];
+  run_stats.num_sparse_models = mapping_result.models.size();
+  run_stats.num_unregistered_images =
+      mapping_result.num_unregistered_images;
   run_stats.incremental_mapping_seconds = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - mapping_start).count();
   const auto color_start = std::chrono::steady_clock::now();
-  ExtractPointColors(&reconstruction);
+  for (Reconstruction& model : mapping_result.models) {
+    ExtractPointColors(&model);
+  }
   run_stats.color_extraction_seconds = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - color_start).count();
   std::filesystem::create_directories(output_dir);
   const auto output_start = std::chrono::steady_clock::now();
-  WritePairDiagnostics(output_dir, reconstruction, graph);
+  WritePairDiagnostics(output_dir, primary, graph);
   WriteRegistrationDiagnostics(output_dir, summary);
-  WriteColmapTextModel(output_dir, reconstruction);
-  WritePlyPointCloud(output_dir / "points3D.ply", reconstruction);
+  WriteColmapReconstruction(output_dir, primary,
+                            options.output_model_format);
+  WritePlyPointCloud(output_dir / "points3D.ply", primary);
+  for (std::size_t output_idx = 0; output_idx < model_order.size();
+       ++output_idx) {
+    const std::filesystem::path model_path =
+        output_dir / "models" / std::to_string(output_idx);
+    const Reconstruction& model =
+        mapping_result.models[model_order[output_idx]];
+    WriteColmapReconstruction(model_path, model,
+                              options.output_model_format);
+    WritePlyPointCloud(model_path / "points3D.ply", model);
+  }
+  std::ofstream models_file(output_dir / "models.txt");
+  models_file << "# MODEL_INDEX REGISTERED_IMAGES POINTS3D PATH\n";
+  for (std::size_t output_idx = 0; output_idx < model_order.size();
+       ++output_idx) {
+    const Reconstruction& model =
+        mapping_result.models[model_order[output_idx]];
+    models_file << output_idx << " " << model.RegisteredImageIds().size()
+                << " " << model.Points3D().size() << " models/"
+                << output_idx << "\n";
+  }
   run_stats.output_write_seconds = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - output_start).count();
   run_stats.total_seconds = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - total_start).count();
-  WriteRunSummary(output_dir, reconstruction, summary, run_stats);
+  WriteRunSummary(output_dir, primary, summary, run_stats);
+  for (std::size_t output_idx = 0; output_idx < model_order.size();
+       ++output_idx) {
+    const std::size_t model_idx = model_order[output_idx];
+    WriteRunSummary(output_dir / "models" / std::to_string(output_idx),
+                    mapping_result.models[model_idx],
+                    mapping_result.mapping_summaries[model_idx], run_stats);
+  }
+  WriteWorkspaceCacheMetadata(
+      workspace_dir, "recon_sfm", sparse_hash,
+      {{"registered_images", std::to_string(summary.num_registered_images)},
+       {"points3d", std::to_string(summary.num_points3d)},
+       {"models", std::to_string(mapping_result.models.size())},
+       {"total_seconds", std::to_string(run_stats.total_seconds)}},
+      ReconOutputRequiredFiles(options.output_model_format,
+                               mapping_result.models.size()));
 
   out << "Images: " << image_paths.size() << "\n"
+      << "Cameras: " << camera_setup.cameras.size() << "\n"
       << "Registered images: " << summary.num_registered_images << "\n"
       << "Points3D: " << summary.num_points3d << "\n"
       << "Feature extraction seconds: " << std::setprecision(6)
       << feature_extraction_seconds << "\n"
       << "Mean reprojection error: "
       << std::setprecision(17)
-      << ComputeReconstructionQualityStats(reconstruction)
+      << ComputeReconstructionQualityStats(primary)
              .mean_reprojection_error
       << "\n"
       << "Output: " << output_dir.string() << "\n";

@@ -281,5 +281,75 @@ TEST(GlobalBundleAdjusterTest, RefinesNamedCameraParameterMask) {
   EXPECT_LT(std::abs(refined_camera.params[3] - true_camera.params[3]), 0.01);
 }
 
+TEST(GlobalBundleAdjusterTest, SupportsEveryRegisteredCameraModel) {
+  const std::vector<CameraModelId> models = {
+      CameraModelId::kSimplePinhole,
+      CameraModelId::kPinhole,
+      CameraModelId::kSimpleRadial,
+      CameraModelId::kRadial,
+      CameraModelId::kOpenCV,
+      CameraModelId::kOpenCVFisheye,
+      CameraModelId::kFullOpenCV,
+      CameraModelId::kFOV,
+      CameraModelId::kSimpleRadialFisheye,
+      CameraModelId::kRadialFisheye,
+      CameraModelId::kThinPrismFisheye,
+      CameraModelId::kRadTanThinPrismFisheye};
+  const std::vector<Eigen::Vector3d> points = MakeScenePoints();
+  const std::vector<Pose3> poses = {
+      CameraAt(Eigen::Vector3d(0.0, 0.0, 0.0)),
+      CameraAt(Eigen::Vector3d(1.0, 0.0, 0.0)),
+      CameraAt(Eigen::Vector3d(0.35, 0.15, 0.0))};
+
+  for (const CameraModelId model : models) {
+    Camera true_camera;
+    true_camera.id = 1;
+    true_camera.model_id = model;
+    true_camera.width = 1000;
+    true_camera.height = 800;
+    true_camera.params = InitializeCameraParams(model, 700.0, 1000, 800);
+    for (const std::size_t idx :
+         GetCameraModelSpec(model).distortion_idxs) {
+      true_camera.params[idx] =
+          model == CameraModelId::kFOV ? 0.3 : 0.0005;
+    }
+
+    Reconstruction reconstruction;
+    Camera estimated_camera = true_camera;
+    for (const std::size_t idx :
+         GetCameraModelSpec(model).focal_length_idxs) {
+      estimated_camera.params[idx] *= 0.95;
+    }
+    reconstruction.AddCamera(estimated_camera);
+    for (std::size_t idx = 0; idx < poses.size(); ++idx) {
+      Image image =
+          MakeRegisteredImage(static_cast<ImageId>(idx + 1), poses[idx]);
+      AddImageObservations(true_camera, poses[idx], &image, points);
+      reconstruction.AddImage(image);
+    }
+    for (std::size_t idx = 0; idx < points.size(); ++idx) {
+      Track track;
+      for (ImageId image_id = 1; image_id <= poses.size(); ++image_id) {
+        track.AddElement(image_id, static_cast<Point2DIdx>(idx));
+      }
+      reconstruction.AddPoint3D(points[idx], track);
+    }
+    const double before = MeanReprojectionError(reconstruction);
+
+    GlobalBundleAdjustmentOptions options;
+    options.max_num_iterations = 50;
+    options.loss_scale = 0.0;
+    options.refine_poses = false;
+    options.refine_points = false;
+    options.refine_camera_params = CameraParameterGroup::kFocalLength;
+    const GlobalBundleAdjustmentSummary summary =
+        AdjustGlobalBundle(options, &reconstruction);
+
+    EXPECT_TRUE(summary.success) << CameraModelIdToName(model);
+    EXPECT_LT(MeanReprojectionError(reconstruction), before * 0.1)
+        << CameraModelIdToName(model);
+  }
+}
+
 }  // namespace
 }  // namespace colite

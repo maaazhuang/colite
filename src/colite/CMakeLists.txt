@@ -41,6 +41,7 @@ add_library(colite_core
   core/parallel.cpp
   core/version.cpp
   controllers/recon_sfm_controller.cpp
+  controllers/sfm_camera_setup.cpp
   controllers/recon_mvs_controller.cpp
   controllers/colmap_compare_controller.cpp
   controllers/feature_extractor.cpp
@@ -55,6 +56,7 @@ add_library(colite_core
   matching/descriptor_matcher.cpp
   ${COLITE_CUDA_MATCHER_SOURCES}
   matching/guided_matching.cpp
+  matching/match_graph_consistency.cpp
   matching/pair_generator.cpp
   matching/vocabulary_tree.cpp
   matching/two_view_geometry_batch.cpp
@@ -78,6 +80,7 @@ add_library(colite_core
   sfm/local_bundle_adjuster.cpp
   sfm/observation_manager.cpp
   sfm/observation_filter.cpp
+  sfm/reconstruction_manager.cpp
 )
 
 target_include_directories(colite_core

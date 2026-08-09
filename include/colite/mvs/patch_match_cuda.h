@@ -27,6 +27,10 @@ struct CudaPatchMatchRequest {
   const MvsImage* reference_image = nullptr;
   const std::vector<MvsImage>* source_images = nullptr;
   const std::vector<DenseDepthMap>* source_depth_maps = nullptr;
+  // Non-owning alternative used by batched geometric refinement. This avoids
+  // copying every immutable full-resolution source depth map into each
+  // concurrent job. Exactly one source-depth representation may be set.
+  const std::vector<const DenseDepthMap*>* source_depth_map_ptrs = nullptr;
   // Reference-view pixel grid, one probability map per source image.
   // Values outside [0, 1] are clamped by the CUDA backend.
   const std::vector<DenseCostMap>* source_selection_probability_maps = nullptr;

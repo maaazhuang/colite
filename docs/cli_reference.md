@@ -65,6 +65,10 @@ $COLITE feature_extractor \
 | `--image_path` | 必填 | 图像目录 |
 | `--workspace_path` | 必填 | 文件 workspace |
 | `--focal_length` | EXIF/尺寸先验 | 显式初始焦距像素；是否由 BA 继续优化由 `--ba_refine_focal_length` 控制 |
+| `--camera_model` | SIMPLE_RADIAL | 现有12种 COLMAP 兼容模型之一 |
+| `--camera_params` | 空 | 按模型参数顺序给出完整 CSV；参数数量必须精确匹配 |
+| `--camera_mode` | auto | `auto|single|per_folder|per_image`；兼容别名 `shared=single`、`individual=per_image` |
+| `--default_focal_length_factor` | 1.2 | EXIF 不足时的 `factor × max(width,height)` |
 | `--max_num_features` | 4096 | OpenCV/CUDA 后端为最终输出上限；CPU VLFeat 按基础 keypoint/DoG level 限制，最终多方向点可超过 |
 | `--feature_num_threads` | -1 | CPU 线程数；-1 为逻辑核 |
 | `--feature_extractor` | auto | `auto|vlsift|cvsift|cuda_opencv|cuda_vlfeat` |
@@ -87,6 +91,9 @@ $COLITE sequential_matcher --workspace_path "$OUT/workspace" \
 | `--matching_type` | 由命令决定 | `exhaustive|sequential|spatial|vocab_tree` |
 | `--matcher` | flann | `bf|flann|cuda`；`cuda` 是与 CPU BF 口径一致的精确 GPU 暴力匹配 |
 | `--max_ratio` | 0.8 | Lowe ratio |
+| `--guided_matching` | 0 | 几何验证后按 F 极线约束重搜描述子 |
+| `--guided_match_ratio` | 0.8 | standalone guided Lowe ratio；COLMAP High 同描述子语义 |
+| `--guided_min_inlier_gain` | 10 | 替换图像对几何所需的最小内点增量 |
 | `--overlap` | 5 | sequential 后向邻居数 |
 | `--spatial_max_num_neighbors` | 10 | 空间邻居数 |
 | `--spatial_max_distance` | ≤0 不限 | 位置先验距离阈值 |
@@ -117,7 +124,30 @@ $COLITE vocab_tree_matcher \
 $COLITE mapper --workspace_path "$OUT/workspace"
 ```
 
-输出位于 workspace 的 `sparse/`，包括 COLMAP text model、带 RGB 的 `points3D.ply`、summary 和注册诊断。算法缓存命中时会直接返回；修改配置或做计时时使用新 workspace。
+默认会重建 verified 匹配图中的多个可初始化分量，并尝试合并可用 verified 3D-3D
+对应对齐的模型：
+
+```bash
+$COLITE mapper \
+  --workspace_path "$OUT/workspace" \
+  --multiple_models 1 --merge_models 1 \
+  --max_num_models 50 --min_model_size 2
+```
+
+从已有 COLMAP text model 继续注册：
+
+```bash
+$COLITE mapper \
+  --workspace_path "$OUT/workspace" \
+  --input_model_path "$OUT/workspace/sparse/models/0"
+```
+
+恢复入口按图像名重映射历史模型 ID，允许当前 workspace 增加新图，但要求相机模型、尺寸和
+共享内参关系兼容；已有图的特征数量、坐标和索引顺序也必须与断点模型一致，改变特征配置后
+会拒绝恢复，以免旧 track 错接到新特征。`--input_model_path` 会绕过 sparse 结果缓存并实际执行续建。输出位于
+workspace 的 `sparse/`：根目录是最大主模型，`models/<index>/` 是全部模型，
+`models.txt` 记录索引；每个模型均含 COLMAP text model 和带 RGB 的 `points3D.ply`。
+算法缓存命中时会直接返回；修改配置或做计时时使用新 workspace。
 
 ## 完整 SfM
 
@@ -131,15 +161,38 @@ $COLITE recon_sfm \
 
 主要参数：
 
-- `--focal_length`；省略时依次使用 EXIF 35mm 等效焦距（按 43.27 mm 全画幅对角线换算）、EXIF 焦距毫米值与焦平面分辨率，最后回退 `1.2 × max(width,height)`。EXIF/用户值标记为焦距先验，尺寸回退不标记为先验。
-- `--nearby_match_window` 默认 0，控制首轮匹配中相邻图像对的 ratio 放宽；`--nearby_match_ratio` 默认 0.8。首轮始终遍历全部图像对。几何验证后会对所有具有可用初始 F 的 pair 执行极线约束描述子重搜索，不受 nearby window 限制。
+- `--camera_model` 默认 `SIMPLE_RADIAL`；`--camera_params` 可按该模型登记顺序
+  提供完整参数。未提供时由焦距先验、图像中心和零畸变初始化。
+- `--camera_mode auto|single|per_folder|per_image`，默认 `auto`，对齐 COLMAP
+  GUI “Individual images”的 ImageReader AUTO 语义：只有 Make、Model、焦距
+  标识及尺寸完整一致的图像共享 Camera；元数据不完整时每图独立，避免误共享。
+  `single` 要求尺寸一致；`per_folder` 按相对父目录共享；`per_image` 强制每图
+  独立。旧名称 `shared`、`individual` 分别保留为 `single`、`per_image` 别名。
+  各组多个焦距 prior 使用中位数，相对跨度超过 5% 时明确报错。
+- `--focal_length`；省略时每张图依次使用 EXIF 35mm 等效焦距（按 43.27 mm
+  全画幅对角线换算）、EXIF 焦距毫米值与焦平面分辨率，最后回退
+  `default_focal_length_factor × max(width,height)`。EXIF/用户值标记为焦距
+  先验，尺寸回退不标记为先验。
+- `--nearby_match_window` 默认 0，控制首轮匹配中相邻图像对的 ratio 放宽；`--nearby_match_ratio` 默认 0.8。首轮始终遍历全部图像对。几何验证后会对所有具有可用初始 F 的 pair 执行极线约束描述子重搜索，不受 nearby window 限制。`--guided_match_ratio` 独立控制该阶段，`recon_sfm` 默认 0.95；使用同一套 COLMAP 描述子做 High 对照时显式设为 0.8。
 - `--max_registration_trials_per_image`、`--max_initialization_trials` 默认 3。
 - `--registration_retry_error_multiplier` 默认 1.5。
 - `--registration_retry_max_error` 默认 8 px。
-- `--ba_refine_focal_length` 默认 1，与 COLMAP 增量 Mapper 的默认行为一致；`--ba_refine_principal_point`、`--ba_refine_extra_params` 默认 0。
+- `--ba_refine_focal_length`、`--ba_refine_extra_params` 默认 1，与 COLMAP
+  增量 Mapper 一致；`--ba_refine_principal_point` 默认 0。
 - `--ba_refine_params <fx,fy,k1,...>` 按名称指定内参优化。
+- `--input_model_path <dir>` 从已有 COLMAP text model 继续注册；完整 `recon_sfm`
+  会重新计算前端特征/匹配，若只需复用已有前端结果，优先使用分阶段 `mapper`。
+- `--multiple_models 0|1`、`--merge_models 0|1` 默认均为 1；
+  `--max_num_models` 默认 50，`--min_model_size` 默认 2。`recon_auto` 可用
+  `--sfm.input_model_path`、`--sfm.multiple_models` 等同名转发参数。
 
-`recon_sfm` 输出 cameras/images/points3D text、带 RGB PLY、pair/registration diagnostics 和 summary。`summary.txt` 记录实际 SIFT/matcher 后端、CUDA 可用性、初始焦距/来源/是否为先验、CPU 线程数、特征/匹配/内点数量，以及特征提取、首轮匹配、几何验证、guided 重匹配、Mapper、RGB 取色和写盘耗时。当前 CUDA 后端加速首轮全局 BF；极线走廊 guided 重搜索仍走 CPU。
+`recon_sfm` 输出 cameras/images/points3D text、带 RGB PLY、pair/registration
+diagnostics 和 summary。最大模型位于输出根目录，全部模型位于
+`models/<index>/`。`summary.txt` 记录相机策略、相机数量、具有焦距先验的
+图像数、初始焦距范围、实际 SIFT/matcher 后端、CUDA 可用性、CPU 线程数、
+特征/匹配/内点数量，以及各流程耗时。当前 CUDA 后端加速首轮全局 BF；极线
+走廊 guided 重搜索仍走 CPU。`recon_auto` 通过 `--sfm.<option>` 转发上述
+相机模型、参数和分组策略。
 
 ## MVS 单步骤
 
@@ -180,14 +233,18 @@ $COLITE patch_match_stereo \
 | 后端 | `patch_match_backend=auto`，`gpu_index=-1`，`num_threads=1` |
 | 尺寸 | `resolution_level=1`，`max_image_size=-1`，`image_cache_size=16` |
 | 迭代 | `iterations=3`，`pyramid_levels=1`，`window_radius=2`，`random_seed=42` |
-| source | `max_num_source_images=8`，`min_num_shared_points=1` |
+| source | `max_num_source_images=8`，`min_num_shared_points=1`；`source_selection_mode=weighted` 保持通用小基线兼容，`colmap` 使用 75% 分位三角化角门限和共享点排序 |
 | 聚合 | `min_num_valid_sources=1`，`max_num_aggregated_costs=3` |
 | 初始法线 | 默认相机朝向半球随机初始化；`initial_normal_hemisphere_degrees=90`，`normal_perturbation_degrees=57.2958`；`fixed_initial_normals` 仅用于兼容/A-B |
 | 调度 | `propagation_schedule=checkerboard`，每迭代默认一轮红黑 |
 | 光度 | bilateral NCC 可选，`sigma_color=0.2`；dynamic selection 可选，`ncc_sigma=0.6` |
-| HMM/CDF | 动态 source 默认启用 directional HMM；`directional_hmm` 也会自动启用动态 source；`source_samples=0` 为 best-K，15 为 COLMAP 风格 CDF |
-| 几何 | refinement iterations/weight/depth error；内部至少 3 层、1 个继承光度结果的同步 pass；最终 reprojection 默认 1 px |
+| HMM/CDF | 动态 source 默认启用 directional HMM；`directional_hmm` 也会自动启用动态 source；`source_samples=0` 为 best-K，15 为 COLMAP 风格 CDF；CDF 默认叠加三角化角、入射角和局部单应分辨率先验，可用 `patch_match_no_colmap_source_priors` 关闭 |
+| 几何 | refinement iterations/weight/depth error；内部至少 3 层、1 个继承光度结果的同步 pass；默认使用独立的稳健跨视图几何聚合，`patch_match_legacy_geometric_aggregation` 可恢复旧的逐 source 混排；最终 reprojection 默认 1 px |
 | 输出 | `dense_map_format=text|binary` 同时控制 depth/normal/cost，可选 photometric filter 和 depth-normal refinement |
+
+Fusion 的候选源图数量与 PatchMatch 解耦：`fusion_max_num_source_images=50`
+默认按共享稀疏点数排序检查最多 50 张重叠图；调整
+`max_num_source_images` 不会再意外限制 Fusion。
 
 `--patch_match_diagnostics` 会启用详细 CUDA 原子统计，正式性能运行默认不要开启。质量优先推荐两层金字塔 + HMM + CDF15；快速预览可使用 `resolution_level=2` 和 2 iterations。
 
@@ -266,12 +323,12 @@ $COLITE mesh_texturer \
   --output_path "$ROOT/surface/textured"
 ```
 
-重要 `--MeshTextureMapping.` 默认：atlas 4096、max atlas 32768、padding 2、inpaint 5、scale 1、min cosine 0.1、min visible vertices 3、label smoothing 3、visibility resolution 1024、occlusion tolerance 0.01、color correction 1、regularization 0.1。
+重要 `--MeshTextureMapping.` 默认：atlas 4096、max atlas 32768、padding 2、inpaint 5、scale 1、min cosine 0.1、min visible vertices 3、label smoothing 3、`view_selection_min_component_size=64`、visibility resolution 1024、occlusion tolerance 0.01、`use_vertex_color_fallback=0`、color correction 1、regularization 0.1。遮挡容差只在受拓扑支持的孔洞恢复中完整使用；主视图选择最多使用 0.005 的端点噪声带。
 
-`occlusion_relative_tolerance=0.01` 允许目标表面 1% 范围内的近共面交点，避免
-重建噪声造成孤立纹理孔洞；不建议在没有 A/B 的情况下继续放宽。没有可靠相机
-视图的面自动使用网格 RGB 顶点色生成非退化 fallback atlas patch，OBJ 仍保留
-全部三角形。
+`occlusion_relative_tolerance=0.01` 只允许受近共面双邻面支持的孔洞恢复在
+目标表面 1% 范围内忽略端点噪声；不建议在没有 A/B 的情况下继续放宽。没有
+可靠相机视图的面默认映射到中性 texel，OBJ 仍保留全部三角形；如需旧版逐面
+RGB 顶点色 patch，可显式设置 `--MeshTextureMapping.use_vertex_color_fallback 1`。
 
 大网格先用 `target_num_triangles=500`、`visibility_resolution=512` 验证，再逐级提高。
 

@@ -15,8 +15,6 @@
 #include <utility>
 #include <vector>
 
-#include <opencv2/imgcodecs.hpp>
-
 #include "colite/controllers/recon_sfm_controller.h"
 #include "colite/core/camera.h"
 #include "colite/core/parallel.h"
@@ -41,9 +39,21 @@ std::vector<std::pair<std::string, std::string>> FeatureCacheEntries(
     const std::vector<std::filesystem::path>& image_paths) {
   std::vector<std::pair<std::string, std::string>> entries;
   entries.emplace_back("stage", "features");
-  entries.emplace_back("camera_prior_version", "exif_diagonal_v2");
+  entries.emplace_back("camera_prior_version", "camera_models_auto_exif_v4");
   entries.emplace_back("image_path", options.image_path.lexically_normal().string());
   entries.emplace_back("focal_length", ToConfigValue(options.focal_length));
+  entries.emplace_back(
+      "camera_mode",
+      std::string(CameraSharingModeName(options.camera_sharing_mode)));
+  entries.emplace_back(
+      "camera_model",
+      std::string(CameraModelIdToName(options.camera_model_id)));
+  std::ostringstream camera_params;
+  camera_params << std::setprecision(17);
+  for (const double value : options.camera_params) camera_params << value << ',';
+  entries.emplace_back("camera_params", camera_params.str());
+  entries.emplace_back("default_focal_length_factor",
+                       ToConfigValue(options.default_focal_length_factor));
   entries.emplace_back("max_num_features", std::to_string(options.max_num_features));
   entries.emplace_back("backend", SiftBackendName(options.backend));
   entries.emplace_back("resolved_backend",
@@ -86,28 +96,11 @@ std::optional<FeatureExtractorControllerSummary> ReadCachedFeatureSummary(
   summary.cache_hit = true;
   summary.num_images = static_cast<std::size_t>(
       std::stoull(metadata.values.at("images")));
+  summary.num_cameras = static_cast<std::size_t>(
+      std::stoull(metadata.values.at("cameras")));
   summary.elapsed_seconds =
       std::stod(metadata.values.at("feature_extraction_seconds"));
   return summary;
-}
-
-Camera MakeSingleCamera(const std::filesystem::path& image_path,
-                        double focal_length) {
-  const cv::Mat image = cv::imread(image_path.string(), cv::IMREAD_COLOR);
-  if (image.empty()) {
-    throw std::runtime_error("Failed to read image: " + image_path.string());
-  }
-  Camera camera;
-  camera.id = 1;
-  camera.model_id = CameraModelId::kPinhole;
-  camera.width = static_cast<std::uint32_t>(image.cols);
-  camera.height = static_cast<std::uint32_t>(image.rows);
-  const InitialFocalLengthEstimate focal =
-      EstimateInitialFocalLengthPriorFromImage(image_path, focal_length);
-  camera.params = InitializeCameraParams(camera.model_id, focal.pixels,
-                                         camera.width, camera.height);
-  camera.has_prior_focal_length = focal.has_prior;
-  return camera;
 }
 
 class ImageJobQueue {
@@ -153,21 +146,19 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
     return *cached_summary;
   }
 
-  const Camera camera = MakeSingleCamera(image_paths.front(),
-                                         options_.focal_length);
-  std::vector<Image> images;
-  images.reserve(image_paths.size());
-  for (std::size_t i = 0; i < image_paths.size(); ++i) {
-    Image image;
-    image.id = static_cast<ImageId>(i + 1);
-    image.camera_id = camera.id;
-    image.name = image_paths[i].filename().string();
-    image.file_path = image_paths[i].string();
-    images.push_back(image);
-  }
+  SfmCameraSetupOptions camera_options;
+  camera_options.sharing_mode = options_.camera_sharing_mode;
+  camera_options.model_id = options_.camera_model_id;
+  camera_options.focal_length = options_.focal_length;
+  camera_options.camera_params = options_.camera_params;
+  camera_options.image_root = options_.image_path;
+  camera_options.default_focal_length_factor =
+      options_.default_focal_length_factor;
+  const SfmCameraSetup camera_setup =
+      BuildSfmCameraSetup(image_paths, camera_options);
 
-  WriteWorkspaceCameras(options_.workspace_path, {camera});
-  WriteWorkspaceImages(options_.workspace_path, images);
+  WriteWorkspaceCameras(options_.workspace_path, camera_setup.cameras);
+  WriteWorkspaceImages(options_.workspace_path, camera_setup.images);
 
   SiftExtractionOptions sift_options;
   sift_options.backend = options_.backend;
@@ -234,17 +225,22 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
   const auto end = std::chrono::steady_clock::now();
   summary.success = true;
   summary.num_images = image_paths.size();
+  summary.num_cameras = camera_setup.cameras.size();
   summary.elapsed_seconds = std::chrono::duration<double>(end - start).count();
   std::filesystem::create_directories(
       WorkspaceFeaturesPath(options_.workspace_path));
   std::ofstream summary_file(WorkspaceFeaturesPath(options_.workspace_path) /
                              "summary.txt");
   summary_file << "images " << summary.num_images << "\n"
+               << "cameras " << summary.num_cameras << "\n"
+               << "camera_mode "
+               << CameraSharingModeName(options_.camera_sharing_mode) << "\n"
                << "feature_extraction_seconds " << summary.elapsed_seconds
                << "\n";
   WriteWorkspaceCacheMetadata(
       options_.workspace_path, "features", config_hash,
       {{"images", std::to_string(summary.num_images)},
+       {"cameras", std::to_string(summary.num_cameras)},
        {"feature_extraction_seconds", ToConfigValue(summary.elapsed_seconds)}},
       FeatureRequiredFiles(image_paths.size()));
   return summary;

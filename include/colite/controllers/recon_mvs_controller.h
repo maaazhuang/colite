@@ -14,6 +14,7 @@ struct ReconMvsControllerOptions {
   std::filesystem::path output_path;
   std::size_t max_num_source_images = 8;
   std::size_t min_num_shared_points = 1;
+  std::string source_selection_mode = "weighted";
   double source_min_triangulation_angle_degrees = 1.0;
   double source_max_triangulation_angle_degrees = 30.0;
   double source_triangulation_angle_weight = 1.0;
@@ -36,6 +37,7 @@ struct ReconMvsControllerOptions {
   float patch_match_sigma_color = 0.2F;
   bool patch_match_dynamic_source_selection = false;
   bool patch_match_directional_hmm = false;
+  bool patch_match_colmap_source_priors = true;
   std::size_t patch_match_source_samples = 0;
   float patch_match_ncc_sigma = 0.6F;
   float patch_match_previous_selection_probability_weight = 0.5F;
@@ -48,7 +50,8 @@ struct ReconMvsControllerOptions {
   std::size_t patch_match_checkerboard_rounds = 1;
   bool patch_match_diagnostics = false;
   std::size_t patch_match_geometric_refinement_iterations = 0;
-  float patch_match_geometric_consistency_weight = 0.0F;
+    float patch_match_geometric_consistency_weight = 0.0F;
+    bool patch_match_robust_geometric_aggregation = true;
   float patch_match_geometric_max_relative_depth_error = 0.01F;
   bool refine_normals_from_depth = false;
   float normal_refinement_max_relative_depth_difference = 0.005F;
@@ -56,6 +59,7 @@ struct ReconMvsControllerOptions {
   bool check_geometric_consistency = false;
   std::size_t filter_geometric_min_num_consistent_sources = 0;
   bool fuse_stereo = false;
+  std::size_t fusion_max_num_source_images = 50;
   std::size_t fusion_min_num_observations = 1;
   std::size_t fusion_max_num_observations = 100000;
   std::size_t fusion_max_traversal_depth = 100;
@@ -100,8 +104,10 @@ struct ReconMvsControllerOptions {
   double texture_min_cos_normal_angle = 0.1;
   int texture_min_visible_vertices = 3;
   int texture_view_smoothing_iterations = 3;
+  int texture_view_min_component_size = 64;
   int texture_visibility_resolution = 1024;
   double texture_occlusion_relative_tolerance = 0.01;
+  bool texture_use_vertex_color_fallback = false;
   bool texture_apply_color_correction = true;
   double texture_color_correction_regularization = 0.1;
   float geometric_max_reprojection_error_pixels = 1.0F;

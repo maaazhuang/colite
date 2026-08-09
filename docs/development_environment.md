@@ -108,7 +108,13 @@ cmake --build build-wsl-colite-cuda --parallel 2
 ctest --test-dir build-wsl-colite-cuda --output-on-failure --parallel 2
 ```
 
-2026-07-26 CUDA matcher、默认焦距、SfM 并行/缓存、PatchMatch 几何覆盖及 Stereo Fusion 优化后为 301/301，300 个通过，1 个“CUDA 不可用时应失败”的条件测试在 CUDA 可用环境中按设计跳过。House 实测摘要同时记录 `feature_backend cuda_vlfeat`、`cuda_sift_available 1`、`cuda_matcher_available 1` 和 `cpu_threads 8`，不可只根据构建目录名称判断 CUDA 是否启用。
+2026-07-30 每图相机/EXIF/混合尺寸、CUDA matcher、SfM 并行/缓存、PatchMatch
+几何覆盖、COLMAP dense-map 兼容和 Stereo Fusion 候选解耦后为 320/320；
+全部测试通过，
+其中 1 个“CUDA 不可用时应失败”的条件测试在 CUDA 可用环境中按设计跳过。
+House 实测摘要同时记录 `feature_backend cuda_vlfeat`、
+`cuda_sift_available 1`、`cuda_matcher_available 1` 和 `cpu_threads 8`，
+不可只根据构建目录名称判断 CUDA 是否启用。
 
 定向测试：
 

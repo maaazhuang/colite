@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,12 @@ struct IncrementalMapperSummary {
   IncrementalTriangulatorSummary local_retriangulation;
   LocalBundleAdjustmentSummary local_bundle_adjustment;
   ObservationFilterSummary observation_filter;
+  double registration_seconds = 0.0;
+  double track_completion_seconds = 0.0;
+  double triangulation_seconds = 0.0;
+  double local_retriangulation_seconds = 0.0;
+  double local_bundle_adjustment_seconds = 0.0;
+  double observation_filter_seconds = 0.0;
   std::string message;
 };
 
@@ -69,9 +76,13 @@ struct IncrementalMappingOptions {
   double registration_retry_reprojection_error_multiplier = 1.5;
   double registration_retry_max_reprojection_error_px = 8.0;
   bool run_global_track_completion = true;
+  bool run_pose_guided_track_completion = true;
   bool run_global_bundle_adjustment = true;
   bool run_global_observation_filter = true;
   bool run_final_global_bundle_adjustment = true;
+  // Empty means all images. Registration and initialization are restricted to
+  // this set when running one component of a multi-model reconstruction.
+  std::set<ImageId> allowed_image_ids;
 };
 
 struct ImageRegistrationFailureSummary {
@@ -96,12 +107,21 @@ struct IncrementalMappingSummary {
   std::vector<IncrementalMapperSummary> registrations;
   std::vector<ImageRegistrationFailureSummary> failed_registrations;
   IncrementalTriangulatorSummary global_track_completion;
+  IncrementalTriangulatorSummary pose_guided_track_completion;
   IncrementalTriangulatorSummary global_retriangulation;
   GlobalBundleAdjustmentSummary global_bundle_adjustment;
   ObservationFilterSummary global_observation_filter;
   GlobalBundleAdjustmentSummary final_global_bundle_adjustment;
   std::size_t num_registered_images = 0;
   std::size_t num_points3d = 0;
+  double initialization_seconds = 0.0;
+  double candidate_selection_seconds = 0.0;
+  double global_track_completion_seconds = 0.0;
+  double pose_guided_track_completion_seconds = 0.0;
+  double global_retriangulation_seconds = 0.0;
+  double global_bundle_adjustment_seconds = 0.0;
+  double global_observation_filter_seconds = 0.0;
+  double final_global_bundle_adjustment_seconds = 0.0;
   std::string message;
 };
 

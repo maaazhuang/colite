@@ -40,10 +40,13 @@ std::optional<Eigen::Vector2d> ProjectWorldPoint(
     const Eigen::Vector3d& point_world) {
   const Eigen::Vector3d point_camera =
       cam_from_world.TransformPoint(point_world);
-  if (point_camera.z() <= 0.0) {
+  Eigen::Vector2d projected;
+  if (!camera.VerifyParams() ||
+      !ProjectPointWithCameraParams(camera.model_id, camera.params.data(),
+                                    point_camera, &projected)) {
     return std::nullopt;
   }
-  return ProjectPoint(camera, point_camera);
+  return projected;
 }
 
 std::optional<double> ReprojectionError(

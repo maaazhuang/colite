@@ -41,6 +41,114 @@ bool ProjectWithParams(CameraModelId model_id,
                                       projected);
 }
 
+bool AnalyticProjectionJacobian(CameraModelId model_id,
+                                const double* params,
+                                const Eigen::Vector3d& point_camera,
+                                Eigen::Matrix<double, 2, 3>* jacobian) {
+  if (jacobian == nullptr || !point_camera.allFinite() ||
+      point_camera.z() <= 0.0) {
+    return false;
+  }
+  const double inverse_z = 1.0 / point_camera.z();
+  const double x = point_camera.x() * inverse_z;
+  const double y = point_camera.y() * inverse_z;
+  Eigen::Matrix2d normalized_jacobian = Eigen::Matrix2d::Zero();
+  if (model_id == CameraModelId::kSimplePinhole) {
+    normalized_jacobian(0, 0) = params[0];
+    normalized_jacobian(1, 1) = params[0];
+  } else if (model_id == CameraModelId::kPinhole) {
+    normalized_jacobian(0, 0) = params[0];
+    normalized_jacobian(1, 1) = params[1];
+  } else if (model_id == CameraModelId::kSimpleRadial) {
+    const double focal = params[0];
+    const double radial = params[3];
+    const double xy = 2.0 * radial * x * y;
+    const double scale = 1.0 + radial * (x * x + y * y);
+    normalized_jacobian(0, 0) =
+        focal * (scale + 2.0 * radial * x * x);
+    normalized_jacobian(0, 1) = focal * xy;
+    normalized_jacobian(1, 0) = focal * xy;
+    normalized_jacobian(1, 1) =
+        focal * (scale + 2.0 * radial * y * y);
+  } else {
+    return false;
+  }
+
+  Eigen::Matrix<double, 2, 3> perspective_jacobian;
+  perspective_jacobian << inverse_z, 0.0, -x * inverse_z,
+                          0.0, inverse_z, -y * inverse_z;
+  *jacobian = normalized_jacobian * perspective_jacobian;
+  return jacobian->allFinite();
+}
+
+bool AnalyticCameraParamsJacobian(CameraModelId model_id,
+                                  const double* params,
+                                  const Eigen::Vector3d& point_camera,
+                                  double* jacobian) {
+  if (jacobian == nullptr || !point_camera.allFinite() ||
+      point_camera.z() <= 0.0) {
+    return false;
+  }
+  const double x = point_camera.x() / point_camera.z();
+  const double y = point_camera.y() / point_camera.z();
+  if (model_id == CameraModelId::kSimplePinhole) {
+    jacobian[0] = x; jacobian[1] = 1.0; jacobian[2] = 0.0;
+    jacobian[3] = y; jacobian[4] = 0.0; jacobian[5] = 1.0;
+    return true;
+  }
+  if (model_id == CameraModelId::kPinhole) {
+    jacobian[0] = x;   jacobian[1] = 0.0;
+    jacobian[2] = 1.0; jacobian[3] = 0.0;
+    jacobian[4] = 0.0; jacobian[5] = y;
+    jacobian[6] = 0.0; jacobian[7] = 1.0;
+    return true;
+  }
+  if (model_id == CameraModelId::kSimpleRadial) {
+    const double radius2 = x * x + y * y;
+    const double scale = 1.0 + params[3] * radius2;
+    jacobian[0] = x * scale;
+    jacobian[1] = 1.0;
+    jacobian[2] = 0.0;
+    jacobian[3] = params[0] * x * radius2;
+    jacobian[4] = y * scale;
+    jacobian[5] = 0.0;
+    jacobian[6] = 1.0;
+    jacobian[7] = params[0] * y * radius2;
+    return true;
+  }
+  return false;
+}
+
+Eigen::Matrix<double, 3, 4> AnalyticQuaternionPointJacobian(
+    const double* q_xyzw,
+    const Eigen::Vector3d& point_world) {
+  Eigen::Vector4d raw(q_xyzw[0], q_xyzw[1], q_xyzw[2], q_xyzw[3]);
+  const double norm = raw.norm();
+  if (!std::isfinite(norm) || norm <= 0.0) {
+    return Eigen::Matrix<double, 3, 4>::Zero();
+  }
+  const Eigen::Vector4d q = raw / norm;
+  const double x = q[0], y = q[1], z = q[2], w = q[3];
+  const double px = point_world.x(), py = point_world.y();
+  const double pz = point_world.z();
+  Eigen::Matrix<double, 3, 4> unit_jacobian;
+  unit_jacobian.col(0) << 2.0 * y * py + 2.0 * z * pz,
+      2.0 * y * px - 4.0 * x * py - 2.0 * w * pz,
+      2.0 * z * px + 2.0 * w * py - 4.0 * x * pz;
+  unit_jacobian.col(1) << -4.0 * y * px + 2.0 * x * py + 2.0 * w * pz,
+      2.0 * x * px + 2.0 * z * pz,
+      -2.0 * w * px + 2.0 * z * py - 4.0 * y * pz;
+  unit_jacobian.col(2) << -4.0 * z * px - 2.0 * w * py + 2.0 * x * pz,
+      2.0 * w * px - 4.0 * z * py + 2.0 * y * pz,
+      2.0 * x * px + 2.0 * y * py;
+  unit_jacobian.col(3) << -2.0 * z * py + 2.0 * y * pz,
+      2.0 * z * px - 2.0 * x * pz,
+      -2.0 * y * px + 2.0 * x * py;
+  const Eigen::Matrix4d normalization_jacobian =
+      (Eigen::Matrix4d::Identity() - q * q.transpose()) / norm;
+  return unit_jacobian * normalization_jacobian;
+}
+
 class ReprojectionCost final : public ceres::CostFunction {
  public:
   ReprojectionCost(CameraModelId model_id,
@@ -69,9 +177,91 @@ class ReprojectionCost final : public ceres::CostFunction {
     }
 
     constexpr double kEps = 1e-6;
-    const int block_sizes[4] = {4, 3, 3, static_cast<int>(num_camera_params_)};
-    for (int block_idx = 0; block_idx < 4; ++block_idx) {
+    // Translation and world-point derivatives share the same 2x3 projection
+    // Jacobian in camera coordinates. Compute it once and apply the rotation
+    // chain rule for the point block instead of evaluating six nearly
+    // identical perturbed projections per observation.
+    if (jacobians[0] != nullptr || jacobians[1] != nullptr ||
+        jacobians[2] != nullptr) {
+      Eigen::Quaterniond q(parameters[0][3], parameters[0][0],
+                           parameters[0][1], parameters[0][2]);
+      q.normalize();
+      const Eigen::Matrix3d rotation = q.toRotationMatrix();
+      const Eigen::Vector3d point_camera =
+          rotation * Eigen::Vector3d(parameters[2][0], parameters[2][1],
+                                     parameters[2][2]) +
+          Eigen::Vector3d(parameters[1][0], parameters[1][1],
+                          parameters[1][2]);
+      Eigen::Matrix<double, 2, 3> projection_jacobian;
+      if (!AnalyticProjectionJacobian(model_id_, parameters[3], point_camera,
+                                      &projection_jacobian)) {
+        for (int axis = 0; axis < 3; ++axis) {
+          Eigen::Vector3d perturbed = point_camera;
+          perturbed[axis] += kEps;
+          Eigen::Vector2d projected;
+          if (!ProjectWithParams(model_id_, parameters[3], perturbed,
+                                 &projected)) {
+            return false;
+          }
+          projection_jacobian(0, axis) =
+              (projected.x() - (residuals[0] + observed_xy_.x())) / kEps;
+          projection_jacobian(1, axis) =
+              (projected.y() - (residuals[1] + observed_xy_.y())) / kEps;
+        }
+      }
+      if (jacobians[1] != nullptr) {
+        for (int row = 0; row < 2; ++row) {
+          for (int col = 0; col < 3; ++col) {
+            jacobians[1][row * 3 + col] =
+                projection_jacobian(row, col);
+          }
+        }
+      }
+      if (jacobians[2] != nullptr) {
+        const Eigen::Matrix<double, 2, 3> point_jacobian =
+            projection_jacobian * rotation;
+        for (int row = 0; row < 2; ++row) {
+          for (int col = 0; col < 3; ++col) {
+            jacobians[2][row * 3 + col] = point_jacobian(row, col);
+          }
+        }
+      }
+      if (jacobians[0] != nullptr) {
+        const Eigen::Vector3d point_world(parameters[2][0], parameters[2][1],
+                                          parameters[2][2]);
+        const Eigen::Matrix<double, 2, 4> quaternion_jacobian =
+            projection_jacobian *
+            AnalyticQuaternionPointJacobian(parameters[0], point_world);
+        for (int row = 0; row < 2; ++row) {
+          for (int col = 0; col < 4; ++col) {
+            jacobians[0][row * 4 + col] = quaternion_jacobian(row, col);
+          }
+        }
+      }
+    }
+
+    bool analytic_camera_params = false;
+    if (jacobians[3] != nullptr) {
+      Eigen::Quaterniond q(parameters[0][3], parameters[0][0],
+                           parameters[0][1], parameters[0][2]);
+      q.normalize();
+      const Eigen::Vector3d point_camera =
+          q * Eigen::Vector3d(parameters[2][0], parameters[2][1],
+                              parameters[2][2]) +
+          Eigen::Vector3d(parameters[1][0], parameters[1][1],
+                          parameters[1][2]);
+      analytic_camera_params = AnalyticCameraParamsJacobian(
+          model_id_, parameters[3], point_camera, jacobians[3]);
+    }
+    const int numeric_blocks[2] = {0, 3};
+    const int block_sizes[4] = {4, 3, 3,
+                                static_cast<int>(num_camera_params_)};
+    for (const int block_idx : numeric_blocks) {
       if (jacobians[block_idx] == nullptr) {
+        continue;
+      }
+      if (block_idx == 0 ||
+          (block_idx == 3 && analytic_camera_params)) {
         continue;
       }
       for (int param_idx = 0; param_idx < block_sizes[block_idx]; ++param_idx) {
@@ -483,6 +673,17 @@ LocalBundleAdjustmentSummary AdjustLocalBundle(
     Camera& camera = reconstruction->GetCamera(camera_id);
     problem.AddParameterBlock(params.data(),
                               static_cast<int>(params.size()));
+    const CameraModelSpec& spec = GetCameraModelSpec(camera.model_id);
+    for (const std::size_t idx : spec.focal_length_idxs) {
+      problem.SetParameterLowerBound(
+          params.data(), static_cast<int>(idx), 1e-8);
+    }
+    if (camera.model_id == CameraModelId::kFOV) {
+      const int omega_idx = static_cast<int>(spec.distortion_idxs.front());
+      const double limit = std::acos(-1.0) - 1e-8;
+      problem.SetParameterLowerBound(params.data(), omega_idx, -limit);
+      problem.SetParameterUpperBound(params.data(), omega_idx, limit);
+    }
     const std::vector<int> constant_indices =
         ConstantCameraParameterIndices(camera, options.refine_camera_params,
                                        options.refine_camera_param_names);

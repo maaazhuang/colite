@@ -5,6 +5,8 @@
 #include <limits>
 #include <stdexcept>
 
+#include <Eigen/LU>
+
 namespace colite {
 namespace {
 
@@ -258,19 +260,145 @@ Eigen::Vector2d DistortRadTanThinPrismFisheye(
   return {x + dx_tang + dx_tp, y + dy_tang + dy_tp};
 }
 
-template <typename DistortFunc>
-Eigen::Vector2d RemoveDistortion(const Eigen::Vector2d& distorted,
-                                 DistortFunc distort) {
-  // 用固定次数迭代近似去畸变。第一版足够用于反投影和测试，后续可改成更稳健的求解。
-  Eigen::Vector2d undistorted = distorted;
-  for (int i = 0; i < 8; ++i) {
-    const Eigen::Vector2d error = distort(undistorted) - distorted;
-    undistorted -= error;
-    if (error.norm() < 1e-14) {
-      break;
+bool ParamsAreNumericallyValid(CameraModelId model_id, const double* params) {
+  if (params == nullptr || !ExistsCameraModel(model_id)) {
+    return false;
+  }
+  const CameraModelSpec& spec = GetCameraModelSpec(model_id);
+  for (std::size_t idx = 0; idx < spec.param_names.size(); ++idx) {
+    if (!std::isfinite(params[idx])) {
+      return false;
     }
   }
-  return undistorted;
+  for (const std::size_t idx : spec.focal_length_idxs) {
+    if (params[idx] <= std::numeric_limits<double>::epsilon()) {
+      return false;
+    }
+  }
+  if (model_id == CameraModelId::kFOV &&
+      std::abs(params[spec.distortion_idxs.front()]) >=
+          std::acos(-1.0) - 1e-8) {
+    return false;
+  }
+  return true;
+}
+
+template <typename TransformFunc>
+bool InvertTransform(const Eigen::Vector2d& target,
+                     TransformFunc transform,
+                     Eigen::Vector2d* inverse) {
+  if (inverse == nullptr || !target.allFinite()) {
+    return false;
+  }
+
+  Eigen::Vector2d estimate = target;
+  for (int iteration = 0; iteration < 100; ++iteration) {
+    const Eigen::Vector2d transformed = transform(estimate);
+    if (!transformed.allFinite()) {
+      return false;
+    }
+    const Eigen::Vector2d residual = transformed - target;
+    const double residual_norm = residual.norm();
+    if (residual_norm <= 1e-12) {
+      *inverse = estimate;
+      return true;
+    }
+
+    Eigen::Matrix2d jacobian;
+    for (int dimension = 0; dimension < 2; ++dimension) {
+      const double step =
+          1e-6 * std::max(1.0, std::abs(estimate[dimension]));
+      Eigen::Vector2d positive = estimate;
+      Eigen::Vector2d negative = estimate;
+      positive[dimension] += step;
+      negative[dimension] -= step;
+      const Eigen::Vector2d transformed_positive = transform(positive);
+      const Eigen::Vector2d transformed_negative = transform(negative);
+      if (!transformed_positive.allFinite() ||
+          !transformed_negative.allFinite()) {
+        return false;
+      }
+      jacobian.col(dimension) =
+          (transformed_positive - transformed_negative) / (2.0 * step);
+    }
+    if (!jacobian.allFinite() ||
+        std::abs(jacobian.determinant()) <
+            64.0 * std::numeric_limits<double>::epsilon()) {
+      return false;
+    }
+
+    Eigen::Vector2d update = jacobian.partialPivLu().solve(residual);
+    if (!update.allFinite()) {
+      return false;
+    }
+    const double trust_radius =
+        std::max(0.1, 0.1 * std::max(1.0, estimate.norm()));
+    if (update.norm() > trust_radius) {
+      update *= trust_radius / update.norm();
+    }
+
+    bool accepted = false;
+    double step_scale = 1.0;
+    for (int line_search = 0; line_search < 12; ++line_search) {
+      const Eigen::Vector2d candidate = estimate - step_scale * update;
+      const Eigen::Vector2d candidate_value = transform(candidate);
+      if (candidate_value.allFinite() &&
+          (candidate_value - target).norm() < residual_norm) {
+        estimate = candidate;
+        accepted = true;
+        break;
+      }
+      step_scale *= 0.5;
+    }
+    if (!accepted) {
+      return false;
+    }
+    if ((step_scale * update).norm() <= 1e-12) {
+      const Eigen::Vector2d final_residual = transform(estimate) - target;
+      if (final_residual.allFinite() && final_residual.norm() <= 1e-9) {
+        *inverse = estimate;
+        return true;
+      }
+      return false;
+    }
+  }
+
+  const Eigen::Vector2d final_residual = transform(estimate) - target;
+  if (!final_residual.allFinite() || final_residual.norm() > 1e-9) {
+    return false;
+  }
+  *inverse = estimate;
+  return true;
+}
+
+Eigen::Vector2d ImageToDistortedNormalized(CameraModelId model_id,
+                                           const double* params,
+                                           const Eigen::Vector2d& pixel) {
+  const CameraModelSpec& spec = GetCameraModelSpec(model_id);
+  const double fx = params[spec.focal_length_idxs[0]];
+  const double fy =
+      params[spec.focal_length_idxs.size() == 1
+                 ? spec.focal_length_idxs[0]
+                 : spec.focal_length_idxs[1]];
+  return {(pixel.x() - params[spec.principal_point_idxs[0]]) / fx,
+          (pixel.y() - params[spec.principal_point_idxs[1]]) / fy};
+}
+
+bool FisheyeToNormal(const Eigen::Vector2d& fisheye,
+                     Eigen::Vector2d* normalized) {
+  if (normalized == nullptr || !fisheye.allFinite()) {
+    return false;
+  }
+  const double theta = fisheye.norm();
+  if (theta <= std::numeric_limits<double>::epsilon()) {
+    *normalized = fisheye;
+    return true;
+  }
+  if (theta >= std::acos(-1.0) / 2.0 - 1e-8) {
+    return false;
+  }
+  *normalized = fisheye * (std::tan(theta) / theta);
+  return normalized->allFinite();
 }
 
 }  // namespace
@@ -296,10 +424,37 @@ bool Camera::HasValidId() const {
 }
 
 bool Camera::VerifyParams() const {
-  if (!ExistsCameraModel(model_id)) {
+  if (!ExistsCameraModel(model_id) || width == 0 || height == 0 ||
+      params.size() != GetCameraModelSpec(model_id).param_names.size()) {
     return false;
   }
-  return params.size() == GetCameraModelSpec(model_id).param_names.size();
+  return ParamsAreNumericallyValid(model_id, params.data());
+}
+
+bool Camera::HasBogusParams(const double min_focal_length_ratio,
+                            const double max_focal_length_ratio,
+                            const double max_extra_param) const {
+  if (!VerifyParams() || !std::isfinite(min_focal_length_ratio) ||
+      !std::isfinite(max_focal_length_ratio) ||
+      !std::isfinite(max_extra_param) || min_focal_length_ratio <= 0.0 ||
+      max_focal_length_ratio < min_focal_length_ratio ||
+      max_extra_param < 0.0) {
+    return true;
+  }
+  const double image_extent = static_cast<double>(std::max(width, height));
+  const CameraModelSpec& spec = GetCameraModelSpec(model_id);
+  for (const std::size_t idx : spec.focal_length_idxs) {
+    const double ratio = params[idx] / image_extent;
+    if (ratio < min_focal_length_ratio || ratio > max_focal_length_ratio) {
+      return true;
+    }
+  }
+  for (const std::size_t idx : spec.distortion_idxs) {
+    if (std::abs(params[idx]) > max_extra_param) {
+      return true;
+    }
+  }
+  return false;
 }
 
 double Camera::MeanFocalLength() const {
@@ -369,6 +524,10 @@ bool ExistsCameraModel(CameraModelId model_id) {
 bool CameraModelProjectionImplemented(CameraModelId model_id) {
   return ExistsCameraModel(model_id) &&
          GetCameraModelSpec(model_id).projection_implemented;
+}
+
+bool CameraModelUnprojectionImplemented(CameraModelId model_id) {
+  return CameraModelProjectionImplemented(model_id);
 }
 
 std::vector<double> InitializeCameraParams(CameraModelId model_id,
@@ -441,8 +600,10 @@ bool ProjectPointWithCameraParams(CameraModelId model_id,
                                   const double* params,
                                   const Eigen::Vector3d& point_camera,
                                   Eigen::Vector2d* projected) {
-  if (params == nullptr || projected == nullptr || point_camera.z() <= 0.0 ||
-      !CameraModelProjectionImplemented(model_id)) {
+  if (projected == nullptr || !point_camera.allFinite() ||
+      point_camera.z() <= std::numeric_limits<double>::epsilon() ||
+      !CameraModelProjectionImplemented(model_id) ||
+      !ParamsAreNumericallyValid(model_id, params)) {
     return false;
   }
 
@@ -452,44 +613,44 @@ bool ProjectPointWithCameraParams(CameraModelId model_id,
 
   if (model_id == CameraModelId::kSimplePinhole) {
     *projected = {params[0] * x + params[1], params[0] * y + params[2]};
-    return true;
+    return projected->allFinite();
   }
   if (model_id == CameraModelId::kPinhole) {
     *projected = {params[0] * x + params[2], params[1] * y + params[3]};
-    return true;
+    return projected->allFinite();
   }
   if (model_id == CameraModelId::kSimpleRadial) {
     const Eigen::Vector2d distorted =
         ApplySimpleRadialDistortion(normalized, params[3]);
     *projected = {params[0] * distorted.x() + params[1],
                   params[0] * distorted.y() + params[2]};
-    return true;
+    return projected->allFinite();
   }
   if (model_id == CameraModelId::kRadial) {
     const Eigen::Vector2d distorted = DistortRadial(normalized, params[3],
                                                    params[4]);
     *projected = {params[0] * distorted.x() + params[1],
                   params[0] * distorted.y() + params[2]};
-    return true;
+    return projected->allFinite();
   }
   if (model_id == CameraModelId::kOpenCV) {
     const Eigen::Vector2d distorted =
         DistortOpenCV(normalized, params[4], params[5], params[6], params[7]);
     *projected = {params[0] * distorted.x() + params[2],
                   params[1] * distorted.y() + params[3]};
-    return true;
+    return projected->allFinite();
   }
   if (model_id == CameraModelId::kFullOpenCV) {
     const Eigen::Vector2d distorted = DistortFullOpenCV(normalized, &params[4]);
     *projected = {params[0] * distorted.x() + params[2],
                   params[1] * distorted.y() + params[3]};
-    return true;
+    return projected->allFinite();
   }
   if (model_id == CameraModelId::kFOV) {
     const Eigen::Vector2d distorted = DistortFov(normalized, params[4]);
     *projected = {params[0] * distorted.x() + params[2],
                   params[1] * distorted.y() + params[3]};
-    return true;
+    return projected->allFinite();
   }
 
   const Eigen::Vector2d fisheye = FisheyeFromNormal(normalized);
@@ -498,33 +659,135 @@ bool ProjectPointWithCameraParams(CameraModelId model_id,
     distorted = DistortRadialFisheye(fisheye, &params[3], 1);
     *projected = {params[0] * distorted.x() + params[1],
                   params[0] * distorted.y() + params[2]};
-    return true;
+    return projected->allFinite();
   }
   if (model_id == CameraModelId::kRadialFisheye) {
     distorted = DistortRadialFisheye(fisheye, &params[3], 2);
     *projected = {params[0] * distorted.x() + params[1],
                   params[0] * distorted.y() + params[2]};
-    return true;
+    return projected->allFinite();
   }
   if (model_id == CameraModelId::kOpenCVFisheye) {
     distorted = DistortRadialFisheye(fisheye, &params[4], 4);
     *projected = {params[0] * distorted.x() + params[2],
                   params[1] * distorted.y() + params[3]};
-    return true;
+    return projected->allFinite();
   }
   if (model_id == CameraModelId::kThinPrismFisheye) {
     distorted = DistortThinPrismFisheye(fisheye, &params[4]);
     *projected = {params[0] * distorted.x() + params[2],
                   params[1] * distorted.y() + params[3]};
-    return true;
+    return projected->allFinite();
   }
   if (model_id == CameraModelId::kRadTanThinPrismFisheye) {
     distorted = DistortRadTanThinPrismFisheye(fisheye, &params[4]);
     *projected = {params[0] * distorted.x() + params[2],
                   params[1] * distorted.y() + params[3]};
-    return true;
+    return projected->allFinite();
   }
   return false;
+}
+
+bool UnprojectPixelWithCameraParams(CameraModelId model_id,
+                                    const double* params,
+                                    const Eigen::Vector2d& pixel,
+                                    const double depth,
+                                    Eigen::Vector3d* point_camera) {
+  if (point_camera == nullptr || !pixel.allFinite() ||
+      !std::isfinite(depth) || depth <= 0.0 ||
+      !CameraModelUnprojectionImplemented(model_id) ||
+      !ParamsAreNumericallyValid(model_id, params)) {
+    return false;
+  }
+
+  const Eigen::Vector2d distorted =
+      ImageToDistortedNormalized(model_id, params, pixel);
+  Eigen::Vector2d model_plane = distorted;
+  bool success = true;
+  if (model_id == CameraModelId::kSimpleRadial) {
+    success = InvertTransform(
+        distorted,
+        [&](const Eigen::Vector2d& point) {
+          return ApplySimpleRadialDistortion(point, params[3]);
+        },
+        &model_plane);
+  } else if (model_id == CameraModelId::kRadial) {
+    success = InvertTransform(
+        distorted,
+        [&](const Eigen::Vector2d& point) {
+          return DistortRadial(point, params[3], params[4]);
+        },
+        &model_plane);
+  } else if (model_id == CameraModelId::kOpenCV) {
+    success = InvertTransform(
+        distorted,
+        [&](const Eigen::Vector2d& point) {
+          return DistortOpenCV(point, params[4], params[5], params[6],
+                               params[7]);
+        },
+        &model_plane);
+  } else if (model_id == CameraModelId::kFullOpenCV) {
+    success = InvertTransform(
+        distorted,
+        [&](const Eigen::Vector2d& point) {
+          return DistortFullOpenCV(point, &params[4]);
+        },
+        &model_plane);
+  } else if (model_id == CameraModelId::kFOV) {
+    success = InvertTransform(
+        distorted,
+        [&](const Eigen::Vector2d& point) {
+          return DistortFov(point, params[4]);
+        },
+        &model_plane);
+  } else if (model_id == CameraModelId::kSimpleRadialFisheye) {
+    success = InvertTransform(
+        distorted,
+        [&](const Eigen::Vector2d& point) {
+          return DistortRadialFisheye(point, &params[3], 1);
+        },
+        &model_plane);
+  } else if (model_id == CameraModelId::kRadialFisheye) {
+    success = InvertTransform(
+        distorted,
+        [&](const Eigen::Vector2d& point) {
+          return DistortRadialFisheye(point, &params[3], 2);
+        },
+        &model_plane);
+  } else if (model_id == CameraModelId::kOpenCVFisheye) {
+    success = InvertTransform(
+        distorted,
+        [&](const Eigen::Vector2d& point) {
+          return DistortRadialFisheye(point, &params[4], 4);
+        },
+        &model_plane);
+  } else if (model_id == CameraModelId::kThinPrismFisheye) {
+    success = InvertTransform(
+        distorted,
+        [&](const Eigen::Vector2d& point) {
+          return DistortThinPrismFisheye(point, &params[4]);
+        },
+        &model_plane);
+  } else if (model_id == CameraModelId::kRadTanThinPrismFisheye) {
+    success = InvertTransform(
+        distorted,
+        [&](const Eigen::Vector2d& point) {
+          return DistortRadTanThinPrismFisheye(point, &params[4]);
+        },
+        &model_plane);
+  }
+  if (!success || !model_plane.allFinite()) {
+    return false;
+  }
+
+  Eigen::Vector2d normalized = model_plane;
+  if (GetCameraModelSpec(model_id).is_fisheye &&
+      !FisheyeToNormal(model_plane, &normalized)) {
+    return false;
+  }
+  *point_camera =
+      Eigen::Vector3d(normalized.x() * depth, normalized.y() * depth, depth);
+  return point_camera->allFinite();
 }
 
 Eigen::Vector2d ProjectPoint(const Camera& camera,
@@ -545,72 +808,16 @@ Eigen::Vector3d UnprojectPixel(const Camera& camera,
                                const Eigen::Vector2d& pixel,
                                double depth) {
   RequireValidParams(camera);
-  if (depth <= 0.0) {
+  if (!std::isfinite(depth) || depth <= 0.0) {
     throw std::invalid_argument("Depth must be positive.");
   }
-
-  if (camera.model_id == CameraModelId::kPinhole) {
-    const double fx = camera.params[0];
-    const double fy = camera.params[1];
-    const double cx = camera.params[2];
-    const double cy = camera.params[3];
-    return {((pixel.x() - cx) / fx) * depth,
-            ((pixel.y() - cy) / fy) * depth,
-            depth};
+  Eigen::Vector3d point_camera;
+  if (!UnprojectPixelWithCameraParams(camera.model_id, camera.params.data(),
+                                      pixel, depth, &point_camera)) {
+    throw std::domain_error(
+        "Pixel cannot be unprojected for this camera model and parameters.");
   }
-
-  if (camera.model_id == CameraModelId::kSimplePinhole) {
-    const double f = camera.params[0];
-    const double cx = camera.params[1];
-    const double cy = camera.params[2];
-    return {((pixel.x() - cx) / f) * depth,
-            ((pixel.y() - cy) / f) * depth,
-            depth};
-  }
-
-  if (camera.model_id == CameraModelId::kSimpleRadial) {
-    const double f = camera.params[0];
-    const double cx = camera.params[1];
-    const double cy = camera.params[2];
-    const double k1 = camera.params[3];
-    const Eigen::Vector2d distorted((pixel.x() - cx) / f,
-                                    (pixel.y() - cy) / f);
-    const Eigen::Vector2d undistorted = RemoveDistortion(
-        distorted, [k1](const Eigen::Vector2d& point) {
-          return ApplySimpleRadialDistortion(point, k1);
-        });
-    return {undistorted.x() * depth, undistorted.y() * depth, depth};
-  }
-
-  if (camera.model_id == CameraModelId::kRadial) {
-    const double f = camera.params[0];
-    const double cx = camera.params[1];
-    const double cy = camera.params[2];
-    const double k1 = camera.params[3];
-    const double k2 = camera.params[4];
-    const Eigen::Vector2d distorted((pixel.x() - cx) / f,
-                                    (pixel.y() - cy) / f);
-    const Eigen::Vector2d undistorted =
-        RemoveDistortion(distorted, [k1, k2](const Eigen::Vector2d& point) {
-          return DistortRadial(point, k1, k2);
-        });
-    return {undistorted.x() * depth, undistorted.y() * depth, depth};
-  }
-
-  if (camera.model_id == CameraModelId::kOpenCV) {
-    const Eigen::Vector2d distorted((pixel.x() - camera.params[2]) /
-                                        camera.params[0],
-                                    (pixel.y() - camera.params[3]) /
-                                        camera.params[1]);
-    const Eigen::Vector2d undistorted = RemoveDistortion(
-        distorted, [&](const Eigen::Vector2d& point) {
-          return DistortOpenCV(point, camera.params[4], camera.params[5],
-                               camera.params[6], camera.params[7]);
-        });
-    return {undistorted.x() * depth, undistorted.y() * depth, depth};
-  }
-
-  throw std::domain_error("Unprojection is not implemented for this model.");
+  return point_camera;
 }
 
 }  // namespace colite

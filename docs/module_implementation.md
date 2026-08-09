@@ -49,7 +49,47 @@ OpenCV-like 高斯边界使用周期折叠的 reflect/`REFLECT_101` 映射，支
 
 ## Incremental SfM
 
-默认焦距初始化与 COLMAP 4.0 对齐：用户显式值优先；EXIF `FocalLengthIn35mmFilm` 使用图像对角线与 43.27 mm 全画幅对角线换算；其次使用 `FocalLength` 与焦平面分辨率；最后才使用 `1.2 × max(width,height)`。前两类 EXIF 值和用户值标为 prior，尺寸回退不是 prior。默认开启焦距 BA；主点和额外畸变参数仍默认固定。
+### Guided/verified 匹配图一致性
+
+`matching/match_graph_consistency` 在 guided matching 和两视图几何验证完成后统一规范
+verified correspondences。图像对内按跨图支持度、三视图闭环、Sampson 误差和稳定索引顺序
+执行一对一选择；同时统计跨图连通分量中“同一图像出现多个特征”的冲突规模。
+
+跨图冲突不能在相机位姿未知时直接按连通分量删边：House exhaustive 图中少量错误桥接会把大量
+真实轨迹连成大组件，硬裁剪会显著损失有效观测。因此 verified 证据保持完整，冲突延后到
+pose-aware 阶段处理：
+
+- PnP 注册一张新图时，同一 3D 点只链接该图中重投影误差最小的 inlier 特征；
+- track completion 不允许向同一 3D 点加入同一图像的第二个观测；
+- merge 遇到同图冲突时，以合并后 3D 位置的重投影误差选出唯一观测，再完成轨迹合并。
+
+`recon_sfm/summary.txt` 会记录 verified 一致性处理前后内点数、pair 冲突数、冲突组件数和冲突
+观测数，便于持续回归。
+
+图像导入递归枚举受支持图像并保存相对根目录的通用路径。默认 Auto 分组对齐
+COLMAP ImageReader：EXIF Make、Model、焦距标识及宽高完整一致时共享 Camera；
+缺字段的图像使用唯一分组。另提供 Single、Per-folder、Per-image，旧
+Shared/Individual 名称作为兼容别名。所有组均支持混合目录和重复文件名；
+真正共享内参的组要求图像尺寸一致。
+
+焦距初始化中用户显式值优先；EXIF `FocalLengthIn35mmFilm` 使用本图对角线与
+43.27 mm 全画幅对角线换算；其次使用 `FocalLength` 与焦平面分辨率；最后使用
+可配置的 `default_focal_length_factor × max(width,height)`。组内 prior 取
+中位数，并拒绝相对跨度超过 5% 的冲突。该策略在
+`controllers/sfm_camera_setup` 中统一实现，完整 `recon_sfm` 和分阶段
+`feature_extractor → matcher → mapper` 共用。默认模型改为 SIMPLE_RADIAL；
+默认优化焦距和畸变/额外参数，主点固定。
+
+Core 当前登记并完整支持 12 个模型：
+
+`SIMPLE_PINHOLE`、`PINHOLE`、`SIMPLE_RADIAL`、`RADIAL`、`OPENCV`、
+`OPENCV_FISHEYE`、`FULL_OPENCV`、`FOV`、`SIMPLE_RADIAL_FISHEYE`、
+`RADIAL_FISHEYE`、`THIN_PRISM_FISHEYE`、`RAD_TAN_THIN_PRISM_FISHEYE`。
+投影、反投影、BA、去畸变和 text/binary 读写共用同一参数登记表。反投影对
+畸变平面使用带数值 Jacobian、信赖半径和回溯的二维求解，再将鱼眼角度平面
+转回透视 ray；失败返回明确状态，不输出 NaN。合法性检查覆盖参数个数、有限值、
+正焦距、FOV 范围及可配置的异常焦距/畸变阈值。暂不登记 COLMAP 4.0 新增的
+4 个模型。
 
 实现位于 `src/colite/sfm`：
 
@@ -58,6 +98,31 @@ OpenCV-like 高斯边界使用周期折叠的 reflect/`REFLECT_101` 映射，支
 - `incremental_triangulator`：Continue、point-centric multi-view Create、complete/merge；一次 Mapper 运行只构建一次只读 correspondence adjacency，所有局部/全局三角化复用。
 - `local_bundle_adjuster` / `global_bundle_adjuster`：Ceres BA、参数 mask 和 gauge fixing；Ceres 线程数继承 SfM 控制器的统一线程设置，不再固定为 1。
 - `observation_manager` / `observation_filter`：track 冲突、合并、坏点和坏观测清理。
+- `reconstruction_manager`：已有模型续建、verified 连通分量枚举、多模型生命周期和模型间
+  Sim(3) 合并。
+
+多模型与断点续建语义：
+
+1. 输入模型使用 COLMAP text 格式。恢复时以图像名而不是历史 ID 关联当前图像清单，因此可在
+   原数据集加入新图或改变枚举顺序；当前图像路径和位置先验保留，历史优化内参、位姿、点及
+   track 恢复。
+2. 相机模型和图像尺寸必须与当前 schema 兼容；若当前策略要求多个图像共享同一 Camera，而
+   输入模型为它们提供了不同内参，则明确报错，不静默选择最后一组参数。
+3. 恢复前校验已注册图像的特征数量、坐标和索引顺序与当前 MatchGraph 一致；只有历史
+   `POINTS2D` 为空的已注册图像可从当前特征安全补齐。改变 SIFT 后端、参数或特征排序后必须
+   重新建模，不能复用旧 track 索引。
+4. seed 模型先继续执行 2D-3D 注册。其余图像按 verified 匹配图的连通分量、由大到小重复
+   初始化；初始化器和注册候选均受当前分量 image-ID 集约束，避免跨分量污染。
+5. 模型合并只使用 verified 匹配连接的已三角化观测建立一对一 3D-3D 对应，经过确定性鲁棒
+   Sim(3) 假设、尺度相关残差门限和全内点重估后，才迁移相机、点与观测。合并后重新执行
+   complete/merge、补注册、过滤和全局 BA。
+6. `sparse/` 或 `recon_sfm` 输出根目录保存最大模型；`models/<index>/` 保存全部模型。
+   `multiple_models=0` 只保留一个初始化机会，`merge_models=0` 保留可对齐模型为独立结果。
+
+当前仍是多模型增量 Mapper，不是 hierarchical/global Mapper。下一阶段若面向数百至数千图，
+优先实现 hierarchical mapper：对 verified 图做重叠分区、局部增量重建、基于公共 track 的
+Sim(3) 模型图优化、分层合并和最终全局 BA。Global mapper 还需要独立的旋转平均、平移平均、
+全局三角化及其鲁棒退化处理，不能仅把当前增量注册循环替换为一次全局求解。
 
 当前三角化语义：
 
@@ -74,7 +139,9 @@ OpenCV-like 高斯边界使用周期折叠的 reflect/`REFLECT_101` 映射，支
 
 ## 图像去畸变
 
-实现位于 `src/colite/mvs/image_undistorter.cpp` 和 MVS 控制器。每个输出 PINHOLE ray 通过原相机投影反查源图，支持已实现投影的畸变、鱼眼和薄棱镜模型。输出模型同步更新内参、图像尺寸和稀疏观测。
+实现位于 `src/colite/mvs/image_undistorter.cpp` 和 MVS 控制器。输出 PINHOLE
+像素先构造 ray，再通过原相机投影反查源图；稀疏观测去畸变复用 Core 的统一
+稳健反投影，支持上述全部12种模型。输出模型同步更新内参、图像尺寸和稀疏观测。
 
 `blank_pixels`、scale 范围和 max image size 控制视场及尺寸。`resolution_level=1` 表示宽高各缩小一级；若去畸变阶段已经缩放，后续 workspace 不重复缩放。
 
@@ -117,15 +184,79 @@ staging，不再先构造同尺寸 `std::vector<float>` 再复制；关闭
 `--patch_match_diagnostics` 时，动态 source probability 在设备端初始化，且不再
 为了摘要回读整张概率图。算法候选、随机种子、迭代次数和过滤阈值均不变。
 
+动态 source CDF 默认将 NCC-HMM 概率与 COLMAP 式几何先验相乘：小于 1°
+的三角化角连续降权，源相机入射角使用 `sigma=0.9` 的概率，并按当前平面单应
+映射后的 patch 面积比抑制严重上/下采样源图。该先验只改变 15 次 CDF 抽样权重，
+不放宽最终 1 px/1%/法向阈值。House 800 px A/B 中，PatchMatch 墙钟
+98.05→98.23 秒，Fusion 点数 287,344→303,978（+5.79%），平均光度代价
+0.2635→0.2249。通用 source 列表仍默认使用 weighted 模式，以免极小基线数据被
+1°门限清空；High/COLMAP 对齐可显式使用 `--source_selection_mode colmap`。
+
 默认策略为 `resolution_level=1`、3 次迭代、checkerboard 每迭代一轮红黑更新。checkerboard 会先按邻居已有代价预选两个平面再执行昂贵的光度评价；House 的 4 轮质量配置相对四邻居全评估将墙钟降低 41.5%，覆盖降低 3.33 个百分点，深度 P95 基本不变。动态 source selection 现在默认同时使用 directional HMM 和 CDF sampling，以保持弱纹理区域的源选择连续性。
 
 几何细化与公开的光度金字塔参数分开：即使 `--patch_match_pyramid_levels 1`，几何 pass 内部也至少使用 3 层 coarse-to-fine，并执行 1 个继承光度结果的同步 pass；该 pass 的内层迭代数仍由 `--patch_match_geometric_refinement_iterations` 控制。reference depth/normal 使用光度结果作为初始假设，所有视图的光度 depth 作为不可变 source snapshot。第二个外层同步 pass 在 2296 px 下增加约 103 s 墙钟，只把严格覆盖从 65.84% 提高到 77.37%；单 pass 已高于相同数据上 COLMAP 的历史严格覆盖 61.96%，因此默认不重复。这样保留单层光度阶段的参数/耗时口径，同时避免红黑传播在大面积弱纹理表面停滞。几何代价按 Colite 的 `0.5*(1-ZNCC)` 量纲缩放，源深度无效时使用截断最大惩罚；关闭遮挡/冲突硬门控时，候选直接进入 COLMAP 风格软重投影代价。CUDA 光度分支只评价真实平面单应，不再额外取 ±7.5° 旋转补丁最小值，也不叠加固定 source/incident cost 惩罚。详细原子诊断默认关闭，因为会显著影响 CUDA 热路径。
+
+几何 refinement 默认将光度 source 排名与几何共识解耦：光度部分继续使用动态
+selection/best-sample 聚合；几何部分对所有有效 source-depth 的 forward-backward
+重投影误差排序，取较低一半均值，并以原权重加入候选代价。CUDA 几何阶段使用正无穷
+作为无效哨兵，避免合法的“光度 + 几何”组合代价大于 1 时被误删。House 2296px
+相对旧组合点数增加 2.10%，24-NN median/P95 降低 21.52%/10.71%，wall 仅增加
+0.26%；可用 `--patch_match_legacy_geometric_aggregation` 恢复旧 source 混排语义。
 
 最终几何一致性图直接构造 CSR offsets/IDs，native binary v2 按连续数组批量写出；构建和第二遍读取过滤均按 `num_threads` 有界并行。结果数组在构图阶段只读，过滤阶段每个任务只修改自己的 view，因此不会改变几何判定和输出顺序。binary dense-map 模式同时覆盖 depth、normal 和 cost，不再把 cost 以十进制文本写入大文件。
 
 历史 `docs/superpowers` 计划中的 source scoring、几何代价、传播、稳定初始化、binary maps、并行缓存、质量诊断、法线 refinement 和 CUDA 对齐任务均已落地，其长期行为已归纳在本节；原计划文件不再保留。
 
 ## Stereo Fusion
+
+内存式 `recon_mvs --fuse_stereo` 不再把 PatchMatch 的 depth/normal/cost 先复制到
+控制器向量、再由 Fusion API 二次复制；maps 所有权直接移交给共享 view data，最终
+dense-map 输出继续复用同一份存储。CUDA geometric refinement 通过不可变 depth
+指针引用全局 snapshot，避免每 job 深拷贝 source maps。大于等于 200 万像素时只
+保留一个 refinement workspace；refinement 后立即释放全部 device/pinned workspace，
+再以最多 2 worker 构建 consistency graph。House 2296px 全流程峰值由 7.09 GiB
+降到 5.53 GiB，Fusion core 保持约 29.4 s。
+
+## Incremental Mapper 与 BA 热路径
+
+全局 `CompleteAndMergeTracks` 使用 dirty-set fixed point：第一轮检查全部三维点，后续
+只重新检查本轮确实增加观测或发生合并的目标点。Mapper 对每张新注册图完成局部三角化
+后只执行一次 completion，不再在每个相邻图对之后重复全图 completion。该策略保留
+complete/merge 的收敛语义，同时显著降低 House 的全局 completion 时间。
+
+Local/Global BA 对默认 SIMPLE_PINHOLE、PINHOLE 和 SIMPLE_RADIAL 相机路径使用解析
+投影 Jacobian 与相机参数 Jacobian；姿态部分使用包含单位化链式导数的 xyzw 四元数解析
+Jacobian。其余九种已登记相机模型保留数值差分回退，因此模型覆盖能力不受影响。
+House 回归中 Mapper 为 62.20 s、46,192 点、145,710 观测、平均重投影 1.13196 px，
+相对 COLMAP 4.0 的 54.55 s 为 1.14 倍。
+
+全局 track completion 额外处理 verified 组件中的跨中间节点证据。候选阶段按未关联
+Point2D 并行执行最多四跳只读 BFS，每个目标保留最多四个最低重投影候选；随后按误差和
+观测 ID 确定性排序，在单线程中执行一图一观测检查和 Reconstruction 修改。这样不会在
+并行阶段产生数据竞争，也不会因逐 Point3D 重复遍历大组件而拖慢 Mapper。House 得到
+146,531 观测、mean track 3.17579、重复观测 0，Mapper 61.92 s。
+
+后续隔离实验把 COLMAP 4.0 数据库 verified 图直接交给 Colite Mapper；Colite 得到
+40,495 点、154,880 观测、mean track 3.824670、同图重复观测 0，高于 COLMAP 在
+同一图上的 3.738058。Colite 自有图 55.6% 的边无精确三视图闭环，而 COLMAP 为
+26.8%，因此剩余长轨迹差距定位到前端图拓扑。此前生产 completion 只在第一次全局
+complete/merge 对四跳无安全候选的目标继续第五跳；该基线 House 为 146,640 观测、
+mean 3.179876、Mapper 61.653 s。当前首轮允许继续到第六跳，BA/过滤后的重复轮次仍
+固定四跳，避免深搜弱连通组件造成耗时回退。
+
+### Guided matching 比率语义
+
+standalone `sequential/exhaustive/spatial/vocab_tree matcher` 支持 `--guided_matching`、`--guided_match_ratio` 和 `--guided_min_inlier_gain`。guided ratio 独立进入 geometry cache hash，不再被 `nearby_match_ratio` 隐式抬高；standalone 默认 0.8，用于对齐 COLMAP High 的同描述子语义。
+
+`recon_sfm` 同样开放 `--guided_match_ratio`，但生产默认暂为 0.95。原因是当前冻结 P1 后，CUDA VLFeat 严格输出 8192 特征/图，0.8 会把 House observations 从 146,640 降到 79,351。调用方可显式用 0.8 做同描述子对照。全局跨图冲突不能在未知位姿时硬拆；House A/B 会把 observations 降到 123,012，因此继续由 PnP、complete/merge 和重投影过滤做位姿感知消歧。
+
+### 最终位姿双描述子轨迹补全
+
+全局 BA 后执行一次 pose-guided completion。对每个尚未观测某注册图像的 Point3D，将其投影到该图像，只搜索 2 px 邻域内的未分配 SIFT 特征；目标描述子必须与轨迹中至少两条已有描述子一致，第二高归一化余弦相似度对应的角距离不得超过 0.301 rad。候选按第二/第一描述子相似度、重投影误差、轨迹长度和稳定 ID 排序，串行提交时再次检查一图一观测约束。新增观测随后进入全局过滤和最终 BA。
+
+该路径不创建或删除 Point3D，不依赖 verified 巨型冲突组件的深层遍历，也不改变 SIFT 上限与多方向语义。House 配合首轮自适应六跳后得到 152,013 observations、mean track 3.300469、重复观测 0，平均重投影误差 1.118657 px；pose-guided 阶段新增 5,196 observations、耗时 0.105 s，完整 Mapper 为 61.989 s。稀疏阶段缓存版本为 `recon_sfm_resume_multimodel_v6_pose_guided_tracks`，旧 checkpoint 会自动重算 Mapper。
+
+## Stereo Fusion 持久化入口
 
 Fusion 读取持久化 dense maps 和 consistency graph，从 seed 像素沿一致投影构造
 track。生产入口按 reference 顺序处理，已完成的早期 reference 不再作为 source
@@ -203,15 +334,13 @@ COLMAP binary 格式，避免每个融合点一次小 vector 分配。默认 180
 BVH 线段求交排除当前面及共享目标顶点邻面。大网格应先简化，并根据纹理细节
 逐级增加 atlas 上限。
 
-BVH 遮挡判定使用 `occlusion_relative_tolerance` 作为目标端相对容差：默认
-1% 范围内的近共面交点按重建表面噪声处理，不再把屋顶、地面上的轻微层叠误判
-为遮挡；明显位于目标前方的表面仍拒绝。严格选择后，仅当至少两个边邻面已有
-纹理时，未选择面才会从邻面候选视图中选择一个仍满足完整投影和正面约束的视图。
+BVH 主视图选择将目标端相对容差限制为 0.5%，避免把 1% 范围内所有近端交点
+无条件当作表面噪声。配置的完整 `occlusion_relative_tolerance` 只用于受近共面
+双邻面支持的孔洞恢复；明显位于目标前方的表面仍拒绝。
 
-最终仍没有可靠相机视图的面不再把三个 UV 压到统一灰色 texel。Texturer 为每个
-此类面分配独立小 atlas patch，并对 Poisson/QEM 保留的 RGB 顶点色做重心插值。
-该 fallback 不改变网格拓扑、不穿透遮挡，也不会伪造相机纹理；其目标是消除
-退化 UV 形成的三角形/异形灰色孔洞。
+最终仍没有可靠相机视图的面默认映射到中性 atlas texel，不再逐面建立 RGB
+顶点色 patch，以免遮挡拒绝面形成明显三角纹理块。兼容旧输出时可显式启用
+`use_vertex_color_fallback`。
 
 跨视图颜色校正分为两级。第一级求每个相机的常量 RGB 偏移，校正整体曝光；
 第二级只在不同视图 patch 的共享边顶点建立带正则的最小二乘残差约束，并在
@@ -233,9 +362,8 @@ global/local seam leveling、共面 virtual faces、孔洞闭合和 mesh refinem
 
 ## 已知差距
 
-1. Texturer 的 RGB 顶点色 fallback 能消除退化 UV 孔洞，但细节低于真实相机
-   投影；全局曝光 + 局部 seam 顶点场已降低跨视图色差，仍未实现局部窄带
-   Poisson seam blending 和共面区域级视图选择。
+1. Texturer 已实现近共面小视图孤岛合并和受拓扑支持的孔洞恢复；全局曝光 +
+   局部 seam 顶点场已降低跨视图色差，仍未实现局部窄带 Poisson seam blending。
 2. House SfM 的共享 Camera 局部 BA/全模型过滤错误和 guided matching 缺口均已修复；相同 CUDA VLFeat 8192 配置最终为 48,794 点、147,407 observations。与 COLMAP 的剩余差异主要是 descriptor 数、SIFT 实现和相机模型，而不是 GPS。
 3. House GUI High 等价 2400×1597、20 sources、radius 5 配置中，平面单应
    + FP32 ZNCC 将 PatchMatch 从 3537.21 s 降至 772.17 s，比同输入 COLMAP
@@ -248,3 +376,26 @@ global/local seam leveling、共面 virtual faces、孔洞闭合和 mesh refinem
 5. Delaunay 需要更多非退化真值场景验证，而不只是与 COLMAP 输出互比。
 6. 历史 ASCII double PLY 已替换为 binary little-endian float PLY；外部脚本仍需
    同时支持两种格式以读取旧测试产物。
+### 纹理视图连续性与遮挡策略
+
+纹理主视图选择使用 BVH 射线遮挡、投影面积和法向夹角。为避免带噪平面被 1% 端点容差整体误判为可见，主选择的端点噪声带上限为 0.005；配置的完整 `occlusion_relative_tolerance` 仅用于后续孔洞恢复。恢复面必须同时满足：同一相邻视图至少两个边邻面支持、相邻法向夹角不超过约 20°、投影有效，并通过带配置容差的射线遮挡检查。
+
+多数标签平滑后，小于 `view_selection_min_component_size`（默认 64 面）的近共面视图孤岛会在整块候选视图均有效且总投影面积至少保留 50% 时合并。这减少屋顶、地面等平面上的单三角 atlas chart，同时不会跨越屋脊等真实折线。
+
+未选中视图的面默认使用中性 atlas 坐标，不再逐三角创建顶点色 fallback patch；后者容易把遮挡拒绝面显示为明显的三角纹理碎片。如需兼容旧行为，可显式设置 `use_vertex_color_fallback=1`。
+
+## Fusion 候选遍历与法线方向约定
+
+几何过滤已经把 consistency graph 支持不足的像素同步置为无效深度、无效法线和无效代价。持久化 Fusion 不再只沿逐像素 graph 二次限制 track，而是按 MVS source scoring 得到的有序重叠视图列表重新投影，并执行 seed-relative 深度、重投影和法线阈值检查。这与 COLMAP 4.0 默认 Fusion 的重叠图像遍历语义一致；native graph 仍由 PatchMatch 保存并用于几何过滤，核心 Fusion API 也保留显式 graph 模式供测试和特殊调用方使用。
+
+PatchMatch 与 Fusion 的候选数量不再共用一个上限。Fusion 默认独立按共享稀疏点
+数排序并检查最多 50 个重叠视图（COLMAP `check_num_images=50` 语义），PatchMatch
+继续使用自己的较小 source 集。House High 的 COLMAP maps 回归中，20-view
+Colite Fusion 为 2,591,903 点；改为独立 50-view 后为 2,666,592 点，与 COLMAP
+自身 2,667,152 仅差 560 点（0.02%）。
+
+COLMAP 默认 photometric PatchMatch 不一定写 consistency graph。读取不到图时必须保留真正的空 `ConsistencyGraph` 并使用 source-view fallback；不能创建“有尺寸但零连接”的图，否则每个有效像素都会被误判为 graph 支持不足。
+
+平面单应代价对法线 `n` 与 `-n` 不敏感，因此 PatchMatch 优化本身不能稳定法线符号。所有 PatchMatch 最终法线在几何过滤、Fusion 和落盘前统一朝向参考相机；持久化 Fusion 加载旧图或外部图时也执行同一幂等规范化。House High 受控实验中，这一修复把 Colite 图经 Colite Fusion 的点数从 2,298,163 提高到 2,386,766；同一 Colite 图经 COLMAP Fusion 为 2,395,492，差距降至 0.36%。
+
+binary dense-map reader 同时接受 Colite 自有格式和 COLMAP 的 `width&height&channels&` 格式。COLMAP normal map 的 payload 是完整 x/y/z 通道平面，读取时必须转换为 Colite 的逐像素 xyz 交错布局；不能把 payload 直接解释为 `Eigen::Vector3f[]`。

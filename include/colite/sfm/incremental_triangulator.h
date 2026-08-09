@@ -15,8 +15,32 @@ namespace colite {
 // 三角化都重新扫描并分配完整的 verified correspondence graph。
 struct IncrementalTriangulatorCache {
   using ObservationKey = std::pair<ImageId, Point2DIdx>;
-  using CorrespondenceAdjacency =
-      std::map<ObservationKey, std::vector<ObservationKey>>;
+  struct CorrespondenceAdjacency {
+    using Neighbors = std::vector<ObservationKey>;
+
+    void ResizeImage(ImageId image_id, std::size_t num_points2d) {
+      by_image[image_id].resize(num_points2d);
+    }
+
+    Neighbors* Mutable(const ObservationKey& observation) {
+      auto& image = by_image[observation.first];
+      if (observation.second >= image.size()) {
+        image.resize(observation.second + 1);
+      }
+      return &image[observation.second];
+    }
+
+    const Neighbors* Find(const ObservationKey& observation) const {
+      const auto image_it = by_image.find(observation.first);
+      if (image_it == by_image.end() ||
+          observation.second >= image_it->second.size()) {
+        return nullptr;
+      }
+      return &image_it->second[observation.second];
+    }
+
+    std::map<ImageId, std::vector<Neighbors>> by_image;
+  };
 
   explicit IncrementalTriangulatorCache(const MatchGraph& graph);
 
@@ -26,8 +50,9 @@ struct IncrementalTriangulatorCache {
 // 增量三角化参数。命名和默认值参考 COLMAP
 // IncrementalTriangulator::Options。
 struct IncrementalTriangulatorOptions {
-  // COLMAP defaults: one-hop correspondence collection, 2 degree angular
-  // residuals for Create/Continue, and a 1.5 degree stable baseline.
+  // Match COLMAP's one-hop creation default. Robust creation still keeps only
+  // the best geometrically consistent observation from each image when a
+  // caller explicitly enables transitive collection.
   std::size_t max_transitivity = 1;
   double min_triangulation_angle_deg = 1.5;
   double min_pair_median_triangulation_angle_deg = 0.0;
@@ -35,7 +60,13 @@ struct IncrementalTriangulatorOptions {
   double continue_max_angle_error_deg = 2.0;
   double merge_max_reprojection_error_px = 4.0;
   double complete_max_reprojection_error_px = 4.0;
-  std::size_t complete_max_transitivity = 5;
+  std::size_t complete_max_transitivity = 6;
+  // Final-pose descriptor-guided completion. These conservative defaults
+  // require a target feature to agree with at least two existing track
+  // descriptors and to lie within two pixels of the projected 3D point.
+  double pose_guided_max_reprojection_error_px = 2.0;
+  double pose_guided_max_descriptor_angle_rad = 0.301;
+  std::size_t pose_guided_min_descriptor_support = 2;
   // 新建点后追加执行的 track completion / merge 轮数上限，接近 COLMAP 的 complete-merge-create 局部循环。
   std::size_t max_track_update_iterations = 5;
   // During incremental mapping, only complete the image being processed so
@@ -83,5 +114,13 @@ IncrementalTriangulatorSummary CompleteAndMergeAllTracks(
     const IncrementalTriangulatorOptions& options,
     Reconstruction* reconstruction,
     const IncrementalTriangulatorCache* cache = nullptr);
+
+// Extend existing tracks after camera poses stabilize. Unlike correspondence
+// graph traversal, this searches unassigned features near each projected 3D
+// point and requires descriptor agreement with multiple track observations.
+IncrementalTriangulatorSummary CompleteTracksByPoseAndDescriptors(
+    const MatchGraph& graph,
+    const IncrementalTriangulatorOptions& options,
+    Reconstruction* reconstruction);
 
 }  // namespace colite

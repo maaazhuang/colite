@@ -76,6 +76,9 @@ struct Camera {
 
   bool HasValidId() const;
   bool VerifyParams() const;
+  bool HasBogusParams(double min_focal_length_ratio = 0.1,
+                      double max_focal_length_ratio = 10.0,
+                      double max_extra_param = 1.0) const;
   double MeanFocalLength() const;
   Eigen::Matrix3d CalibrationMatrix() const;
 };
@@ -85,6 +88,7 @@ CameraModelId CameraModelNameToId(std::string_view name);
 std::string_view CameraModelIdToName(CameraModelId model_id);
 bool ExistsCameraModel(CameraModelId model_id);
 bool CameraModelProjectionImplemented(CameraModelId model_id);
+bool CameraModelUnprojectionImplemented(CameraModelId model_id);
 
 // 按模型默认方式初始化参数：焦距使用 focal_length，主点位于图像中心，畸变为 0。
 std::vector<double> InitializeCameraParams(CameraModelId model_id,
@@ -105,6 +109,12 @@ bool ProjectPointWithCameraParams(CameraModelId model_id,
                                   const double* params,
                                   const Eigen::Vector3d& point_camera,
                                   Eigen::Vector2d* projected);
+
+bool UnprojectPixelWithCameraParams(CameraModelId model_id,
+                                    const double* params,
+                                    const Eigen::Vector2d& pixel,
+                                    double depth,
+                                    Eigen::Vector3d* point_camera);
 
 Eigen::Vector2d ProjectPoint(const Camera& camera,
                              const Eigen::Vector3d& point_camera);

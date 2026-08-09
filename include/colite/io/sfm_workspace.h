@@ -13,6 +13,20 @@
 
 namespace colite {
 
+// COLMAP sparse-model storage. kAuto is valid for reading only and prefers a
+// complete binary model when both representations are present.
+enum class ColmapModelFormat {
+  kAuto,
+  kText,
+  kBinary,
+  kTextAndBinary,
+};
+
+ColmapModelFormat ColmapModelFormatFromString(const std::string& value);
+std::string ColmapModelFormatToString(ColmapModelFormat format);
+ColmapModelFormat DetectColmapModelFormat(
+    const std::filesystem::path& model_path);
+
 std::filesystem::path WorkspaceFeaturesPath(
     const std::filesystem::path& workspace_path);
 std::filesystem::path WorkspaceMatchesPath(
@@ -81,6 +95,42 @@ void ReadWorkspaceVerifiedGeometries(
 
 void WriteWorkspaceSparseReconstruction(
     const std::filesystem::path& workspace_path,
+    const Reconstruction& reconstruction,
+    ColmapModelFormat format = ColmapModelFormat::kText);
+
+// COLMAP text model I/O shared by SfM resume, multi-model output and MVS.
+Reconstruction ReadColmapTextReconstruction(
+    const std::filesystem::path& model_path);
+Reconstruction ReadColmapBinaryReconstruction(
+    const std::filesystem::path& model_path);
+Reconstruction ReadColmapReconstruction(
+    const std::filesystem::path& model_path,
+    ColmapModelFormat format = ColmapModelFormat::kAuto);
+void WriteSparseReconstruction(
+    const std::filesystem::path& model_path,
     const Reconstruction& reconstruction);
+void WriteColmapBinaryReconstruction(
+    const std::filesystem::path& model_path,
+    const Reconstruction& reconstruction);
+void WriteColmapReconstruction(
+    const std::filesystem::path& model_path,
+    const Reconstruction& reconstruction,
+    ColmapModelFormat format);
+
+// Create a reconstruction containing every workspace camera/image. When an
+// input model is supplied, its optimized cameras, registered poses, points and
+// tracks are overlaid after remapping image IDs by name and validating camera
+// compatibility against the workspace.
+Reconstruction ReadWorkspaceReconstruction(
+    const std::filesystem::path& workspace_path,
+    const std::filesystem::path& input_model_path = {});
+
+Reconstruction ApplyColmapTextModel(
+    const Reconstruction& schema,
+    const std::filesystem::path& input_model_path);
+Reconstruction ApplyColmapModel(
+    const Reconstruction& schema,
+    const std::filesystem::path& input_model_path,
+    ColmapModelFormat format = ColmapModelFormat::kAuto);
 
 }  // namespace colite

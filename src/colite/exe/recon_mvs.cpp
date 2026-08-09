@@ -45,6 +45,8 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
          "default 8.\n"
       << "  --min_num_shared_points <n> Minimum shared sparse points for a "
          "source image, default 1.\n"
+      << "  --source_selection_mode <name> Source ranking: weighted or "
+         "colmap; default weighted.\n"
       << "  --source_min_triangulation_angle <deg> Minimum source-view "
          "triangulation angle used for scoring, default 1.\n"
       << "  --source_max_triangulation_angle <deg> Maximum source-view "
@@ -95,6 +97,10 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
          "likelihood source probabilities; disabled by default.\n"
       << "  --patch_match_directional_hmm Apply CUDA row/column "
          "forward-backward source messages after each NCC update.\n"
+      << "  --patch_match_colmap_source_priors Enable source sampling "
+         "triangulation, incident-angle, and resolution priors (default).\n"
+      << "  --patch_match_no_colmap_source_priors Disable the COLMAP-style "
+         "source sampling geometry priors.\n"
       << "  --patch_match_source_samples <n> Per-pixel source CDF samples; "
          "default 0 uses best-K; 15 enables the experimental COLMAP-style "
          "CDF path.\n"
@@ -120,8 +126,13 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
          "counters; disabled by default because hot-path atomics are costly.\n"
       << "  --patch_match_geometric_refinement_iterations <n> PatchMatch "
          "second-pass geometric refinement iterations, default 0.\n"
-      << "  --patch_match_geometric_consistency_weight <w> Source-depth "
-         "geometric consistency cost weight for refinement, default 0.\n"
+        << "  --patch_match_geometric_consistency_weight <w> Source-depth "
+           "geometric consistency cost weight for refinement, default 0.\n"
+        << "  --patch_match_robust_geometric_aggregation Decouple source "
+           "photometric ranking from a robust cross-view geometric "
+           "consensus (default).\n"
+        << "  --patch_match_legacy_geometric_aggregation Restore legacy "
+           "per-source mixed photometric/geometric ranking.\n"
       << "  --patch_match_geometric_max_relative_depth_error <r> Source-depth "
          "relative error normalization threshold, default 0.01.\n"
       << "  --refine_normals_from_depth Refine PatchMatch normals from the "
@@ -137,6 +148,8 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
          "with fewer than n consistent sources.\n"
       << "  --fuse_stereo             Fuse filtered stereo depth maps into "
          "dense/fused.ply.\n"
+      << "  --fusion_max_num_source_images <n> Maximum overlapping images "
+         "checked by Fusion, default 50; independent of PatchMatch sources.\n"
       << "  --fusion_min_num_observations <n> Minimum observations per fused "
          "track, default 1.\n"
       << "  --fusion_max_num_observations <n> Maximum observations per fused "
@@ -199,8 +212,10 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --texture_min_cos_normal_angle <v> Grazing-angle threshold, default 0.1.\n"
       << "  --texture_min_visible_vertices <n> Required projected vertices, default 3.\n"
       << "  --texture_view_smoothing_iterations <n> Neighbor label smoothing, default 3.\n"
+      << "  --texture_view_min_component_size <n> Merge smaller planar view islands, default 64 (0 disables).\n"
       << "  --texture_visibility_resolution <n> Depth-buffer longest side, default 1024.\n"
       << "  --texture_occlusion_tolerance <r> Relative depth tolerance, default 0.01.\n"
+      << "  --texture_vertex_color_fallback <0|1> Per-face fallback patches, default 0.\n"
       << "  --texture_color_correction <0|1> Apply global seam correction, default 1.\n"
       << "  --texture_color_correction_regularization <v> Correction regularizer, default 0.1.\n"
       << "  --geometric_max_reprojection_error <px> Geometric consistency "
@@ -264,6 +279,8 @@ ReconMvsCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--min_num_shared_points") {
       options.min_num_shared_points =
           static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
+    } else if (arg == "--source_selection_mode") {
+      options.source_selection_mode = RequireValue(args, &i, arg);
     } else if (arg == "--source_min_triangulation_angle") {
       options.source_min_triangulation_angle_degrees =
           std::stod(RequireValue(args, &i, arg));
@@ -325,6 +342,10 @@ ReconMvsCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--patch_match_directional_hmm") {
       options.patch_match_directional_hmm = true;
       options.patch_match_dynamic_source_selection = true;
+    } else if (arg == "--patch_match_colmap_source_priors") {
+      options.patch_match_colmap_source_priors = true;
+    } else if (arg == "--patch_match_no_colmap_source_priors") {
+      options.patch_match_colmap_source_priors = false;
     } else if (arg == "--patch_match_source_samples") {
       options.patch_match_source_samples =
           static_cast<std::size_t>(
@@ -360,9 +381,13 @@ ReconMvsCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--patch_match_geometric_refinement_iterations") {
       options.patch_match_geometric_refinement_iterations =
           static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
-    } else if (arg == "--patch_match_geometric_consistency_weight") {
-      options.patch_match_geometric_consistency_weight =
-          std::stof(RequireValue(args, &i, arg));
+      } else if (arg == "--patch_match_geometric_consistency_weight") {
+        options.patch_match_geometric_consistency_weight =
+            std::stof(RequireValue(args, &i, arg));
+      } else if (arg == "--patch_match_robust_geometric_aggregation") {
+        options.patch_match_robust_geometric_aggregation = true;
+      } else if (arg == "--patch_match_legacy_geometric_aggregation") {
+        options.patch_match_robust_geometric_aggregation = false;
     } else if (arg == "--patch_match_geometric_max_relative_depth_error") {
       options.patch_match_geometric_max_relative_depth_error =
           std::stof(RequireValue(args, &i, arg));
@@ -386,6 +411,9 @@ ReconMvsCliOptions ParseOptions(const std::vector<std::string>& args) {
       if (options.filter_geometric_min_num_consistent_sources == 0) {
         options.filter_geometric_min_num_consistent_sources = 1;
       }
+    } else if (arg == "--fusion_max_num_source_images") {
+      options.fusion_max_num_source_images =
+          static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
     } else if (arg == "--fusion_min_num_observations") {
       options.fusion_min_num_observations =
           static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
@@ -508,12 +536,18 @@ ReconMvsCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--texture_view_smoothing_iterations") {
       options.texture_view_smoothing_iterations =
           std::stoi(RequireValue(args, &i, arg));
+    } else if (arg == "--texture_view_min_component_size") {
+      options.texture_view_min_component_size =
+          std::stoi(RequireValue(args, &i, arg));
     } else if (arg == "--texture_visibility_resolution") {
       options.texture_visibility_resolution =
           std::stoi(RequireValue(args, &i, arg));
     } else if (arg == "--texture_occlusion_tolerance") {
       options.texture_occlusion_relative_tolerance =
           std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--texture_vertex_color_fallback") {
+      options.texture_use_vertex_color_fallback =
+          std::stoi(RequireValue(args, &i, arg)) != 0;
     } else if (arg == "--texture_color_correction") {
       options.texture_apply_color_correction =
           std::stoi(RequireValue(args, &i, arg)) != 0;
@@ -780,6 +814,7 @@ void ValidateOptions(const ReconMvsCliOptions& options) {
       options.texture_min_visible_vertices >= 1 &&
       options.texture_min_visible_vertices <= 3 &&
       options.texture_view_smoothing_iterations >= 0 &&
+      options.texture_view_min_component_size >= 0 &&
       options.texture_visibility_resolution >= 16 &&
       std::isfinite(options.texture_occlusion_relative_tolerance) &&
       options.texture_occlusion_relative_tolerance >= 0.0 &&
@@ -876,6 +911,11 @@ void ValidateOptions(const ReconMvsCliOptions& options) {
       options.dense_map_format != "binary") {
     throw std::invalid_argument(
         "--dense_map_format must be either text or binary");
+  }
+  if (options.source_selection_mode != "weighted" &&
+      options.source_selection_mode != "colmap") {
+    throw std::invalid_argument(
+        "--source_selection_mode must be either weighted or colmap");
   }
   if (options.num_threads == 0) {
     throw std::invalid_argument("--num_threads must be positive");

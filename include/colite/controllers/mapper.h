@@ -2,11 +2,27 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <set>
+#include <string>
+
+#include "colite/core/camera.h"
+#include "colite/io/sfm_workspace.h"
 
 namespace colite::controllers {
 
 struct MapperControllerOptions {
   std::filesystem::path workspace_path;
+  std::filesystem::path input_model_path;
+  ColmapModelFormat input_model_format = ColmapModelFormat::kAuto;
+  ColmapModelFormat output_model_format =
+      ColmapModelFormat::kTextAndBinary;
+  bool multiple_models = true;
+  bool merge_models = true;
+  std::size_t max_num_models = 50;
+  std::size_t min_num_images_per_model = 2;
+  CameraParameterGroup ba_refine_camera_params =
+      CameraParameterGroup::kFocalLength | CameraParameterGroup::kDistortion;
+  std::set<std::string> ba_refine_camera_param_names;
 };
 
 struct MapperControllerSummary {
@@ -14,6 +30,8 @@ struct MapperControllerSummary {
   bool cache_hit = false;
   std::size_t num_registered_images = 0;
   std::size_t num_points3d = 0;
+  std::size_t num_models = 0;
+  std::size_t num_unregistered_images = 0;
 };
 
 class MapperController {

@@ -1,6 +1,6 @@
 # Colite 项目概况
 
-更新时间：2026-07-18。
+更新时间：2026-07-30。
 
 ## 目标与定位
 
@@ -18,20 +18,27 @@ Colite 是一个 C++17 编写的轻量三维重建系统，覆盖从原始图像
 
 | 领域 | 能力 |
 |---|---|
-| 图像与相机 | EXIF 焦距先验、相机模型投影/反投影、图像去畸变、COLMAP text/binary 模型读取 |
+| 图像与相机 | 递归目录/相对路径、扩展 EXIF、Auto/Single/Per-folder/Per-image 内参策略、12 种相机模型的投影/稳健反投影/BA/去畸变、COLMAP text/binary 模型读取 |
 | 特征 | CPU OpenCV 语义 SIFT、CPU VLFeat 语义 SIFT、CUDA OpenCV/VLFeat 两种模式、RootSIFT、多线程、AVX2/FMA |
 | 匹配 | BF、FLANN、exhaustive、sequential、spatial、vocabulary tree、guided matching、两视图几何验证 |
-| SfM | 初始化、图像注册、PnP、point-centric 多视图三角化、track complete/merge、局部/全局 BA、观测过滤 |
+| SfM | 初始化、图像注册、PnP、point-centric 多视图三角化、track complete/merge、局部/全局 BA、观测过滤、多连通分量模型、已有模型续建、鲁棒 Sim(3) 模型合并 |
 | MVS | source view 选择、CPU/CUDA PatchMatch、光度/几何一致性、binary/text dense maps、Stereo Fusion |
 | 表面 | Poisson、可见性 Delaunay graph-cut、QEM 简化、标定图像纹理图集 |
-| 编排 | SfM/MVS 两段流程、完整 `recon_auto`、单步骤 stage manifest、`--resume/--force/--dry_run` |
+| 编排 | SfM/MVS 两段流程、完整 `recon_auto`、SfM 多模型输出与 text-model 断点续建、单步骤 stage manifest、`--resume/--force/--dry_run` |
 | 输出 | 带 RGB 的稀疏/稠密 PLY、法线、可见性、PLY 网格、OBJ/MTL/PNG 纹理 |
 
 ## 当前成熟度
 
 - SfM 主体结构在 `building-18` 上已接近 COLMAP 3.11：注册率、点数、观测数、平均 track length 和相机位姿均已做 Sim(3) 对齐验证。
-- PatchMatch 保留区域的深度误差已接近 COLMAP 4.0，质量档通过两层金字塔达到参考覆盖率的 90% 以上；大图默认采用原图缩小一级平衡耗时和显存。
-- Fusion 已完成 seed-track 并行；Poisson 基本数值等价；Delaunay 的图割和长面清理已高度接近 COLMAP。
+- SfM 可从 verified 匹配图的多个连通分量输出独立 sparse model，也可加载已有
+  COLMAP text model 后继续注册当前图像集中的剩余图像；模型间有足够 verified
+  3D-3D 对应时执行鲁棒 Sim(3) 合并。当前尚未实现 hierarchical/global mapper。
+- PatchMatch 保留区域的深度误差已接近 COLMAP 4.0；CUDA source 采样已加入
+  三角化角、入射角和局部单应分辨率先验。House High 共用相机基准的最终稠密
+  点数与 COLMAP 相差 0.95%，同时 PatchMatch wall 更低。
+- Fusion 已完成 seed-track 并行，并将 PatchMatch 20 个 source 与 Fusion
+  默认 50 个候选解耦；同一 COLMAP maps 输入下点数与 COLMAP Fusion 相差
+  0.02%。Poisson 基本数值等价；Delaunay 的图割和长面清理已高度接近 COLMAP。
 - 纹理视图选择使用 BVH 遮挡和近表面容差；无可靠相机视图的面会以 RGB
   顶点色生成独立 fallback atlas patch，不再输出退化 UV 灰色孔洞。复杂模型
   的真实相机纹理召回和接缝质量仍需继续与 COLMAP 对比。
@@ -84,8 +91,7 @@ colite/
 
 ## 近期开发优先级
 
-1. 提升 Texturer 的有效面召回，同时保持遮挡假阳性受控。
-2. 在带真值、宽基线、重复纹理和更大图像集上验证 SfM/MVS 鲁棒性。
-3. 降低全分辨率 CUDA PatchMatch 的内存和多图调度开销。
-4. 为 PLY 增加更统一的 binary 输出选项，减少 ASCII 精度和体积问题。
-5. 继续完善模型/点云/网格经过 Sim(3) 对齐后的自动评估工具。
+1. 在带真值、宽基线、重复纹理、混合相机和更大图像集上验证 SfM/MVS 鲁棒性。
+2. 降低 50-view Fusion 工作集和全分辨率 CUDA PatchMatch 的内存与调度开销。
+3. 继续提升 Texturer 的真实相机纹理召回和接缝质量，同时控制遮挡假阳性。
+4. 继续完善模型/点云/网格经过 Sim(3) 对齐后的自动评估工具。

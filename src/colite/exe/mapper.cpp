@@ -17,7 +17,14 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "Usage:\n"
       << "  " << executable << " --workspace_path <dir>\n\n"
       << "Options:\n"
-      << "  --workspace_path <dir>   Colite file workspace directory.\n";
+      << "  --workspace_path <dir>   Colite file workspace directory.\n"
+      << "  --input_model_path <dir> Continue from an existing COLMAP model.\n"
+      << "  --input_format <auto|txt|bin> Input model format, default auto.\n"
+      << "  --output_format <txt|bin|both> Sparse model format, default both.\n"
+      << "  --multiple_models <0|1>  Reconstruct remaining components, default 1.\n"
+      << "  --merge_models <0|1>     Merge Sim(3)-alignable models, default 1.\n"
+      << "  --max_num_models <n>     Maximum output models, default 50.\n"
+      << "  --min_model_size <n>     Minimum registered images per model, default 2.\n";
 }
 
 std::string RequireValue(const std::vector<std::string>& args,
@@ -28,6 +35,16 @@ std::string RequireValue(const std::vector<std::string>& args,
   }
   ++(*index);
   return args[*index];
+}
+
+bool ParseBool(const std::string& value, std::string_view flag) {
+  if (value == "1" || value == "true") {
+    return true;
+  }
+  if (value == "0" || value == "false") {
+    return false;
+  }
+  throw std::invalid_argument("Expected 0/1 for " + std::string(flag));
 }
 
 }  // namespace
@@ -50,6 +67,31 @@ int RunMapper(const std::vector<std::string>& args,
       }
       if (arg == "--workspace_path") {
         options.workspace_path = RequireValue(args, &i, arg);
+      } else if (arg == "--input_model_path") {
+        options.input_model_path = RequireValue(args, &i, arg);
+      } else if (arg == "--input_format") {
+        options.input_model_format =
+            ColmapModelFormatFromString(RequireValue(args, &i, arg));
+        if (options.input_model_format == ColmapModelFormat::kTextAndBinary) {
+          throw std::invalid_argument("--input_format does not accept both");
+        }
+      } else if (arg == "--output_format") {
+        options.output_model_format =
+            ColmapModelFormatFromString(RequireValue(args, &i, arg));
+        if (options.output_model_format == ColmapModelFormat::kAuto) {
+          throw std::invalid_argument("--output_format does not accept auto");
+        }
+      } else if (arg == "--multiple_models") {
+        options.multiple_models =
+            ParseBool(RequireValue(args, &i, arg), arg);
+      } else if (arg == "--merge_models") {
+        options.merge_models = ParseBool(RequireValue(args, &i, arg), arg);
+      } else if (arg == "--max_num_models") {
+        options.max_num_models = static_cast<std::size_t>(
+            std::stoull(RequireValue(args, &i, arg)));
+      } else if (arg == "--min_model_size") {
+        options.min_num_images_per_model = static_cast<std::size_t>(
+            std::stoull(RequireValue(args, &i, arg)));
       } else {
         throw std::invalid_argument("Unknown argument: " + arg);
       }
@@ -57,9 +99,16 @@ int RunMapper(const std::vector<std::string>& args,
     if (options.workspace_path.empty()) {
       throw std::invalid_argument("--workspace_path is required");
     }
+    if (options.max_num_models == 0 ||
+        options.min_num_images_per_model < 2) {
+      throw std::invalid_argument(
+          "--max_num_models must be positive and --min_model_size >= 2");
+    }
     const auto summary = controllers::MapperController(options).Run();
     out << "Registered images: " << summary.num_registered_images << "\n"
         << "Sparse cache hit: " << (summary.cache_hit ? 1 : 0) << "\n"
+        << "Sparse models: " << summary.num_models << "\n"
+        << "Unregistered images: " << summary.num_unregistered_images << "\n"
         << "Points3D: " << summary.num_points3d << "\n";
     return summary.success ? EXIT_SUCCESS : EXIT_FAILURE;
   } catch (const std::exception& exception) {

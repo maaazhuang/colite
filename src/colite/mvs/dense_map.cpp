@@ -1,6 +1,7 @@
 #include "colite/mvs/dense_map.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -38,6 +39,27 @@ void RequireBinaryStream(bool condition, const std::filesystem::path& path) {
     throw std::runtime_error("Invalid binary dense map file: " +
                              path.string());
   }
+}
+
+std::pair<std::size_t, std::size_t> ReadColmapDenseMapHeader(
+    std::ifstream& file,
+    std::size_t expected_channels,
+    const std::filesystem::path& path) {
+  std::size_t width = 0;
+  std::size_t height = 0;
+  std::size_t channels = 0;
+  char delimiter = '\0';
+  file >> width >> delimiter;
+  RequireBinaryStream(delimiter == '&', path);
+  file >> height >> delimiter;
+  RequireBinaryStream(delimiter == '&', path);
+  file >> channels >> delimiter;
+  RequireBinaryStream(
+      static_cast<bool>(file) && delimiter == '&' && width > 0 &&
+          height > 0 && channels == expected_channels &&
+          width <= std::numeric_limits<std::size_t>::max() / height,
+      path);
+  return {width, height};
 }
 
 }  // namespace
@@ -371,6 +393,17 @@ DenseDepthMap ReadDenseDepthMapBinary(const std::filesystem::path& path) {
                              path.string());
   }
 
+  if (std::isdigit(static_cast<unsigned char>(file.peek())) != 0) {
+    const auto [width, height] = ReadColmapDenseMapHeader(file, 1, path);
+    DenseDepthMap depth_map(width, height);
+    std::vector<float>& values = depth_map.MutableData();
+    file.read(reinterpret_cast<char*>(values.data()),
+              static_cast<std::streamsize>(values.size() * sizeof(float)));
+    RequireBinaryStream(static_cast<bool>(file), path);
+    depth_map.RecomputeDepthRange();
+    return depth_map;
+  }
+
   std::string magic;
   int version = 0;
   file >> magic >> version;
@@ -474,6 +507,24 @@ NormalMap ReadNormalMapBinary(const std::filesystem::path& path) {
   if (!file) {
     throw std::runtime_error("Failed to read binary normal map: " +
                              path.string());
+  }
+
+  if (std::isdigit(static_cast<unsigned char>(file.peek())) != 0) {
+    const auto [width, height] = ReadColmapDenseMapHeader(file, 3, path);
+    NormalMap normal_map(width, height);
+    std::vector<Eigen::Vector3f>& values = normal_map.MutableData();
+    // COLMAP stores multi-channel Mat data one complete channel at a time,
+    // whereas NormalMap keeps xyz interleaved per pixel.
+    std::vector<float> channel(values.size());
+    for (Eigen::Index component = 0; component < 3; ++component) {
+      file.read(reinterpret_cast<char*>(channel.data()),
+                static_cast<std::streamsize>(channel.size() * sizeof(float)));
+      RequireBinaryStream(static_cast<bool>(file), path);
+      for (std::size_t pixel = 0; pixel < values.size(); ++pixel) {
+        values[pixel][component] = channel[pixel];
+      }
+    }
+    return normal_map;
   }
 
   std::string magic;

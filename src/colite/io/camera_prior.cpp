@@ -7,6 +7,7 @@
 #include <iterator>
 #include <cmath>
 #include <optional>
+#include <string>
 #include <stdexcept>
 #include <vector>
 
@@ -16,6 +17,8 @@ namespace colite {
 namespace {
 
 constexpr std::uint16_t kExifTagExifIfd = 0x8769;
+constexpr std::uint16_t kExifTagMake = 0x010F;
+constexpr std::uint16_t kExifTagModel = 0x0110;
 constexpr std::uint16_t kExifTagFocalLengthIn35mmFilm = 0xA405;
 constexpr std::uint16_t kExifTagFocalLength = 0x920A;
 constexpr std::uint16_t kExifTagFocalPlaneXResolution = 0xA20E;
@@ -186,7 +189,42 @@ std::optional<double> ReadIfdNumericValue(
   return std::nullopt;
 }
 
+std::optional<std::string> ReadIfdAsciiValue(
+    const std::vector<std::uint8_t>& tiff,
+    std::size_t ifd_offset,
+    std::uint16_t desired_tag,
+    bool little_endian) {
+  if (ifd_offset + 2 > tiff.size()) return std::nullopt;
+  const std::uint16_t num_entries =
+      ReadUInt16(tiff, ifd_offset, little_endian);
+  for (std::uint16_t i = 0; i < num_entries; ++i) {
+    const std::size_t entry_offset = ifd_offset + 2 + 12 * i;
+    if (entry_offset + 12 > tiff.size()) return std::nullopt;
+    if (ReadUInt16(tiff, entry_offset, little_endian) != desired_tag) continue;
+    const std::uint16_t type =
+        ReadUInt16(tiff, entry_offset + 2, little_endian);
+    const std::uint32_t count =
+        ReadUInt32(tiff, entry_offset + 4, little_endian);
+    if (type != 2 || count == 0) return std::nullopt;
+    const std::size_t value_offset =
+        count <= 4 ? entry_offset + 8
+                   : ReadUInt32(tiff, entry_offset + 8, little_endian);
+    if (value_offset + count > tiff.size()) return std::nullopt;
+    std::string value(
+        reinterpret_cast<const char*>(tiff.data() + value_offset), count);
+    while (!value.empty() &&
+           (value.back() == '\0' || value.back() == ' ')) {
+      value.pop_back();
+    }
+    return value.empty() ? std::nullopt
+                         : std::optional<std::string>(std::move(value));
+  }
+  return std::nullopt;
+}
+
 struct ExifFocalMetadata {
+  std::optional<std::string> make;
+  std::optional<std::string> model;
   std::optional<double> focal_35mm;
   std::optional<double> focal_mm;
   std::optional<double> focal_plane_x_resolution;
@@ -208,6 +246,10 @@ std::optional<ExifFocalMetadata> ReadExifFocalMetadata(
       ReadIfdUIntValue(*tiff, ifd0_offset, kExifTagExifIfd, little_endian);
   if (!exif_ifd_offset.has_value()) return std::nullopt;
   ExifFocalMetadata metadata;
+  metadata.make =
+      ReadIfdAsciiValue(*tiff, ifd0_offset, kExifTagMake, little_endian);
+  metadata.model =
+      ReadIfdAsciiValue(*tiff, ifd0_offset, kExifTagModel, little_endian);
   metadata.focal_35mm = ReadIfdNumericValue(
       *tiff, *exif_ifd_offset, kExifTagFocalLengthIn35mmFilm, little_endian);
   metadata.focal_mm = ReadIfdNumericValue(
@@ -222,6 +264,18 @@ std::optional<ExifFocalMetadata> ReadExifFocalMetadata(
 
 }  // namespace
 
+ExifCameraMetadata ReadExifCameraMetadata(
+    const std::filesystem::path& image_path) {
+  ExifCameraMetadata result;
+  const auto metadata = ReadExifFocalMetadata(image_path);
+  if (!metadata.has_value()) return result;
+  result.make = metadata->make;
+  result.model = metadata->model;
+  result.focal_length = metadata->focal_mm;
+  result.focal_length_35mm = metadata->focal_35mm;
+  return result;
+}
+
 std::optional<double> ReadExifFocalLength35mm(
     const std::filesystem::path& image_path) {
   const auto metadata = ReadExifFocalMetadata(image_path);
@@ -232,7 +286,13 @@ std::optional<double> ReadExifFocalLength35mm(
 
 InitialFocalLengthEstimate EstimateInitialFocalLengthPriorFromImage(
     const std::filesystem::path& image_path,
-    const double user_focal_length) {
+    const double user_focal_length,
+    const double default_focal_length_factor) {
+  if (!std::isfinite(default_focal_length_factor) ||
+      default_focal_length_factor <= 0.0) {
+    throw std::invalid_argument(
+        "Default focal length factor must be finite and positive");
+  }
   if (user_focal_length > 0.0) {
     return {user_focal_length, InitialFocalLengthSource::kUser, true};
   }
@@ -270,15 +330,19 @@ InitialFocalLengthEstimate EstimateInitialFocalLengthPriorFromImage(
               InitialFocalLengthSource::kExifFocalPlane, true};
     }
   }
-  return {1.2 * max_dimension, InitialFocalLengthSource::kDefaultImageSize,
+  return {default_focal_length_factor * max_dimension,
+          InitialFocalLengthSource::kDefaultImageSize,
           false};
 }
 
 double EstimateInitialFocalLengthFromImage(
     const std::filesystem::path& image_path,
-    const double user_focal_length) {
+    const double user_focal_length,
+    const double default_focal_length_factor) {
   return EstimateInitialFocalLengthPriorFromImage(image_path,
-                                                   user_focal_length).pixels;
+                                                   user_focal_length,
+                                                   default_focal_length_factor)
+      .pixels;
 }
 
 const char* InitialFocalLengthSourceName(

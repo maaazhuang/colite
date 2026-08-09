@@ -78,10 +78,38 @@ TEST(MvsPipelineTest, DefaultsToEightSourceImagesForDenserCoverage) {
   const MvsPipelineOptions options;
 
   EXPECT_EQ(options.max_num_source_images, 8U);
+  EXPECT_EQ(options.source_selection_mode, SourceSelectionMode::kWeighted);
   EXPECT_DOUBLE_EQ(options.shared_points_weight, 1.0);
   EXPECT_DOUBLE_EQ(options.scale_consistency_weight, 2.0);
   EXPECT_DOUBLE_EQ(options.coverage_weight, 5.0);
   EXPECT_EQ(options.coverage_grid_size, 4U);
+}
+
+TEST(MvsPipelineTest, ColmapModeGatesByAnglePercentileAndRanksSharedPoints) {
+  Reconstruction reconstruction = MakeSparseReconstruction();
+  reconstruction.AddImage(MakeRegisteredImage(4, -0.001));
+  reconstruction.RegisterImage(4);
+  for (const Point3DId point3d_id :
+       {Point3DId(1), Point3DId(2), Point3DId(3)}) {
+    reconstruction.GetPoint3D(point3d_id).track.AddElement(4, 0);
+  }
+
+  MvsPipelineOptions options;
+  options.max_num_source_images = 3;
+  options.source_selection_mode = SourceSelectionMode::kColmap;
+  options.min_triangulation_angle_degrees = 1.0;
+
+  const std::vector<SourceImageScore> sources =
+      SelectSourceImages(reconstruction, 1, options);
+
+  ASSERT_EQ(sources.size(), 2U);
+  EXPECT_EQ(sources[0].score,
+            static_cast<double>(sources[0].num_shared_points));
+  EXPECT_GE(sources[0].triangulation_angle_percentile_degrees, 1.0);
+  EXPECT_GE(sources[1].triangulation_angle_percentile_degrees, 1.0);
+  EXPECT_TRUE(std::none_of(
+      sources.begin(), sources.end(),
+      [](const SourceImageScore& source) { return source.image_id == 4; }));
 }
 
 TEST(MvsPipelineTest, SelectsSourceImagesBySharedSparsePoints) {

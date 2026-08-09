@@ -58,6 +58,7 @@ struct DeviceCostOptions {
   int min_num_valid_sources = 1;
   int max_num_aggregated_costs = 3;
   float geometric_consistency_weight = 0.0F;
+  bool robust_geometric_aggregation = false;
   float geometric_max_reprojection_error = 3.0F;
   float geometric_max_relative_depth_error = 0.01F;
   bool geometric_reject_occluded_candidates = true;
@@ -79,6 +80,9 @@ struct DevicePatchMatchOptions {
   DeviceCostOptions cost;
   bool dynamic_selection_probability = false;
   bool directional_hmm = false;
+  bool source_geometric_priors = false;
+  float source_min_triangulation_angle_degrees = 1.0F;
+  float source_incident_angle_sigma = 0.9F;
   int num_source_samples = 0;
   float ncc_sigma = 0.6F;
   float previous_selection_probability_weight = 0.5F;
@@ -1091,6 +1095,127 @@ __device__ float GetSourceSelectionProbability(
   return Clamp(probability, 0.0F, 1.0F);
 }
 
+__device__ bool WarpHomographyPoint(const float homography[9],
+                                    float x,
+                                    float y,
+                                    float* warped_x,
+                                    float* warped_y) {
+  const float denominator =
+      homography[6] * x + homography[7] * y + homography[8];
+  if (!isfinite(denominator) || fabsf(denominator) <= 1e-8F) {
+    return false;
+  }
+  *warped_x =
+      (homography[0] * x + homography[1] * y + homography[2]) / denominator;
+  *warped_y =
+      (homography[3] * x + homography[4] * y + homography[5]) / denominator;
+  return isfinite(*warped_x) && isfinite(*warped_y);
+}
+
+__device__ float ComputeSourceGeometricPrior(
+    cudaTextureObject_t poses_texture,
+    const DevicePatchMatchOptions& options,
+    int source_idx,
+    int col,
+    int row,
+    float depth,
+    float3 normal) {
+  if (!options.source_geometric_priors) {
+    return 1.0F;
+  }
+  const DeviceCamera& ref = options.reference_camera;
+  const float3 point =
+      make_float3((static_cast<float>(col) - ref.cx) / ref.fx * depth,
+                  (static_cast<float>(row) - ref.cy) / ref.fy * depth, depth);
+  constexpr int kBasePoseVariant = 0;
+  const float3 source_center = make_float3(
+      ReadPose(poses_texture, source_idx, kBasePoseVariant, kPoseCOffset + 0),
+      ReadPose(poses_texture, source_idx, kBasePoseVariant, kPoseCOffset + 1),
+      ReadPose(poses_texture, source_idx, kBasePoseVariant, kPoseCOffset + 2));
+  const float3 source_ray =
+      make_float3(source_center.x - point.x, source_center.y - point.y,
+                  source_center.z - point.z);
+  const float reference_norm = sqrtf(Dot3(point, point));
+  const float source_norm = sqrtf(Dot3(source_ray, source_ray));
+  const float normal_norm = sqrtf(Dot3(normal, normal));
+  if (reference_norm <= 1e-8F || source_norm <= 1e-8F ||
+      normal_norm <= 1e-8F) {
+    return 0.0F;
+  }
+
+  constexpr float kPi = 3.14159265358979323846F;
+  const float min_angle_radians =
+      options.source_min_triangulation_angle_degrees * kPi / 180.0F;
+  const float cos_min_angle = cosf(min_angle_radians);
+  const float cos_triangulation =
+      Clamp(-Dot3(source_ray, point) / (source_norm * reference_norm),
+            -1.0F, 1.0F);
+  float triangulation_probability = 1.0F;
+  if (cos_triangulation > cos_min_angle) {
+    const float denominator = 1.0F - cos_min_angle;
+    if (denominator <= 1e-8F) {
+      triangulation_probability = 0.0F;
+    } else {
+      const float scaled =
+          1.0F - (1.0F - cos_triangulation) / denominator;
+      triangulation_probability =
+          Clamp(1.0F - scaled * scaled, 0.0F, 1.0F);
+    }
+  }
+
+  const float cos_incident =
+      Dot3(source_ray, normal) / (source_norm * normal_norm);
+  const float incident_delta = 1.0F - fmaxf(0.0F, cos_incident);
+  const float incident_sigma =
+      fmaxf(1e-6F, options.source_incident_angle_sigma);
+  const float incident_probability =
+      expf(-0.5F * incident_delta * incident_delta /
+           (incident_sigma * incident_sigma));
+
+  float homography[9];
+  if (!ComposePlaneHomography(options, poses_texture, source_idx,
+                              kBasePoseVariant, col, row, depth, normal,
+                              homography)) {
+    return 0.0F;
+  }
+  const float radius = static_cast<float>(options.cost.window_radius);
+  float warped_x[4];
+  float warped_y[4];
+  if (!WarpHomographyPoint(homography, static_cast<float>(col) - radius,
+                           static_cast<float>(row) - radius, &warped_x[0],
+                           &warped_y[0]) ||
+      !WarpHomographyPoint(homography, static_cast<float>(col) - radius,
+                           static_cast<float>(row) + radius, &warped_x[1],
+                           &warped_y[1]) ||
+      !WarpHomographyPoint(homography, static_cast<float>(col) + radius,
+                           static_cast<float>(row) + radius, &warped_x[2],
+                           &warped_y[2]) ||
+      !WarpHomographyPoint(homography, static_cast<float>(col) + radius,
+                           static_cast<float>(row) - radius, &warped_x[3],
+                           &warped_y[3])) {
+    return 0.0F;
+  }
+  const float source_area =
+      fabsf(0.5F *
+            (warped_x[0] * warped_y[1] - warped_x[1] * warped_y[0] -
+             warped_x[0] * warped_y[3] + warped_x[1] * warped_y[2] -
+             warped_x[2] * warped_y[1] + warped_x[3] * warped_y[0] +
+             warped_x[2] * warped_y[3] - warped_x[3] * warped_y[2]));
+  const float window_size =
+      static_cast<float>(2 * options.cost.window_radius + 1);
+  const float reference_area = window_size * window_size;
+  if (!isfinite(source_area) || source_area <= 1e-8F ||
+      reference_area <= 1e-8F) {
+    return 0.0F;
+  }
+  const float resolution_probability =
+      source_area < reference_area ? source_area / reference_area
+                                   : reference_area / source_area;
+  return Clamp(triangulation_probability * incident_probability *
+                   resolution_probability,
+               0.0F, 1.0F);
+}
+
 __device__ bool ShouldUseSourceForPixel(cudaTextureObject_t poses_texture,
                                         cudaTextureObject_t selection_texture,
                                         const float* dynamic_probabilities,
@@ -1166,7 +1291,8 @@ __device__ float ComputeSourceCostForVariant(
     int col,
     int row,
     float depth,
-    float3 normal) {
+    float3 normal,
+    bool include_geometric_cost) {
   float weight_sum = 0.0F;
   float sum_ref = 0.0F;
   float sum_src = 0.0F;
@@ -1311,7 +1437,7 @@ __device__ float ComputeSourceCostForVariant(
       fmaxf(-1.0F, fminf(1.0F, covariance * rsqrtf(ref_var * src_var)));
   float cost = 0.5F * (1.0F - zncc);
 
-  if (source_depth_maps_texture != 0 &&
+  if (include_geometric_cost && source_depth_maps_texture != 0 &&
       options.cost.geometric_consistency_weight > 0.0F) {
     float signed_relative_error = 0.0F;
     float reprojection_error = 0.0F;
@@ -1373,12 +1499,69 @@ __device__ float ComputeSourceCost(cudaTextureObject_t reference_texture,
         reference_texture, source_images_texture, source_depth_maps_texture,
         poses_texture, shared_reference_tile, shared_reference_start_idx,
         shared_reference_num_pixels, source_images, options, source_idx,
-        variant_idx, col, row, depth, normal);
+        variant_idx, col, row, depth, normal,
+        !options.cost.robust_geometric_aggregation);
     if (isfinite(cost) && cost < best_cost) {
       best_cost = cost;
     }
   }
   return best_cost;
+}
+
+__device__ float ComputeRobustGeometricConsensusCost(
+    cudaTextureObject_t poses_texture,
+    cudaTextureObject_t source_depth_maps_texture,
+    const DeviceSourceImage* source_images,
+    const DevicePatchMatchOptions& options,
+    int col,
+    int row,
+    float depth) {
+  if (!options.cost.robust_geometric_aggregation ||
+      source_depth_maps_texture == 0 ||
+      options.cost.geometric_consistency_weight <= 0.0F) {
+    return 0.0F;
+  }
+
+  float best_errors[kMaxCudaSourceImages];
+  int num_valid = 0;
+  for (int source_idx = 0; source_idx < options.num_sources; ++source_idx) {
+    float signed_relative_error = 0.0F;
+    float reprojection_error = 0.0F;
+    if (!ComputeSourceDepthRoundTripErrors(
+            options, poses_texture, source_depth_maps_texture,
+            source_images[source_idx], source_idx, col, row, depth,
+            &signed_relative_error, &reprojection_error)) {
+      continue;
+    }
+    const float error =
+        fminf(options.cost.geometric_max_reprojection_error,
+              reprojection_error);
+    int insert_idx = num_valid;
+    while (insert_idx > 0 && best_errors[insert_idx - 1] > error) {
+      if (insert_idx < kMaxCudaSourceImages) {
+        best_errors[insert_idx] = best_errors[insert_idx - 1];
+      }
+      --insert_idx;
+    }
+    if (insert_idx < kMaxCudaSourceImages) {
+      best_errors[insert_idx] = error;
+    }
+    num_valid = min(num_valid + 1, kMaxCudaSourceImages);
+  }
+  if (num_valid == 0) {
+    return 0.5F * options.cost.geometric_consistency_weight *
+           options.cost.geometric_max_reprojection_error;
+  }
+
+  // The lower half rejects occluded/conflicting source depths while requiring
+  // broader agreement than the photometric best-three source ranking.
+  const int num_used = max(1, (num_valid + 1) / 2);
+  float total = 0.0F;
+  for (int i = 0; i < num_used; ++i) {
+    total += best_errors[i];
+  }
+  return 0.5F * options.cost.geometric_consistency_weight *
+         total / static_cast<float>(num_used);
 }
 
 __device__ bool ComputeAggregatedCost(cudaTextureObject_t reference_texture,
@@ -1416,6 +1599,8 @@ __device__ bool ComputeAggregatedCost(cudaTextureObject_t reference_texture,
     valid_weights[num_valid] = GetSourceSelectionProbability(
         poses_texture, selection_texture, dynamic_probabilities,
         options.width * options.height, options.width, source_idx, col, row);
+    valid_weights[num_valid] *= ComputeSourceGeometricPrior(
+        poses_texture, options, source_idx, col, row, depth, normal);
     int insert_idx = num_valid;
     while (insert_idx > 0 && best_costs[insert_idx - 1] > source_cost) {
       if (insert_idx < kMaxCudaSourceImages) {
@@ -1461,6 +1646,9 @@ __device__ bool ComputeAggregatedCost(cudaTextureObject_t reference_texture,
       }
       *aggregated_cost =
           sampled_total / static_cast<float>(options.num_source_samples);
+      *aggregated_cost += ComputeRobustGeometricConsensusCost(
+          poses_texture, source_depth_maps_texture, source_images, options,
+          col, row, depth);
       return true;
     }
   }
@@ -1473,6 +1661,9 @@ __device__ bool ComputeAggregatedCost(cudaTextureObject_t reference_texture,
     total += best_costs[i];
   }
   *aggregated_cost = total / static_cast<float>(num_used);
+  *aggregated_cost += ComputeRobustGeometricConsensusCost(
+      poses_texture, source_depth_maps_texture, source_images, options, col,
+      row, depth);
   return true;
 }
 
@@ -1522,7 +1713,8 @@ __global__ void UpdateSelectionProbabilityKernel(
       const float cost = ComputeSourceCostForVariant(
           reference_texture, source_images_texture, source_depth_maps_texture,
           poses_texture, nullptr, 0, 0, source_images, options, source_idx,
-          variant_idx, col, row, depth, normal);
+          variant_idx, col, row, depth, normal,
+          !options.cost.robust_geometric_aggregation);
       if (isfinite(cost) && cost < best_cost) {
         best_cost = cost;
       }
@@ -2528,6 +2720,31 @@ void PackSourceDepthMapsToBuffer(
   }
 }
 
+void PackSourceDepthMapsToBuffer(
+    const std::vector<const DenseDepthMap*>& depth_maps,
+    int max_width,
+    int max_height,
+    float* packed) {
+  const std::size_t packed_size =
+      static_cast<std::size_t>(depth_maps.size()) * max_width * max_height;
+  if (packed_size > 0 && packed == nullptr) {
+    throw std::invalid_argument("CUDA source depth staging buffer is null.");
+  }
+  std::fill(packed, packed + packed_size, 0.0F);
+  for (std::size_t map_idx = 0; map_idx < depth_maps.size(); ++map_idx) {
+    if (depth_maps[map_idx] == nullptr) {
+      throw std::invalid_argument("CUDA source depth map pointer is null.");
+    }
+    const DenseDepthMap& depth_map = *depth_maps[map_idx];
+    float* layer = packed + map_idx * max_width * max_height;
+    for (std::size_t row = 0; row < depth_map.Height(); ++row) {
+      for (std::size_t col = 0; col < depth_map.Width(); ++col) {
+        layer[row * max_width + col] = depth_map.Get(row, col);
+      }
+    }
+  }
+}
+
 void PackSelectionProbabilityMapsToBuffer(
     const std::vector<DenseCostMap>& probability_maps,
     int width,
@@ -2607,7 +2824,18 @@ void ValidateRequest(const CudaPatchMatchRequest& request) {
         "CUDA PatchMatch source views and images must match.");
   }
   if (request.source_depth_maps != nullptr &&
-      request.source_depth_maps->size() != request.source_views->size()) {
+      request.source_depth_map_ptrs != nullptr) {
+    throw std::invalid_argument(
+        "CUDA PatchMatch source depth representations are ambiguous.");
+  }
+  const std::size_t source_depth_count =
+      request.source_depth_maps != nullptr
+          ? request.source_depth_maps->size()
+          : (request.source_depth_map_ptrs != nullptr
+                 ? request.source_depth_map_ptrs->size()
+                 : 0);
+  if (source_depth_count != 0 &&
+      source_depth_count != request.source_views->size()) {
     throw std::invalid_argument(
         "CUDA PatchMatch source depth maps must match source views.");
   }
@@ -2938,6 +3166,12 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
         request.options.source_selection.dynamic_probability;
     device_options.directional_hmm =
         request.options.source_selection.directional_hmm;
+    device_options.source_geometric_priors =
+        request.options.source_selection.geometric_priors;
+    device_options.source_min_triangulation_angle_degrees =
+        request.options.source_selection.min_triangulation_angle_degrees;
+    device_options.source_incident_angle_sigma =
+        request.options.source_selection.incident_angle_sigma;
     device_options.num_source_samples = static_cast<int>(
         request.options.source_selection.num_samples);
     device_options.ncc_sigma = request.options.source_selection.ncc_sigma;
@@ -2957,7 +3191,23 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
             ? request.options.cost.sigma_spatial
             : static_cast<float>(std::max(1, request.options.cost.window_radius));
     device_options.cost.sigma_color = request.options.cost.sigma_color;
-    device_options.cost.invalid_cost = request.options.cost.invalid_cost;
+    // Photometric ZNCC is bounded by request.options.cost.invalid_cost, but
+    // geometric refinement adds a truncated reprojection penalty and can
+    // therefore produce a perfectly valid cost above that value.  Reusing
+    // the photometric sentinel here used to discard those sources and made
+    // stronger geometric regularization reduce coverage.  CUDA kernels use
+    // non-finite values as invalid already, so reserve +inf for the combined
+    // geometric stage while preserving the public photometric convention.
+    const bool has_source_depth_maps =
+        ((request.source_depth_maps != nullptr &&
+          !request.source_depth_maps->empty()) ||
+         (request.source_depth_map_ptrs != nullptr &&
+          !request.source_depth_map_ptrs->empty()));
+    device_options.cost.invalid_cost =
+        has_source_depth_maps &&
+                request.options.cost.geometric_consistency_weight > 0.0F
+            ? std::numeric_limits<float>::infinity()
+            : request.options.cost.invalid_cost;
     device_options.cost.min_variance = request.options.cost.min_variance;
     device_options.cost.min_num_valid_sources =
         static_cast<int>(request.options.cost.min_num_valid_sources);
@@ -2965,6 +3215,8 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
         static_cast<int>(request.options.cost.max_num_aggregated_costs);
     device_options.cost.geometric_consistency_weight =
         request.options.cost.geometric_consistency_weight;
+    device_options.cost.robust_geometric_aggregation =
+        request.options.cost.robust_geometric_aggregation;
     device_options.cost.geometric_max_reprojection_error =
         request.options.cost.geometric_max_reprojection_error;
     device_options.cost.geometric_max_relative_depth_error =
@@ -2984,11 +3236,9 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
     const std::vector<float> pose_texture_data =
         PackPoseTextureData(*request.reference_view, *request.source_views);
 
-    const bool use_source_depth_maps = request.source_depth_maps != nullptr &&
-                                       !request.source_depth_maps->empty() &&
-                                       request.options.cost
-                                               .geometric_consistency_weight >
-                                           0.0F;
+    const bool use_source_depth_maps =
+        has_source_depth_maps &&
+        request.options.cost.geometric_consistency_weight > 0.0F;
     const bool use_selection_probability_maps =
         request.source_selection_probability_maps != nullptr &&
         !request.source_selection_probability_maps->empty();
@@ -3061,9 +3311,15 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereoSingleScale(
           max_source_width, max_source_height, device_options.num_sources,
           source_image_texture_values,
           [&](float* staging) {
-            PackSourceDepthMapsToBuffer(
-                *request.source_depth_maps, max_source_width,
-                max_source_height, staging);
+            if (request.source_depth_map_ptrs != nullptr) {
+              PackSourceDepthMapsToBuffer(
+                  *request.source_depth_map_ptrs, max_source_width,
+                  max_source_height, staging);
+            } else {
+              PackSourceDepthMapsToBuffer(
+                  *request.source_depth_maps, max_source_width,
+                  max_source_height, staging);
+            }
           }));
     }
     if (use_selection_probability_maps) {
@@ -3877,11 +4133,21 @@ std::optional<PatchMatchStereoResult> RunCudaPatchMatchStereo(
 
       std::vector<DenseDepthMap> level_source_depth_maps;
       const std::vector<DenseDepthMap>* level_source_depth_maps_ptr = nullptr;
-      if (request.source_depth_maps != nullptr) {
-        level_source_depth_maps.reserve(request.source_depth_maps->size());
-        for (std::size_t i = 0; i < request.source_depth_maps->size(); ++i) {
+      const std::size_t source_depth_count =
+          request.source_depth_maps != nullptr
+              ? request.source_depth_maps->size()
+              : (request.source_depth_map_ptrs != nullptr
+                     ? request.source_depth_map_ptrs->size()
+                     : 0);
+      if (source_depth_count > 0) {
+        level_source_depth_maps.reserve(source_depth_count);
+        for (std::size_t i = 0; i < source_depth_count; ++i) {
+          const DenseDepthMap& source_depth_map =
+              request.source_depth_map_ptrs != nullptr
+                  ? *request.source_depth_map_ptrs->at(i)
+                  : request.source_depth_maps->at(i);
           level_source_depth_maps.push_back(ResizeDepthMapNearestForCuda(
-              request.source_depth_maps->at(i), level_source_images[i].Width(),
+              source_depth_map, level_source_images[i].Width(),
               level_source_images[i].Height()));
         }
         level_source_depth_maps_ptr = &level_source_depth_maps;

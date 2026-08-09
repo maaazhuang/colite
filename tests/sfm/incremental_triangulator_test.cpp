@@ -97,7 +97,7 @@ TEST(IncrementalTriangulatorTest,
   const Eigen::Vector3d point_world(0.1, -0.2, 5.0);
   Reconstruction reconstruction;
   reconstruction.AddCamera(camera);
-  for (ImageId image_id = 1; image_id <= 3; ++image_id) {
+  for (ImageId image_id = 1; image_id <= 4; ++image_id) {
     const Pose3 pose = CameraAt(
         Eigen::Vector3d(static_cast<double>(image_id - 1), 0.0, 0.0));
     const auto pixel = ProjectWorldPoint(camera, pose, point_world);
@@ -123,6 +123,63 @@ TEST(IncrementalTriangulatorTest,
   EXPECT_EQ(summary.num_created_observations, 3U);
   ASSERT_EQ(reconstruction.Points3D().size(), 1U);
   EXPECT_EQ(reconstruction.Points3D().begin()->second.track.Length(), 3U);
+}
+
+TEST(IncrementalTriangulatorTest,
+     PoseGuidedCompletionRequiresMultiDescriptorAgreement) {
+  const Camera camera = MakeCamera(1);
+  const Eigen::Vector3d point_world(0.0, 0.0, 5.0);
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  MatchGraph graph;
+  for (ImageId image_id = 1; image_id <= 3; ++image_id) {
+    const Pose3 pose = CameraAt(
+        Eigen::Vector3d(0.4 * static_cast<double>(image_id - 1), 0.0, 0.0));
+    const auto pixel = ProjectWorldPoint(camera, pose, point_world);
+    ASSERT_TRUE(pixel.has_value());
+    Image image = MakeImage(image_id, 1);
+    image.registered = true;
+    image.cam_from_world = pose;
+    image.points2d.push_back(
+        {*pixel + (image_id == 3 ? Eigen::Vector2d(1.0, 0.0)
+                                 : Eigen::Vector2d::Zero()),
+         0, kInvalidPoint3DId});
+    if (image_id == 3) {
+      image.points2d.push_back({*pixel, 1, kInvalidPoint3DId});
+    }
+    reconstruction.AddImage(image);
+
+    FeatureSet features;
+    features.keypoints.push_back(
+        {static_cast<float>(image.points2d[0].xy.x()),
+         static_cast<float>(image.points2d[0].xy.y()), 1.0F, 0.0F});
+    if (image_id == 3) {
+      features.keypoints.push_back(
+          {static_cast<float>(pixel->x()), static_cast<float>(pixel->y()),
+           1.0F, 0.0F});
+    }
+    features.descriptors = DescriptorMatrix::Zero(
+        static_cast<Eigen::Index>(features.keypoints.size()), 128);
+    features.descriptors(0, 0) = 1.0F;
+    if (image_id == 3) {
+      features.descriptors(1, 1) = 1.0F;
+    }
+    SetFeatures(&graph, image_id, features);
+  }
+
+  Track track;
+  track.AddElement(1, 0);
+  track.AddElement(2, 0);
+  const Point3DId point3d_id =
+      reconstruction.AddPoint3D(point_world, track);
+  IncrementalTriangulatorOptions options;
+  const IncrementalTriangulatorSummary summary =
+      CompleteTracksByPoseAndDescriptors(graph, options, &reconstruction);
+
+  EXPECT_EQ(summary.num_completed_observations, 1U);
+  EXPECT_EQ(reconstruction.GetPoint3D(point3d_id).track.Length(), 3U);
+  EXPECT_EQ(reconstruction.GetImage(3).points2d[0].point3d_id, point3d_id);
+  EXPECT_FALSE(reconstruction.GetImage(3).points2d[1].HasPoint3D());
 }
 
 TEST(IncrementalTriangulatorTest,
@@ -161,6 +218,49 @@ TEST(IncrementalTriangulatorTest,
   EXPECT_EQ(summary.num_created_points, 1U);
   EXPECT_EQ(summary.num_created_observations, 3U);
   EXPECT_FALSE(reconstruction.GetImage(4).points2d[0].HasPoint3D());
+}
+
+TEST(IncrementalTriangulatorTest,
+     MultiViewCreateKeepsBestConflictingObservationPerImage) {
+  const Camera camera = MakeCamera(1);
+  const Eigen::Vector3d point_world(0.0, 0.0, 5.0);
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+
+  for (ImageId image_id = 1; image_id <= 4; ++image_id) {
+    const Pose3 pose = CameraAt(
+        Eigen::Vector3d(0.7 * static_cast<double>(image_id - 1), 0.0, 0.0));
+    const auto pixel = ProjectWorldPoint(camera, pose, point_world);
+    ASSERT_TRUE(pixel.has_value());
+    Image image = MakeImage(image_id, 1);
+    image.registered = true;
+    image.cam_from_world = pose;
+    image.points2d.push_back({*pixel, 0, kInvalidPoint3DId});
+    if (image_id == 2) {
+      image.points2d.push_back(
+          {*pixel + Eigen::Vector2d(3.0, 0.0), 1, kInvalidPoint3DId});
+    }
+    reconstruction.AddImage(image);
+  }
+
+  MatchGraph graph;
+  SetVerifiedGeometry(&graph, 1, 2,
+                      MakeVerifiedGeometry({{0, 0}, {0, 1}}));
+  SetVerifiedGeometry(&graph, 1, 3, MakeVerifiedGeometry({{0, 0}}));
+  SetVerifiedGeometry(&graph, 1, 4, MakeVerifiedGeometry({{0, 0}}));
+
+  IncrementalTriangulatorOptions options;
+  options.min_triangulation_angle_deg = 0.1;
+  options.create_max_angle_error_deg = 2.0;
+  const IncrementalTriangulatorSummary summary =
+      TriangulateRegisteredImage(graph, 1, options, &reconstruction);
+
+  EXPECT_EQ(summary.num_created_points, 1U);
+  EXPECT_EQ(summary.num_created_observations, 4U);
+  ASSERT_EQ(reconstruction.Points3D().size(), 1U);
+  EXPECT_EQ(reconstruction.Points3D().begin()->second.track.Length(), 4U);
+  EXPECT_TRUE(reconstruction.GetImage(2).points2d[0].HasPoint3D());
+  EXPECT_FALSE(reconstruction.GetImage(2).points2d[1].HasPoint3D());
 }
 
 TEST(IncrementalTriangulatorTest,
@@ -548,6 +648,91 @@ TEST(IncrementalTriangulatorTest, MergesMatchedExistingPointsIntoLongerTrack) {
 }
 
 TEST(IncrementalTriangulatorTest,
+     MergeUsesJointMultiViewTriangulationWhenWeightedPositionFails) {
+  const Camera camera = MakeCamera(1);
+  const Eigen::Vector3d point_world(0.0, 0.0, 5.0);
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  for (ImageId image_id = 1; image_id <= 4; ++image_id) {
+    const Pose3 pose = CameraAt(
+        Eigen::Vector3d(0.5 * static_cast<double>(image_id - 1), 0.0, 0.0));
+    const auto pixel = ProjectWorldPoint(camera, pose, point_world);
+    ASSERT_TRUE(pixel.has_value());
+    Image image = MakeImage(image_id, 1);
+    image.registered = true;
+    image.cam_from_world = pose;
+    image.points2d.push_back({*pixel, 0, kInvalidPoint3DId});
+    reconstruction.AddImage(image);
+  }
+
+  Track first_track;
+  first_track.AddElement(1, 0);
+  first_track.AddElement(2, 0);
+  reconstruction.AddPoint3D(point_world + Eigen::Vector3d(0.15, 0.0, 0.0),
+                            first_track);
+  Track second_track;
+  second_track.AddElement(3, 0);
+  second_track.AddElement(4, 0);
+  reconstruction.AddPoint3D(point_world + Eigen::Vector3d(0.15, 0.0, 0.0),
+                            second_track);
+
+  MatchGraph graph;
+  SetVerifiedGeometry(&graph, 2, 3, MakeVerifiedGeometry({{0, 0}}));
+  IncrementalTriangulatorOptions options;
+  options.merge_max_reprojection_error_px = 1.0;
+  const IncrementalTriangulatorSummary summary =
+      CompleteTracksForRegisteredImage(graph, 2, options, &reconstruction);
+
+  EXPECT_EQ(summary.num_merged_points, 1U);
+  ASSERT_EQ(reconstruction.Points3D().size(), 1U);
+  EXPECT_EQ(reconstruction.Points3D().begin()->second.track.Length(), 4U);
+  EXPECT_NEAR(reconstruction.Points3D().begin()->second.xyz.x(), 0.0, 1e-6);
+}
+
+TEST(IncrementalTriangulatorTest,
+     MergePrunesSingleConflictingObservation) {
+  const Camera camera = MakeCamera(1);
+  const Eigen::Vector3d point_world(0.0, 0.0, 5.0);
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  for (ImageId image_id = 1; image_id <= 4; ++image_id) {
+    const Pose3 pose = CameraAt(
+        Eigen::Vector3d(0.5 * static_cast<double>(image_id - 1), 0.0, 0.0));
+    const auto pixel = ProjectWorldPoint(camera, pose, point_world);
+    ASSERT_TRUE(pixel.has_value());
+    Image image = MakeImage(image_id, 1);
+    image.registered = true;
+    image.cam_from_world = pose;
+    image.points2d.push_back({*pixel, 0, kInvalidPoint3DId});
+    if (image_id == 4) {
+      image.points2d[0].xy += Eigen::Vector2d(80.0, 40.0);
+    }
+    reconstruction.AddImage(image);
+  }
+
+  Track first_track;
+  first_track.AddElement(1, 0);
+  first_track.AddElement(2, 0);
+  reconstruction.AddPoint3D(point_world, first_track);
+  Track second_track;
+  second_track.AddElement(3, 0);
+  second_track.AddElement(4, 0);
+  reconstruction.AddPoint3D(point_world, second_track);
+
+  MatchGraph graph;
+  SetVerifiedGeometry(&graph, 2, 3, MakeVerifiedGeometry({{0, 0}}));
+  IncrementalTriangulatorOptions options;
+  options.merge_max_reprojection_error_px = 1.0;
+  const IncrementalTriangulatorSummary summary =
+      CompleteTracksForRegisteredImage(graph, 2, options, &reconstruction);
+
+  EXPECT_EQ(summary.num_merged_points, 1U);
+  ASSERT_EQ(reconstruction.Points3D().size(), 1U);
+  EXPECT_EQ(reconstruction.Points3D().begin()->second.track.Length(), 3U);
+  EXPECT_FALSE(reconstruction.GetImage(4).points2d[0].HasPoint3D());
+}
+
+TEST(IncrementalTriangulatorTest,
      GlobalCompletionTransitivelyCompletesAndMergesTracks) {
   const Camera camera = MakeCamera(1);
   const Eigen::Vector3d point_world(0.0, 0.0, 5.0);
@@ -594,6 +779,55 @@ TEST(IncrementalTriangulatorTest,
     EXPECT_EQ(reconstruction.GetImage(image_id).points2d[0].point3d_id,
               first_id);
   }
+}
+
+TEST(IncrementalTriangulatorTest,
+     GlobalCompletionTraversesAssignedIntermediateObservation) {
+  const Camera camera = MakeCamera(1);
+  const Eigen::Vector3d first_world(0.0, 0.0, 5.0);
+  const Eigen::Vector3d intermediate_world(0.2, 0.0, 5.0);
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  for (ImageId image_id = 1; image_id <= 3; ++image_id) {
+    const Pose3 pose = CameraAt(
+        Eigen::Vector3d(static_cast<double>(image_id - 1) * 0.4, 0.0, 0.0));
+    const Eigen::Vector3d& observed_world =
+        image_id == 2 ? intermediate_world : first_world;
+    const auto pixel = ProjectWorldPoint(camera, pose, observed_world);
+    ASSERT_TRUE(pixel.has_value());
+    Image image = MakeImage(image_id, 1);
+    image.registered = true;
+    image.cam_from_world = pose;
+    image.points2d.push_back({*pixel, 0, kInvalidPoint3DId});
+    reconstruction.AddImage(image);
+  }
+
+  Track first_track;
+  first_track.AddElement(1, 0);
+  const Point3DId first_id =
+      reconstruction.AddPoint3D(first_world, first_track);
+  Track intermediate_track;
+  intermediate_track.AddElement(2, 0);
+  const Point3DId intermediate_id =
+      reconstruction.AddPoint3D(intermediate_world, intermediate_track);
+
+  MatchGraph graph;
+  SetVerifiedGeometry(&graph, 1, 2, MakeVerifiedGeometry({{0, 0}}));
+  SetVerifiedGeometry(&graph, 2, 3, MakeVerifiedGeometry({{0, 0}}));
+
+  IncrementalTriangulatorOptions options;
+  options.complete_max_transitivity = 2;
+  options.complete_max_reprojection_error_px = 1.0;
+  options.merge_max_reprojection_error_px = 1.0;
+  const IncrementalTriangulatorSummary summary =
+      CompleteAndMergeAllTracks(graph, options, &reconstruction);
+
+  EXPECT_EQ(summary.num_completed_observations, 1U);
+  EXPECT_EQ(summary.num_merged_points, 0U);
+  ASSERT_TRUE(reconstruction.ExistsPoint3D(first_id));
+  ASSERT_TRUE(reconstruction.ExistsPoint3D(intermediate_id));
+  EXPECT_EQ(reconstruction.GetPoint3D(first_id).track.Length(), 2U);
+  EXPECT_EQ(reconstruction.GetImage(3).points2d[0].point3d_id, first_id);
 }
 
 TEST(IncrementalTriangulatorTest,

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,9 @@ struct IncrementalInitializerOptions {
   // 最多尝试多少个候选初始图像对。用于跳过高分但实际无法三角化的坏 pair，
   // 更接近 COLMAP 在多候选/多模型初始化中的保守回退行为。
   std::size_t max_num_initialization_trials = 3;
+  // Empty means all images. Multi-model mapping uses this set to initialize
+  // only from the current remaining verified component.
+  std::set<ImageId> allowed_image_ids;
 };
 
 struct IncrementalInitializerSummary {

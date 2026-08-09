@@ -221,6 +221,7 @@ TEST(ReconMvsExeTest, RunsSparseWorkspacePassFromColmapTextModel) {
   EXPECT_NE(source_images.find("target_image_id\tsource_image_id"
                                "\tnum_shared_points"
                                "\tmean_triangulation_angle_degrees"
+                               "\ttriangulation_angle_percentile_degrees"
                                "\tmean_scale_ratio\tcoverage_score\tscore"),
             std::string::npos);
   EXPECT_NE(source_images.find("1\t2\t2"), std::string::npos);

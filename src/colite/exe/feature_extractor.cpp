@@ -19,6 +19,13 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << " --image_path <dir> --workspace_path <dir> [options]\n\n"
       << "Options:\n"
       << "  --focal_length <px>       Initial focal length in pixels.\n"
+      << "  --camera_model <name>     Camera model, default SIMPLE_RADIAL.\n"
+      << "  --camera_params <csv>     Explicit model parameters in COLMAP order.\n"
+      << "  --camera_mode <auto|single|per_folder|per_image>\n"
+         "                            Default auto groups complete EXIF camera "
+         "identities. Legacy shared/individual aliases remain accepted.\n"
+      << "  --default_focal_length_factor <f>\n"
+         "                            Missing-EXIF focal factor, default 1.2.\n"
       << "  --max_num_features <n>   SIFT feature limit, default 4096.\n"
       << "  --feature_num_threads <n> CPU feature threads, default -1.\n"
       << "  --feature_extractor <auto|vlsift|cvsift|cuda_opencv|cuda_vlfeat>\n"
@@ -61,6 +68,22 @@ int RunFeatureExtractor(const std::vector<std::string>& args,
         options.workspace_path = RequireValue(args, &i, arg);
       } else if (arg == "--focal_length") {
         options.focal_length = std::stod(RequireValue(args, &i, arg));
+      } else if (arg == "--camera_model") {
+        options.camera_model_id =
+            CameraModelNameToId(RequireValue(args, &i, arg));
+        if (!ExistsCameraModel(options.camera_model_id)) {
+          throw std::invalid_argument("Unsupported camera model");
+        }
+      } else if (arg == "--camera_params") {
+        options.camera_params =
+            controllers::ParseCameraParams(RequireValue(args, &i, arg));
+      } else if (arg == "--camera_mode") {
+        options.camera_sharing_mode =
+            controllers::CameraSharingModeFromName(
+                RequireValue(args, &i, arg));
+      } else if (arg == "--default_focal_length_factor") {
+        options.default_focal_length_factor =
+            std::stod(RequireValue(args, &i, arg));
       } else if (arg == "--max_num_features") {
         options.max_num_features = std::stoi(RequireValue(args, &i, arg));
       } else if (arg == "--feature_num_threads") {
@@ -78,6 +101,7 @@ int RunFeatureExtractor(const std::vector<std::string>& args,
     const auto summary =
         controllers::FeatureExtractorController(options).Run();
     out << "Images: " << summary.num_images << "\n"
+        << "Cameras: " << summary.num_cameras << "\n"
         << "Feature cache hit: " << (summary.cache_hit ? 1 : 0) << "\n"
         << "Feature extraction seconds: " << summary.elapsed_seconds << "\n";
     return summary.success ? EXIT_SUCCESS : EXIT_FAILURE;

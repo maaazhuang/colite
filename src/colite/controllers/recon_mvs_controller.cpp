@@ -33,6 +33,7 @@
 #include "colite/core/point2d.h"
 #include "colite/core/point3d.h"
 #include "colite/core/reconstruction.h"
+#include "colite/io/sfm_workspace.h"
 #include "colite/mvs/dense_cloud.h"
 #include "colite/mvs/dense_map.h"
 #include "colite/mvs/image_workspace.h"
@@ -54,171 +55,6 @@ const ReconMvsControllerOptions& ReconMvsController::Options() const {
 
 namespace {
 using ControllerClock = std::chrono::steady_clock;
-
-std::vector<std::string> DataLines(const std::filesystem::path& path) {
-  std::ifstream file(path);
-  if (!file) {
-    throw std::runtime_error("Failed to open model file: " + path.string());
-  }
-
-  std::vector<std::string> lines;
-  std::string line;
-  while (std::getline(file, line)) {
-    if (line.empty() || line.front() == '#') {
-      continue;
-    }
-    lines.push_back(line);
-  }
-  return lines;
-}
-
-void ReadCameras(const std::filesystem::path& model_path,
-                 Reconstruction* reconstruction) {
-  for (const std::string& line : DataLines(model_path / "cameras.txt")) {
-    std::istringstream stream(line);
-    Camera camera;
-    std::string model_name;
-    stream >> camera.id >> model_name >> camera.width >> camera.height;
-    camera.model_id = CameraModelNameToId(model_name);
-    if (!ExistsCameraModel(camera.model_id)) {
-      throw std::runtime_error("Unsupported camera model: " + model_name);
-    }
-    double param = 0.0;
-    while (stream >> param) {
-      camera.params.push_back(param);
-    }
-    if (!camera.VerifyParams()) {
-      throw std::runtime_error("Invalid camera parameters in: " + line);
-    }
-    reconstruction->AddCamera(camera);
-  }
-}
-
-Point3DId ParseColmapPoint3DId(std::int64_t raw_id) {
-  if (raw_id < 0) {
-    return kInvalidPoint3DId;
-  }
-  return static_cast<Point3DId>(raw_id);
-}
-
-void ReadImages(const std::filesystem::path& model_path,
-                Reconstruction* reconstruction) {
-  const std::vector<std::string> lines = DataLines(model_path / "images.txt");
-  if (lines.size() % 2 != 0) {
-    throw std::runtime_error("images.txt must contain two data lines per image");
-  }
-
-  for (std::size_t i = 0; i < lines.size(); i += 2) {
-    std::istringstream header(lines[i]);
-    Image image;
-    Pose3 pose;
-    header >> image.id >> pose.q_cw.w() >> pose.q_cw.x() >> pose.q_cw.y() >>
-        pose.q_cw.z() >> pose.t_cw.x() >> pose.t_cw.y() >> pose.t_cw.z() >>
-        image.camera_id >> image.name;
-    if (!header || !reconstruction->ExistsCamera(image.camera_id)) {
-      throw std::runtime_error("Invalid image entry in: " + lines[i]);
-    }
-    image.registered = true;
-    image.cam_from_world = pose;
-
-    std::istringstream points_line(lines[i + 1]);
-    double x = 0.0;
-    double y = 0.0;
-    std::int64_t raw_point3d_id = -1;
-    Point2DIdx point2d_idx = 0;
-    while (points_line >> x >> y >> raw_point3d_id) {
-      Point2D point2d;
-      point2d.xy = Eigen::Vector2d(x, y);
-      point2d.feature_idx = point2d_idx++;
-      point2d.point3d_id = ParseColmapPoint3DId(raw_point3d_id);
-      image.points2d.push_back(point2d);
-    }
-
-    reconstruction->AddImage(image);
-    reconstruction->RegisterImage(image.id);
-  }
-}
-
-void ReadPoints3D(const std::filesystem::path& model_path,
-                  Reconstruction* reconstruction) {
-  for (const std::string& line : DataLines(model_path / "points3D.txt")) {
-    std::istringstream stream(line);
-    Point3D point3d;
-    int red = 0;
-    int green = 0;
-    int blue = 0;
-    stream >> point3d.id >> point3d.xyz.x() >> point3d.xyz.y() >>
-        point3d.xyz.z() >> red >> green >> blue >> point3d.reprojection_error;
-    if (!stream) {
-      throw std::runtime_error("Invalid point3D entry in: " + line);
-    }
-    point3d.color =
-        Eigen::Matrix<std::uint8_t, 3, 1>(static_cast<std::uint8_t>(red),
-                                          static_cast<std::uint8_t>(green),
-                                          static_cast<std::uint8_t>(blue));
-
-    ImageId image_id = kInvalidImageId;
-    Point2DIdx point2d_idx = kInvalidPoint2DIdx;
-    while (stream >> image_id >> point2d_idx) {
-      point3d.track.AddElement(image_id, point2d_idx);
-    }
-    reconstruction->AddPoint3D(point3d);
-  }
-}
-
-Reconstruction ReadColmapTextModel(const std::filesystem::path& model_path) {
-  Reconstruction reconstruction;
-  ReadCameras(model_path, &reconstruction);
-  ReadImages(model_path, &reconstruction);
-  ReadPoints3D(model_path, &reconstruction);
-  return reconstruction;
-}
-
-void WriteColmapTextModel(const std::filesystem::path& model_path,
-                          const Reconstruction& reconstruction) {
-  std::filesystem::create_directories(model_path);
-  std::ofstream cameras(model_path / "cameras.txt");
-  std::ofstream images(model_path / "images.txt");
-  std::ofstream points(model_path / "points3D.txt");
-  if (!cameras || !images || !points) {
-    throw std::runtime_error("Failed to write undistorted sparse model.");
-  }
-  cameras << std::setprecision(17);
-  for (const auto& [camera_id, camera] : reconstruction.Cameras()) {
-    cameras << camera_id << ' ' << CameraModelIdToName(camera.model_id) << ' '
-            << camera.width << ' ' << camera.height;
-    for (const double parameter : camera.params) cameras << ' ' << parameter;
-    cameras << '\n';
-  }
-  images << std::setprecision(17);
-  for (const ImageId image_id : reconstruction.RegisteredImageIds()) {
-    const Image& image = reconstruction.GetImage(image_id);
-    const Pose3& pose = *image.cam_from_world;
-    images << image.id << ' ' << pose.q_cw.w() << ' ' << pose.q_cw.x() << ' '
-           << pose.q_cw.y() << ' ' << pose.q_cw.z() << ' ' << pose.t_cw.x()
-           << ' ' << pose.t_cw.y() << ' ' << pose.t_cw.z() << ' '
-           << image.camera_id << ' ' << image.name << '\n';
-    for (const Point2D& point : image.points2d) {
-      images << point.xy.x() << ' ' << point.xy.y() << ' ';
-      if (point.HasPoint3D()) images << point.point3d_id;
-      else images << -1;
-      images << ' ';
-    }
-    images << '\n';
-  }
-  points << std::setprecision(17);
-  for (const auto& [point_id, point] : reconstruction.Points3D()) {
-    points << point_id << ' ' << point.xyz.x() << ' ' << point.xyz.y() << ' '
-           << point.xyz.z() << ' ' << static_cast<int>(point.color.x()) << ' '
-           << static_cast<int>(point.color.y()) << ' '
-           << static_cast<int>(point.color.z()) << ' '
-           << point.reprojection_error;
-    for (const TrackElement& element : point.track.elements) {
-      points << ' ' << element.image_id << ' ' << element.point2d_idx;
-    }
-    points << '\n';
-  }
-}
 
 std::size_t UndistortWorkspaceImages(
     const ReconMvsControllerOptions& cli_options,
@@ -288,8 +124,9 @@ std::size_t UndistortWorkspaceImages(
       if (projected.has_value()) point.xy = *projected;
     }
   }
-  WriteColmapTextModel(output_path / "undistorted" / "sparse",
-                       *reconstruction);
+  WriteColmapReconstruction(output_path / "undistorted" / "sparse",
+                            *reconstruction,
+                            ColmapModelFormat::kTextAndBinary);
   return count;
 }
 
@@ -410,8 +247,14 @@ void WriteMvsSummary(const std::filesystem::path& output_path,
        << "fused_observations "
        << fusion_summary.num_fused_observations
        << "\n"
+       << "fusion_depth_pixels "
+       << fusion_summary.num_depth_pixels
+       << "\n"
        << "fusion_visited_pixels "
        << fusion_summary.num_visited_pixels
+       << "\n"
+       << "fusion_skipped_pixels "
+       << fusion_summary.num_skipped_pixels
        << "\n"
        << "fusion_rejected_tracks "
        << fusion_summary.num_rejected_tracks
@@ -429,6 +272,7 @@ void WriteSourceImages(const std::filesystem::path& output_path,
   std::ofstream file(output_path / "source_images.tsv");
   file << "target_image_id\tsource_image_id\tnum_shared_points"
        << "\tmean_triangulation_angle_degrees"
+       << "\ttriangulation_angle_percentile_degrees"
        << "\tmean_scale_ratio\tcoverage_score\tscore\n";
   for (const mvs::ImageMvsSummary& image_summary : summary.images) {
     for (const mvs::SourceImageScore& source : image_summary.source_images) {
@@ -436,6 +280,7 @@ void WriteSourceImages(const std::filesystem::path& output_path,
            << source.image_id << "\t"
            << source.num_shared_points << "\t"
            << source.mean_triangulation_angle_degrees << "\t"
+           << source.triangulation_angle_percentile_degrees << "\t"
            << source.mean_scale_ratio << "\t"
            << source.coverage_score << "\t"
            << source.score << "\n";
@@ -481,6 +326,7 @@ std::size_t InitializePatchMatchMapsForWorkspace(
   workspace_options.max_cache_entries = cli_options.image_cache_size;
   workspace_options.max_image_size = cli_options.max_image_size;
   workspace_options.resolution_level = cli_options.resolution_level;
+  workspace_options.load_color = false;
   mvs::MvsImageWorkspace workspace(reconstruction, workspace_options);
 
   mvs::PatchMatchInitializationOptions init_options;
@@ -874,9 +720,15 @@ PatchMatchWorkspaceResult RunInitialPatchMatchForImage(
 
   std::vector<mvs::PatchMatchView> source_views;
   std::vector<mvs::MvsImage> source_images;
-  source_views.reserve(image_summary.source_images.size());
-  source_images.reserve(image_summary.source_images.size());
-  for (const mvs::SourceImageScore& source : image_summary.source_images) {
+  const std::size_t num_patch_match_sources =
+      std::min(image_summary.source_images.size(),
+               cli_options.max_num_source_images);
+  source_views.reserve(num_patch_match_sources);
+  source_images.reserve(num_patch_match_sources);
+  for (std::size_t source_idx = 0;
+       source_idx < num_patch_match_sources; ++source_idx) {
+    const mvs::SourceImageScore& source =
+        image_summary.source_images[source_idx];
     source_views.push_back(views.at(source.image_id));
     source_images.push_back(images.at(source.image_id));
   }
@@ -932,8 +784,11 @@ PatchMatchWorkspaceResult RunInitialPatchMatchForImage(
   workspace_result.image = reference_image;
   workspace_result.min_depth = static_cast<float>(image_summary.min_depth);
   workspace_result.max_depth = static_cast<float>(image_summary.max_depth);
-  for (const mvs::SourceImageScore& source : image_summary.source_images) {
-    workspace_result.source_image_ids.push_back(source.image_id);
+  workspace_result.source_image_ids.reserve(num_patch_match_sources);
+  for (std::size_t source_idx = 0;
+       source_idx < num_patch_match_sources; ++source_idx) {
+    workspace_result.source_image_ids.push_back(
+        image_summary.source_images[source_idx].image_id);
   }
   workspace_result.result = std::move(result);
   workspace_result.stats_before_filter = stats_before;
@@ -1088,19 +943,35 @@ PatchMatchRefinementResult RunPatchMatchRefinementJob(
     std::size_t cuda_workspace_pool_slot) {
   PatchMatchRefinementResult output;
   output.result_index = job.result_index;
-  std::vector<mvs::DenseDepthMap> source_depth_maps;
-  source_depth_maps.reserve(job.source_result_indices.size());
-  for (const std::size_t source_result_index : job.source_result_indices) {
-    source_depth_maps.push_back(initial_depth_maps.at(source_result_index));
-  }
   mvs::PatchMatchMaps initial_maps;
   initial_maps.depth_map = initial_depth_maps.at(job.result_index);
   initial_maps.normal_map = std::move(job.initial_normal_map);
-  output.result =
-      mvs::RunPatchMatchStereoForImageWithSourceDepthsAndCudaWorkspace(
-          job.reference_view, job.source_views, job.reference_image,
-          job.source_images, source_depth_maps, job.min_depth,
-          job.max_depth, cuda_workspace, refinement_options, &initial_maps);
+  if (cuda_workspace != nullptr) {
+    std::vector<const mvs::DenseDepthMap*> source_depth_maps;
+    source_depth_maps.reserve(job.source_result_indices.size());
+    for (const std::size_t source_result_index : job.source_result_indices) {
+      source_depth_maps.push_back(
+          &initial_depth_maps.at(source_result_index));
+    }
+    output.result = mvs::
+        RunPatchMatchStereoForImageWithSourceDepthPointersAndCudaWorkspace(
+            job.reference_view, job.source_views, job.reference_image,
+            job.source_images, source_depth_maps, job.min_depth,
+            job.max_depth, cuda_workspace, refinement_options,
+            &initial_maps);
+  } else {
+    // CPU kernels currently use an owning contiguous depth-map vector.
+    std::vector<mvs::DenseDepthMap> source_depth_maps;
+    source_depth_maps.reserve(job.source_result_indices.size());
+    for (const std::size_t source_result_index : job.source_result_indices) {
+      source_depth_maps.push_back(initial_depth_maps.at(source_result_index));
+    }
+    output.result =
+        mvs::RunPatchMatchStereoForImageWithSourceDepthsAndCudaWorkspace(
+            job.reference_view, job.source_views, job.reference_image,
+            job.source_images, source_depth_maps, job.min_depth,
+            job.max_depth, nullptr, refinement_options, &initial_maps);
+  }
   if (output.result.summary.actual_backend == mvs::PatchMatchBackend::kCuda &&
       cuda_workspace_pool_size > 0) {
     output.result.summary.cuda_workspace_pool_size =
@@ -1449,6 +1320,10 @@ std::size_t RunPatchMatchForWorkspace(
   workspace_options.max_cache_entries = cli_options.image_cache_size;
   workspace_options.max_image_size = cli_options.max_image_size;
   workspace_options.resolution_level = cli_options.resolution_level;
+  // PatchMatch consumes normalized grayscale only. Persisted Fusion owns a
+  // separate RGB-only workspace, so retaining color for every source view in
+  // this phase wastes three bytes per pixel across the full image set.
+  workspace_options.load_color = false;
   mvs::MvsImageWorkspace workspace(reconstruction, workspace_options);
 
   mvs::PatchMatchStereoOptions patch_match_options;
@@ -1476,6 +1351,8 @@ std::size_t RunPatchMatchForWorkspace(
   patch_match_options.source_selection.directional_hmm =
       cli_options.patch_match_directional_hmm ||
       cli_options.patch_match_dynamic_source_selection;
+  patch_match_options.source_selection.geometric_priors =
+      cli_options.patch_match_colmap_source_priors;
   patch_match_options.source_selection.num_samples =
       cli_options.patch_match_source_samples;
   patch_match_options.source_selection.ncc_sigma =
@@ -1517,6 +1394,8 @@ std::size_t RunPatchMatchForWorkspace(
       std::max<std::size_t>(3, patch_match_options.pyramid_levels);
   refinement_options.cost.geometric_consistency_weight =
       cli_options.patch_match_geometric_consistency_weight;
+  refinement_options.cost.robust_geometric_aggregation =
+      cli_options.patch_match_robust_geometric_aggregation;
   refinement_options.cost.geometric_max_reprojection_error = 3.0F;
   refinement_options.cost.geometric_max_relative_depth_error =
       cli_options.patch_match_geometric_max_relative_depth_error;
@@ -1588,6 +1467,19 @@ std::size_t RunPatchMatchForWorkspace(
   }
   num_patch_match_images = results.size();
   if (run_geometric_refinement) {
+    // A refinement workspace adds a full layered source-depth texture and
+    // pinned staging buffer on top of its photometric image textures. Two
+    // High-resolution workspaces exceed the memory saved by overlapping jobs
+    // on one GPU, so retain one warmed workspace for large images. Small
+    // images keep the two-stream schedule where overlap is inexpensive.
+    constexpr std::size_t kLargeRefinementPixels = 2'000'000;
+    if (!results.empty() && cuda_workspace_ptrs.size() > 1 &&
+        results.front().result.depth_map.NumPixels() >=
+            kLargeRefinementPixels) {
+      cuda_workspace_ptrs.resize(1);
+      cuda_workspaces.erase(cuda_workspaces.begin() + 1,
+                            cuda_workspaces.end());
+    }
     std::vector<PatchMatchRefinementJob> refinement_jobs;
     refinement_jobs.reserve(results.size());
     std::vector<std::uint8_t> refinement_job_by_result(results.size(), 0);
@@ -1684,6 +1576,22 @@ std::size_t RunPatchMatchForWorkspace(
     }
   }
 
+  // No CUDA workspace is used after photometric/geometric refinement. Release
+  // texture arrays, device buffers, and pinned staging memory before CPU
+  // consistency-graph construction so graph workers do not overlap the
+  // largest GPU-host working set.
+  cuda_workspace_ptrs.clear();
+  cuda_workspaces.clear();
+
+  // Plane homographies are invariant to flipping the plane normal, so
+  // PatchMatch cost minimization alone cannot enforce a stable sign. Persist
+  // the standard camera-facing orientation before geometric filtering,
+  // Fusion, and dense-map output.
+  for (PatchMatchWorkspaceResult& result : results) {
+    mvs::OrientNormalMapTowardsCamera(
+        result.view, &result.result.normal_map);
+  }
+
   std::size_t total_geometric_consistent_pixels = 0;
   std::size_t total_geometric_filtered_pixels = 0;
   if (cli_options.check_geometric_consistency) {
@@ -1699,8 +1607,14 @@ std::size_t RunPatchMatchForWorkspace(
     // all depth maps or all consistency graphs in memory.
     const ControllerClock::time_point graph_build_start =
         ControllerClock::now();
-    const std::size_t graph_num_threads =
-        std::max<std::size_t>(1, cli_options.num_threads);
+    // A compact graph still needs a full size_t offset array plus its source
+    // ids while it is being built. At High resolution eight concurrent
+    // graphs can add hundreds of MiB without improving the pixel-parallel
+    // PatchMatch kernels. Bound graph materialization independently from the
+    // user CPU thread count; each worker continues to use all source views.
+    const std::size_t graph_num_threads = std::min<std::size_t>(
+        std::max<std::size_t>(1, cli_options.num_threads),
+        2);
     std::vector<std::future<void>> graph_futures;
     graph_futures.reserve(graph_num_threads);
     const auto collect_oldest_graph_future = [&graph_futures]() {
@@ -1808,26 +1722,22 @@ std::size_t RunPatchMatchForWorkspace(
   }
 
   mvs::StereoFusionSummary fusion_summary;
+  std::vector<std::shared_ptr<mvs::StereoFusionViewData>>
+      fusion_view_data;
   if (cli_options.fuse_stereo) {
     std::vector<mvs::PatchMatchView> fusion_views;
-    std::vector<mvs::MvsImage> fusion_images;
-    std::vector<mvs::DenseDepthMap> fusion_depth_maps;
-    std::vector<mvs::NormalMap> fusion_normal_maps;
-    std::vector<mvs::DenseCostMap> fusion_cost_maps;
-    std::vector<mvs::ConsistencyGraph> fusion_graphs;
     fusion_views.reserve(results.size());
-    fusion_images.reserve(results.size());
-    fusion_depth_maps.reserve(results.size());
-    fusion_normal_maps.reserve(results.size());
-    fusion_cost_maps.reserve(results.size());
-    fusion_graphs.reserve(results.size());
-    for (const PatchMatchWorkspaceResult& result : results) {
+    fusion_view_data.reserve(results.size());
+    for (PatchMatchWorkspaceResult& result : results) {
       fusion_views.push_back(result.view);
-      fusion_images.push_back(result.image);
-      fusion_depth_maps.push_back(result.result.depth_map);
-      fusion_normal_maps.push_back(result.result.normal_map);
-      fusion_cost_maps.push_back(result.result.cost_map);
-      fusion_graphs.push_back(result.consistency_graph);
+      auto data = std::make_shared<mvs::StereoFusionViewData>();
+      data->image = result.image;
+      data->depth_map = std::move(result.result.depth_map);
+      data->normal_map = std::move(result.result.normal_map);
+      data->cost_map = std::move(result.result.cost_map);
+      data->consistency_graph = std::move(result.consistency_graph);
+      data->fallback_source_image_ids = result.source_image_ids;
+      fusion_view_data.push_back(std::move(data));
     }
 
     mvs::StereoFusionOptions fusion_options;
@@ -1853,9 +1763,15 @@ std::size_t RunPatchMatchForWorkspace(
         cli_options.fusion_source_pixel_search_radius;
     fusion_options.skip_completed_reference_views = true;
     fusion_options.collect_diagnostics = cli_options.fusion_diagnostics;
-    const mvs::StereoFusionResult fusion = mvs::FuseStereoDepthMaps(
-        fusion_views, fusion_images, fusion_depth_maps, fusion_normal_maps,
-        fusion_cost_maps, fusion_graphs, fusion_options);
+    const mvs::StereoFusionResult fusion =
+        mvs::FuseStereoDepthMapsWithViewCache(
+            fusion_views,
+            [&fusion_view_data](std::size_t image_idx) {
+              return std::static_pointer_cast<
+                  const mvs::StereoFusionViewData>(
+                  fusion_view_data.at(image_idx));
+            },
+            fusion_options);
     fusion_summary = fusion.summary;
     WriteFusedPointCloudPly(output_path / "dense" / "fused.ply",
                             fusion.points);
@@ -1902,10 +1818,14 @@ std::size_t RunPatchMatchForWorkspace(
         cli_options.texture_min_visible_vertices;
     texturing_options.view_selection_smoothing_iterations =
         cli_options.texture_view_smoothing_iterations;
+    texturing_options.view_selection_min_component_size =
+        cli_options.texture_view_min_component_size;
     texturing_options.visibility_resolution =
         cli_options.texture_visibility_resolution;
     texturing_options.occlusion_relative_tolerance =
         cli_options.texture_occlusion_relative_tolerance;
+    texturing_options.use_vertex_color_fallback =
+        cli_options.texture_use_vertex_color_fallback;
     texturing_options.apply_color_correction =
         cli_options.texture_apply_color_correction;
     texturing_options.color_correction_regularization =
@@ -2125,19 +2045,33 @@ std::size_t RunPatchMatchForWorkspace(
               << "\tgeometric_filtered_pixels"
               << "\tfinal_valid_cost_pixels"
               << "\tdepth_min\tdepth_max\n";
-  for (const PatchMatchWorkspaceResult& result : results) {
+  for (std::size_t result_idx = 0; result_idx < results.size();
+       ++result_idx) {
+    const PatchMatchWorkspaceResult& result = results[result_idx];
+    const mvs::DenseDepthMap& output_depth_map =
+        cli_options.fuse_stereo
+            ? fusion_view_data[result_idx]->depth_map
+            : result.result.depth_map;
+    const mvs::NormalMap& output_normal_map =
+        cli_options.fuse_stereo
+            ? fusion_view_data[result_idx]->normal_map
+            : result.result.normal_map;
+    const mvs::DenseCostMap& output_cost_map =
+        cli_options.fuse_stereo
+            ? fusion_view_data[result_idx]->cost_map
+            : result.result.cost_map;
     const mvs::PatchMatchPhotometricStats final_stats =
-        mvs::ComputePatchMatchPhotometricStats(result.result.cost_map);
+        mvs::ComputePatchMatchPhotometricStats(output_cost_map);
     WriteDenseDepthMap(depth_dir / result.dense_file_name,
-                       result.result.depth_map, binary_dense_maps);
+                       output_depth_map, binary_dense_maps);
     WriteNormalMap(normal_dir / result.dense_file_name,
-                   result.result.normal_map, binary_dense_maps);
+                   output_normal_map, binary_dense_maps);
     if (binary_dense_maps) {
       mvs::WriteDenseCostMapBinary(cost_dir / result.dense_file_name,
-                                   result.result.cost_map);
+                                   output_cost_map);
     } else {
       mvs::WriteDenseCostMapText(cost_dir / result.text_file_name,
-                                 result.result.cost_map);
+                                 output_cost_map);
     }
     diagnostics << result.image_id << "\t"
                 << mvs::PatchMatchBackendToName(
@@ -2427,6 +2361,23 @@ mvs::StereoFusionSummary FusePersistedStereoMaps(
     fusion_views.push_back(MakePatchMatchView(
         reconstruction, image_summary->image_id, image.scale));
   }
+  mvs::MvsPipelineOptions fusion_source_options;
+  fusion_source_options.max_num_source_images =
+      cli_options.fusion_max_num_source_images;
+  fusion_source_options.min_num_shared_points =
+      cli_options.min_num_shared_points;
+  fusion_source_options.source_selection_mode =
+      mvs::SourceSelectionMode::kColmap;
+  // COLMAP Fusion considers every sparse-overlap candidate and only uses the
+  // triangulation-angle gate for PatchMatch source selection.
+  fusion_source_options.min_triangulation_angle_degrees = 0.0;
+  std::vector<std::vector<mvs::SourceImageScore>> fusion_source_images;
+  fusion_source_images.reserve(image_ids.size());
+  for (const ImageId image_id : image_ids) {
+    fusion_source_images.push_back(
+        mvs::SelectSourceImages(reconstruction, image_id,
+                                fusion_source_options));
+  }
   const double image_loading_ms = elapsed_ms(total_start);
   const bool binary = UseBinaryDenseMaps(cli_options);
 
@@ -2500,6 +2451,12 @@ mvs::StereoFusionSummary FusePersistedStereoMaps(
 
     auto data = std::make_shared<mvs::StereoFusionViewData>();
     data->image = workspace.GetImage(image_ids.at(image_idx));
+    data->fallback_source_image_ids.reserve(
+        fusion_source_images.at(image_idx).size());
+    for (const mvs::SourceImageScore& source :
+         fusion_source_images.at(image_idx)) {
+      data->fallback_source_image_ids.push_back(source.image_id);
+    }
     const std::string dense_name =
         DenseMapFileName(image_names.at(image_idx), false, binary);
     const auto depth_path =
@@ -2512,26 +2469,16 @@ mvs::StereoFusionSummary FusePersistedStereoMaps(
     data->normal_map =
         binary ? mvs::ReadNormalMapBinary(normal_path)
                : mvs::ReadNormalMapText(normal_path);
-    const auto native_path = output_path / "stereo" /
-                             "consistency_graphs" /
-                             (image_names.at(image_idx) + ".bin");
-    const auto legacy_native_path = output_path / "stereo" /
-                                    "consistency_graphs" / dense_name;
-    const auto colmap_path = output_path / "stereo" /
-                             "consistency_graphs_colmap" / dense_name;
-    if (std::filesystem::exists(native_path)) {
-      data->consistency_graph =
-          mvs::ReadConsistencyGraphBinary(native_path);
-    } else if (binary && std::filesystem::exists(legacy_native_path)) {
-      data->consistency_graph =
-          mvs::ReadConsistencyGraphBinary(legacy_native_path);
-    } else if (std::filesystem::exists(colmap_path)) {
-      data->consistency_graph =
-          mvs::ReadConsistencyGraphColmapBinary(colmap_path, image_ids);
-    } else {
-      data->consistency_graph = mvs::ConsistencyGraph(
-          data->depth_map.Width(), data->depth_map.Height());
-    }
+    mvs::OrientNormalMapTowardsCamera(
+        fusion_views.at(image_idx), &data->normal_map);
+    // Geometric filtering has already applied the per-pixel consistency
+    // graph and synchronized the invalid mask into depth and normal maps.
+    // Persisted Fusion deliberately traverses the independently selected
+    // 50-view overlap list below, so loading the graph here cannot affect any
+    // acceptance decision. On High-resolution House data the unused CSR
+    // payload is one of the largest members of every cached view and also
+    // adds avoidable parsing on each cache miss.
+    data->consistency_graph = mvs::ConsistencyGraph();
     {
       std::lock_guard<std::mutex> lock(cache_mutex);
       cache_lru.push_front(image_idx);
@@ -2560,6 +2507,14 @@ mvs::StereoFusionSummary FusePersistedStereoMaps(
   options.max_view_angle_degrees = cli_options.fusion_max_view_angle_degrees;
   options.source_pixel_search_radius =
       cli_options.fusion_source_pixel_search_radius;
+  // COLMAP's default photometric PatchMatch does not write a consistency
+  // graph. Persisted fusion falls back to the ordered MVS source list and
+  // applies the same reprojection/depth/normal checks at traversal time.
+  options.require_consistency_graph = false;
+  // Geometric filtering has already invalidated unsupported pixels. Reusing
+  // the per-pixel graph here applies the same support constraint twice and
+  // prevents valid cross-view tracks that COLMAP's fuser accepts.
+  options.prefer_fallback_source_images = true;
   options.skip_completed_reference_views = true;
   // Geometric filtering persists invalid pixels consistently in depth,
   // normal, and cost maps. Depth and normal are sufficient here, so avoid
@@ -2648,7 +2603,8 @@ mvs::StereoFusionSummary FusePersistedStereoMaps(
 
 int ReconMvsController::Run(std::ostream& out) const {
   ReconMvsControllerOptions cli_options = options_;
-  Reconstruction reconstruction = ReadColmapTextModel(cli_options.model_path);
+  Reconstruction reconstruction =
+      ReadColmapReconstruction(cli_options.model_path);
   const std::filesystem::path output_path(cli_options.output_path);
   std::size_t num_undistorted_images = 0;
   if (cli_options.image_undistorter) {
@@ -2662,6 +2618,10 @@ int ReconMvsController::Run(std::ostream& out) const {
   mvs::MvsPipelineOptions mvs_options;
   mvs_options.max_num_source_images = cli_options.max_num_source_images;
   mvs_options.min_num_shared_points = cli_options.min_num_shared_points;
+  mvs_options.source_selection_mode =
+      cli_options.source_selection_mode == "colmap"
+          ? mvs::SourceSelectionMode::kColmap
+          : mvs::SourceSelectionMode::kWeighted;
   mvs_options.min_triangulation_angle_degrees =
       cli_options.source_min_triangulation_angle_degrees;
   mvs_options.max_triangulation_angle_degrees =

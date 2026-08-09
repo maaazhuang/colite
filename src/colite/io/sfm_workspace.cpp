@@ -1,9 +1,12 @@
 #include "colite/io/sfm_workspace.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
 #include <ios>
+#include <limits>
 #include <map>
 #include <sstream>
 #include <stdexcept>
@@ -31,8 +34,55 @@ std::vector<std::string> DataLines(const std::filesystem::path& path) {
   return lines;
 }
 
+std::vector<std::pair<std::string, std::string>> ColmapImageEntries(
+    const std::filesystem::path& path) {
+  std::ifstream file(path);
+  if (!file) {
+    throw std::runtime_error("Failed to open COLMAP model file: " +
+                             path.string());
+  }
+  std::vector<std::pair<std::string, std::string>> entries;
+  std::string header;
+  while (std::getline(file, header)) {
+    if (header.empty() || header.front() == '#') {
+      continue;
+    }
+    std::string points;
+    if (!std::getline(file, points)) {
+      throw std::runtime_error(
+          "COLMAP images.txt is missing the POINTS2D line after: " + header);
+    }
+    if (!points.empty() && points.front() == '#') {
+      throw std::runtime_error(
+          "COLMAP images.txt has a comment where a POINTS2D line is expected");
+    }
+    entries.emplace_back(std::move(header), std::move(points));
+  }
+  return entries;
+}
+
+bool CameraParametersEqual(const Camera& lhs, const Camera& rhs) {
+  if (lhs.model_id != rhs.model_id || lhs.width != rhs.width ||
+      lhs.height != rhs.height || lhs.params.size() != rhs.params.size()) {
+    return false;
+  }
+  for (std::size_t idx = 0; idx < lhs.params.size(); ++idx) {
+    const double scale =
+        std::max({1.0, std::abs(lhs.params[idx]), std::abs(rhs.params[idx])});
+    if (std::abs(lhs.params[idx] - rhs.params[idx]) > 1e-10 * scale) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::string Point3DIdForText(Point3DId point3d_id) {
   return point3d_id == kInvalidPoint3DId ? "-1" : std::to_string(point3d_id);
+}
+
+Point3DId ParsePoint3DId(std::int64_t point3d_id) {
+  return point3d_id < 0 ? kInvalidPoint3DId
+                        : static_cast<Point3DId>(point3d_id);
 }
 
 int GeometryTypeToInt(TwoViewGeometry::Type type) {
@@ -56,6 +106,9 @@ TwoViewGeometry::Type GeometryTypeFromInt(int value) {
 template <typename T>
 void WriteBinary(std::ofstream* file, const T& value) {
   file->write(reinterpret_cast<const char*>(&value), sizeof(T));
+  if (!*file) {
+    throw std::runtime_error("Failed to write binary file");
+  }
 }
 
 template <typename T>
@@ -64,6 +117,37 @@ void ReadBinary(std::ifstream* file, T* value) {
   if (!*file) {
     throw std::runtime_error("Unexpected end of binary workspace file");
   }
+}
+
+std::string ReadNullTerminated(std::ifstream* file) {
+  std::string value;
+  char character = '\0';
+  while (file->get(character)) {
+    if (character == '\0') {
+      return value;
+    }
+    value.push_back(character);
+  }
+  throw std::runtime_error("Unexpected end of COLMAP binary image name");
+}
+
+template <typename Id, typename Map>
+std::vector<Id> SortedIds(const Map& values) {
+  std::vector<Id> ids;
+  ids.reserve(values.size());
+  for (const auto& [id, value] : values) {
+    (void)value;
+    ids.push_back(id);
+  }
+  std::sort(ids.begin(), ids.end());
+  return ids;
+}
+
+bool HasCompleteModel(const std::filesystem::path& path,
+                      const std::string& extension) {
+  return std::filesystem::is_regular_file(path / ("cameras." + extension)) &&
+         std::filesystem::is_regular_file(path / ("images." + extension)) &&
+         std::filesystem::is_regular_file(path / ("points3D." + extension));
 }
 
 std::filesystem::path NormalizeRequiredFile(
@@ -78,6 +162,40 @@ std::string ToHex(std::uint64_t value) {
 }
 
 }  // namespace
+
+ColmapModelFormat ColmapModelFormatFromString(const std::string& value) {
+  if (value == "auto") return ColmapModelFormat::kAuto;
+  if (value == "txt" || value == "text") return ColmapModelFormat::kText;
+  if (value == "bin" || value == "binary") return ColmapModelFormat::kBinary;
+  if (value == "both" || value == "txt+bin") {
+    return ColmapModelFormat::kTextAndBinary;
+  }
+  throw std::invalid_argument(
+      "COLMAP model format must be auto, txt, bin, or both: " + value);
+}
+
+std::string ColmapModelFormatToString(const ColmapModelFormat format) {
+  switch (format) {
+    case ColmapModelFormat::kAuto: return "auto";
+    case ColmapModelFormat::kText: return "txt";
+    case ColmapModelFormat::kBinary: return "bin";
+    case ColmapModelFormat::kTextAndBinary: return "both";
+  }
+  throw std::invalid_argument("Unknown COLMAP model format");
+}
+
+ColmapModelFormat DetectColmapModelFormat(
+    const std::filesystem::path& model_path) {
+  if (HasCompleteModel(model_path, "bin")) {
+    return ColmapModelFormat::kBinary;
+  }
+  if (HasCompleteModel(model_path, "txt")) {
+    return ColmapModelFormat::kText;
+  }
+  throw std::runtime_error(
+      "COLMAP model requires a complete cameras/images/points3D .bin or .txt "
+      "file set: " + model_path.string());
+}
 
 std::filesystem::path WorkspaceFeaturesPath(
     const std::filesystem::path& workspace_path) {
@@ -509,8 +627,15 @@ void ReadWorkspaceVerifiedGeometries(
 
 void WriteWorkspaceSparseReconstruction(
     const std::filesystem::path& workspace_path,
+    const Reconstruction& reconstruction,
+    const ColmapModelFormat format) {
+  WriteColmapReconstruction(WorkspaceSparsePath(workspace_path),
+                            reconstruction, format);
+}
+
+void WriteSparseReconstruction(
+    const std::filesystem::path& sparse_path,
     const Reconstruction& reconstruction) {
-  const std::filesystem::path sparse_path = WorkspaceSparsePath(workspace_path);
   std::filesystem::create_directories(sparse_path);
 
   std::ofstream cameras_file(sparse_path / "cameras.txt");
@@ -582,6 +707,445 @@ void WriteWorkspaceSparseReconstruction(
              << static_cast<int>(point3d.color.y()) << " "
              << static_cast<int>(point3d.color.z()) << "\n";
   }
+}
+
+void WriteColmapBinaryReconstruction(
+    const std::filesystem::path& model_path,
+    const Reconstruction& reconstruction) {
+  std::filesystem::create_directories(model_path);
+  std::ofstream cameras_file(model_path / "cameras.bin", std::ios::binary);
+  std::ofstream images_file(model_path / "images.bin", std::ios::binary);
+  std::ofstream points_file(model_path / "points3D.bin", std::ios::binary);
+  if (!cameras_file || !images_file || !points_file) {
+    throw std::runtime_error("Failed to create COLMAP binary model: " +
+                             model_path.string());
+  }
+
+  const std::vector<CameraId> camera_ids =
+      SortedIds<CameraId>(reconstruction.Cameras());
+  WriteBinary(&cameras_file, static_cast<std::uint64_t>(camera_ids.size()));
+  for (const CameraId camera_id : camera_ids) {
+    const Camera& camera = reconstruction.GetCamera(camera_id);
+    WriteBinary(&cameras_file, static_cast<std::uint32_t>(camera.id));
+    WriteBinary(&cameras_file, static_cast<std::int32_t>(camera.model_id));
+    WriteBinary(&cameras_file, static_cast<std::uint64_t>(camera.width));
+    WriteBinary(&cameras_file, static_cast<std::uint64_t>(camera.height));
+    for (const double parameter : camera.params) {
+      WriteBinary(&cameras_file, parameter);
+    }
+  }
+
+  std::vector<ImageId> registered_image_ids(
+      reconstruction.RegisteredImageIds().begin(),
+      reconstruction.RegisteredImageIds().end());
+  WriteBinary(&images_file,
+              static_cast<std::uint64_t>(registered_image_ids.size()));
+  for (const ImageId image_id : registered_image_ids) {
+    const Image& image = reconstruction.GetImage(image_id);
+    if (!image.cam_from_world.has_value()) {
+      throw std::runtime_error(
+          "Registered image has no pose while writing COLMAP binary model");
+    }
+    const Pose3& pose = *image.cam_from_world;
+    WriteBinary(&images_file, static_cast<std::uint32_t>(image.id));
+    WriteBinary(&images_file, pose.q_cw.w());
+    WriteBinary(&images_file, pose.q_cw.x());
+    WriteBinary(&images_file, pose.q_cw.y());
+    WriteBinary(&images_file, pose.q_cw.z());
+    WriteBinary(&images_file, pose.t_cw.x());
+    WriteBinary(&images_file, pose.t_cw.y());
+    WriteBinary(&images_file, pose.t_cw.z());
+    WriteBinary(&images_file, static_cast<std::uint32_t>(image.camera_id));
+    images_file.write(image.name.data(),
+                      static_cast<std::streamsize>(image.name.size()));
+    images_file.put('\0');
+    if (!images_file) {
+      throw std::runtime_error("Failed to write COLMAP binary image name");
+    }
+    WriteBinary(&images_file,
+                static_cast<std::uint64_t>(image.points2d.size()));
+    for (const Point2D& point2d : image.points2d) {
+      WriteBinary(&images_file, point2d.xy.x());
+      WriteBinary(&images_file, point2d.xy.y());
+      WriteBinary(&images_file,
+                  static_cast<std::uint64_t>(point2d.point3d_id));
+    }
+  }
+
+  const std::vector<Point3DId> point_ids =
+      SortedIds<Point3DId>(reconstruction.Points3D());
+  WriteBinary(&points_file, static_cast<std::uint64_t>(point_ids.size()));
+  for (const Point3DId point_id : point_ids) {
+    const Point3D& point = reconstruction.GetPoint3D(point_id);
+    WriteBinary(&points_file, static_cast<std::uint64_t>(point.id));
+    WriteBinary(&points_file, point.xyz.x());
+    WriteBinary(&points_file, point.xyz.y());
+    WriteBinary(&points_file, point.xyz.z());
+    WriteBinary(&points_file, point.color.x());
+    WriteBinary(&points_file, point.color.y());
+    WriteBinary(&points_file, point.color.z());
+    const double error =
+        Point3DTrackReprojectionError(reconstruction, point)
+            .value_or(point.reprojection_error);
+    WriteBinary(&points_file, error);
+    WriteBinary(&points_file,
+                static_cast<std::uint64_t>(point.track.elements.size()));
+    for (const TrackElement& element : point.track.elements) {
+      WriteBinary(&points_file, static_cast<std::uint32_t>(element.image_id));
+      WriteBinary(&points_file,
+                  static_cast<std::uint32_t>(element.point2d_idx));
+    }
+  }
+}
+
+void WriteColmapReconstruction(
+    const std::filesystem::path& model_path,
+    const Reconstruction& reconstruction,
+    const ColmapModelFormat format) {
+  switch (format) {
+    case ColmapModelFormat::kText:
+      WriteSparseReconstruction(model_path, reconstruction);
+      return;
+    case ColmapModelFormat::kBinary:
+      WriteColmapBinaryReconstruction(model_path, reconstruction);
+      return;
+    case ColmapModelFormat::kTextAndBinary:
+      WriteSparseReconstruction(model_path, reconstruction);
+      WriteColmapBinaryReconstruction(model_path, reconstruction);
+      return;
+    case ColmapModelFormat::kAuto:
+      throw std::invalid_argument(
+          "COLMAP auto format is valid for reading but not writing");
+  }
+  throw std::invalid_argument("Unknown COLMAP model format");
+}
+
+Reconstruction ReadColmapTextReconstruction(
+    const std::filesystem::path& model_path) {
+  Reconstruction reconstruction;
+  for (const std::string& line : DataLines(model_path / "cameras.txt")) {
+    std::istringstream stream(line);
+    Camera camera;
+    std::string model_name;
+    stream >> camera.id >> model_name >> camera.width >> camera.height;
+    camera.model_id = CameraModelNameToId(model_name);
+    double parameter = 0.0;
+    while (stream >> parameter) {
+      camera.params.push_back(parameter);
+    }
+    if (!camera.VerifyParams()) {
+      throw std::runtime_error("Invalid COLMAP camera entry: " + line);
+    }
+    reconstruction.AddCamera(std::move(camera));
+  }
+
+  for (const auto& [header_line, points_line] :
+       ColmapImageEntries(model_path / "images.txt")) {
+    std::istringstream header(header_line);
+    Image image;
+    Pose3 pose;
+    header >> image.id >> pose.q_cw.w() >> pose.q_cw.x() >> pose.q_cw.y() >>
+        pose.q_cw.z() >> pose.t_cw.x() >> pose.t_cw.y() >> pose.t_cw.z() >>
+        image.camera_id;
+    std::getline(header, image.name);
+    const std::size_t name_start = image.name.find_first_not_of(" \t");
+    if (name_start != std::string::npos) {
+      image.name.erase(0, name_start);
+    } else {
+      image.name.clear();
+    }
+    if (!header || !reconstruction.ExistsCamera(image.camera_id)) {
+      throw std::runtime_error("Invalid COLMAP image entry: " + header_line);
+    }
+    image.cam_from_world = pose;
+    image.registered = true;
+    std::istringstream points(points_line);
+    double x = 0.0;
+    double y = 0.0;
+    std::int64_t point3d_id = -1;
+    Point2DIdx point2d_idx = 0;
+    while (points >> x >> y >> point3d_id) {
+      image.points2d.push_back(
+          {Eigen::Vector2d(x, y), point2d_idx++,
+           ParsePoint3DId(point3d_id)});
+    }
+    reconstruction.AddImage(std::move(image));
+  }
+
+  for (const std::string& line : DataLines(model_path / "points3D.txt")) {
+    std::istringstream stream(line);
+    Point3D point;
+    int red = 0;
+    int green = 0;
+    int blue = 0;
+    stream >> point.id >> point.xyz.x() >> point.xyz.y() >> point.xyz.z() >>
+        red >> green >> blue >> point.reprojection_error;
+    if (!stream) {
+      throw std::runtime_error("Invalid COLMAP point entry: " + line);
+    }
+    point.color = Eigen::Matrix<std::uint8_t, 3, 1>(
+        static_cast<std::uint8_t>(red), static_cast<std::uint8_t>(green),
+        static_cast<std::uint8_t>(blue));
+    ImageId image_id = kInvalidImageId;
+    Point2DIdx point2d_idx = kInvalidPoint2DIdx;
+    while (stream >> image_id >> point2d_idx) {
+      point.track.AddElement(image_id, point2d_idx);
+    }
+    reconstruction.AddPoint3D(std::move(point));
+  }
+  return reconstruction;
+}
+
+Reconstruction ReadColmapBinaryReconstruction(
+    const std::filesystem::path& model_path) {
+  std::ifstream cameras_file(model_path / "cameras.bin", std::ios::binary);
+  std::ifstream images_file(model_path / "images.bin", std::ios::binary);
+  std::ifstream points_file(model_path / "points3D.bin", std::ios::binary);
+  if (!cameras_file || !images_file || !points_file) {
+    throw std::runtime_error("Failed to open complete COLMAP binary model: " +
+                             model_path.string());
+  }
+
+  Reconstruction reconstruction;
+  std::uint64_t num_cameras = 0;
+  ReadBinary(&cameras_file, &num_cameras);
+  for (std::uint64_t index = 0; index < num_cameras; ++index) {
+    Camera camera;
+    std::int32_t model_id = -1;
+    std::uint64_t width = 0;
+    std::uint64_t height = 0;
+    ReadBinary(&cameras_file, &camera.id);
+    ReadBinary(&cameras_file, &model_id);
+    ReadBinary(&cameras_file, &width);
+    ReadBinary(&cameras_file, &height);
+    if (width > std::numeric_limits<std::uint32_t>::max() ||
+        height > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::runtime_error("COLMAP binary camera dimensions overflow");
+    }
+    camera.model_id = static_cast<CameraModelId>(model_id);
+    camera.width = static_cast<std::uint32_t>(width);
+    camera.height = static_cast<std::uint32_t>(height);
+    if (!ExistsCameraModel(camera.model_id)) {
+      throw std::runtime_error("Unknown COLMAP binary camera model id: " +
+                               std::to_string(model_id));
+    }
+    camera.params.resize(GetCameraModelSpec(camera.model_id).param_names.size());
+    for (double& parameter : camera.params) {
+      ReadBinary(&cameras_file, &parameter);
+    }
+    if (!camera.VerifyParams()) {
+      throw std::runtime_error("Invalid COLMAP binary camera");
+    }
+    reconstruction.AddCamera(std::move(camera));
+  }
+
+  std::uint64_t num_images = 0;
+  ReadBinary(&images_file, &num_images);
+  for (std::uint64_t index = 0; index < num_images; ++index) {
+    Image image;
+    Pose3 pose;
+    ReadBinary(&images_file, &image.id);
+    ReadBinary(&images_file, &pose.q_cw.w());
+    ReadBinary(&images_file, &pose.q_cw.x());
+    ReadBinary(&images_file, &pose.q_cw.y());
+    ReadBinary(&images_file, &pose.q_cw.z());
+    ReadBinary(&images_file, &pose.t_cw.x());
+    ReadBinary(&images_file, &pose.t_cw.y());
+    ReadBinary(&images_file, &pose.t_cw.z());
+    ReadBinary(&images_file, &image.camera_id);
+    image.name = ReadNullTerminated(&images_file);
+    std::uint64_t num_points2d = 0;
+    ReadBinary(&images_file, &num_points2d);
+    if (num_points2d > std::numeric_limits<Point2DIdx>::max()) {
+      throw std::runtime_error("COLMAP binary image has too many 2D points");
+    }
+    image.points2d.reserve(static_cast<std::size_t>(num_points2d));
+    for (std::uint64_t point_index = 0; point_index < num_points2d;
+         ++point_index) {
+      Eigen::Vector2d xy;
+      Point3DId point3d_id = kInvalidPoint3DId;
+      ReadBinary(&images_file, &xy.x());
+      ReadBinary(&images_file, &xy.y());
+      ReadBinary(&images_file, &point3d_id);
+      image.points2d.push_back(
+          {xy, static_cast<Point2DIdx>(point_index), point3d_id});
+    }
+    if (!reconstruction.ExistsCamera(image.camera_id)) {
+      throw std::runtime_error(
+          "COLMAP binary image references a missing camera");
+    }
+    image.cam_from_world = pose;
+    image.registered = true;
+    reconstruction.AddImage(std::move(image));
+  }
+
+  std::uint64_t num_points3d = 0;
+  ReadBinary(&points_file, &num_points3d);
+  for (std::uint64_t index = 0; index < num_points3d; ++index) {
+    Point3D point;
+    ReadBinary(&points_file, &point.id);
+    ReadBinary(&points_file, &point.xyz.x());
+    ReadBinary(&points_file, &point.xyz.y());
+    ReadBinary(&points_file, &point.xyz.z());
+    ReadBinary(&points_file, &point.color.x());
+    ReadBinary(&points_file, &point.color.y());
+    ReadBinary(&points_file, &point.color.z());
+    ReadBinary(&points_file, &point.reprojection_error);
+    std::uint64_t track_length = 0;
+    ReadBinary(&points_file, &track_length);
+    point.track.elements.reserve(static_cast<std::size_t>(track_length));
+    for (std::uint64_t track_index = 0; track_index < track_length;
+         ++track_index) {
+      TrackElement element;
+      ReadBinary(&points_file, &element.image_id);
+      ReadBinary(&points_file, &element.point2d_idx);
+      point.track.elements.push_back(element);
+    }
+    reconstruction.AddPoint3D(std::move(point));
+  }
+  return reconstruction;
+}
+
+Reconstruction ReadColmapReconstruction(
+    const std::filesystem::path& model_path, ColmapModelFormat format) {
+  if (format == ColmapModelFormat::kAuto) {
+    format = DetectColmapModelFormat(model_path);
+  }
+  if (format == ColmapModelFormat::kText) {
+    return ReadColmapTextReconstruction(model_path);
+  }
+  if (format == ColmapModelFormat::kBinary) {
+    return ReadColmapBinaryReconstruction(model_path);
+  }
+  throw std::invalid_argument(
+      "Reading COLMAP model format 'both' is ambiguous; use auto, txt, or bin");
+}
+
+Reconstruction ReadWorkspaceReconstruction(
+    const std::filesystem::path& workspace_path,
+    const std::filesystem::path& input_model_path) {
+  const std::vector<Camera> workspace_cameras =
+      ReadWorkspaceCameras(workspace_path);
+  const std::vector<Image> workspace_images =
+      ReadWorkspaceImages(workspace_path);
+  if (input_model_path.empty()) {
+    Reconstruction reconstruction;
+    for (const Camera& camera : workspace_cameras) {
+      reconstruction.AddCamera(camera);
+    }
+    for (const Image& image : workspace_images) {
+      reconstruction.AddImage(image);
+    }
+    return reconstruction;
+  }
+
+  Reconstruction schema;
+  for (const Camera& camera : workspace_cameras) {
+    schema.AddCamera(camera);
+  }
+  for (const Image& image : workspace_images) {
+    schema.AddImage(image);
+  }
+  return ApplyColmapModel(schema, input_model_path);
+}
+
+Reconstruction ApplyColmapTextModel(
+    const Reconstruction& schema,
+    const std::filesystem::path& input_model_path) {
+  return ApplyColmapModel(schema, input_model_path,
+                          ColmapModelFormat::kText);
+}
+
+Reconstruction ApplyColmapModel(
+    const Reconstruction& schema,
+    const std::filesystem::path& input_model_path,
+    const ColmapModelFormat format) {
+  const Reconstruction model =
+      ReadColmapReconstruction(input_model_path, format);
+  std::map<std::string, ImageId> schema_image_ids;
+  for (const auto& [image_id, image] : schema.Images()) {
+    if (!schema_image_ids.emplace(image.name, image_id).second) {
+      throw std::runtime_error("Workspace contains duplicate image name: " +
+                               image.name);
+    }
+  }
+  std::map<ImageId, ImageId> model_to_schema_image;
+  std::map<CameraId, Camera> cameras;
+  std::map<CameraId, Camera> mapped_model_cameras;
+  for (const auto& [camera_id, camera] : schema.Cameras()) {
+    cameras.emplace(camera_id, camera);
+  }
+  for (const auto& [model_image_id, model_image] : model.Images()) {
+    const auto schema_id_it = schema_image_ids.find(model_image.name);
+    if (schema_id_it == schema_image_ids.end()) {
+      throw std::runtime_error(
+          "Input model image is absent from current image set: " +
+          model_image.name);
+    }
+    const Image& schema_image = schema.GetImage(schema_id_it->second);
+    const Camera& model_camera = model.GetCamera(model_image.camera_id);
+    Camera optimized_camera = model_camera;
+    optimized_camera.id = schema_image.camera_id;
+    const Camera& schema_camera = schema.GetCamera(schema_image.camera_id);
+    if (optimized_camera.model_id != schema_camera.model_id ||
+        optimized_camera.width != schema_camera.width ||
+        optimized_camera.height != schema_camera.height) {
+      throw std::runtime_error(
+          "Input model camera is incompatible with current image: " +
+          model_image.name);
+    }
+    const auto [mapped_it, inserted] = mapped_model_cameras.emplace(
+        schema_image.camera_id, optimized_camera);
+    if (!inserted &&
+        !CameraParametersEqual(mapped_it->second, optimized_camera)) {
+      throw std::runtime_error(
+          "Input model has incompatible intrinsics for images sharing "
+          "workspace camera " +
+          std::to_string(schema_image.camera_id));
+    }
+    cameras[schema_image.camera_id] = std::move(optimized_camera);
+    model_to_schema_image.emplace(model_image_id, schema_id_it->second);
+  }
+
+  Reconstruction reconstruction;
+  for (const auto& [camera_id, camera] : cameras) {
+    (void)camera_id;
+    reconstruction.AddCamera(camera);
+  }
+  std::map<ImageId, const Image*> model_images_by_schema_id;
+  for (const auto& [model_image_id, schema_image_id] :
+       model_to_schema_image) {
+    model_images_by_schema_id.emplace(
+        schema_image_id, &model.GetImage(model_image_id));
+  }
+  for (const auto& [image_id, schema_image] : schema.Images()) {
+    (void)image_id;
+    const auto model_image_it = model_images_by_schema_id.find(image_id);
+    if (model_image_it == model_images_by_schema_id.end()) {
+      reconstruction.AddImage(schema_image);
+      continue;
+    }
+    Image image = *model_image_it->second;
+    image.id = image_id;
+    image.camera_id = schema_image.camera_id;
+    image.file_path = schema_image.file_path;
+    image.prior_position = schema_image.prior_position;
+    reconstruction.AddImage(std::move(image));
+  }
+  if (reconstruction.RegisteredImageIds().size() !=
+      model.RegisteredImageIds().size()) {
+    throw std::runtime_error(
+        "Input model contains images outside the workspace");
+  }
+  for (const auto& [point_id, point] : model.Points3D()) {
+    (void)point_id;
+    Point3D remapped = point;
+    for (TrackElement& element : remapped.track.elements) {
+      element.image_id = model_to_schema_image.at(element.image_id);
+    }
+    reconstruction.AddPoint3D(std::move(remapped));
+  }
+  return reconstruction;
 }
 
 }  // namespace colite

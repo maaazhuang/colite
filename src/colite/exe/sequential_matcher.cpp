@@ -85,7 +85,10 @@ void PrintHelp(std::string_view executable,
       << "  --vocab_tree_sequential_overlap <n> Merge next-n temporal pairs; "
          "0 disables, default 2.\n"
       << "  --matcher <bf|flann|cuda> Descriptor matcher backend, default flann.\n"
-      << "  --max_ratio <r>          Lowe ratio, default 0.8.\n";
+      << "  --max_ratio <r>          Lowe ratio, default 0.8.\n"
+      << "  --guided_matching <0|1> Re-search descriptors under verified geometry, default 0.\n"
+      << "  --guided_match_ratio <r> Lowe ratio used by guided matching, default 0.8.\n"
+      << "  --guided_min_inlier_gain <n> Minimum guided inlier gain, default 10.\n";
 }
 
 std::string RequireValue(const std::vector<std::string>& args,
@@ -153,6 +156,14 @@ int RunMatcherCommand(const std::vector<std::string>& args,
             static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
       } else if (arg == "--max_ratio") {
         options.max_ratio = std::stod(RequireValue(args, &i, arg));
+      } else if (arg == "--guided_matching") {
+        options.guided_matching =
+            std::stoi(RequireValue(args, &i, arg)) != 0;
+      } else if (arg == "--guided_match_ratio") {
+        options.guided_match_ratio = std::stod(RequireValue(args, &i, arg));
+      } else if (arg == "--guided_min_inlier_gain") {
+        options.guided_min_inlier_gain = static_cast<std::size_t>(
+            std::stoull(RequireValue(args, &i, arg)));
       } else if (arg == "--matcher") {
         const std::string matcher = RequireValue(args, &i, arg);
         if (matcher == "bf") {
@@ -171,6 +182,10 @@ int RunMatcherCommand(const std::vector<std::string>& args,
     if (options.workspace_path.empty()) {
       throw std::invalid_argument("--workspace_path is required");
     }
+    if (options.guided_match_ratio <= 0.0 ||
+        options.guided_match_ratio > 1.0) {
+      throw std::invalid_argument("--guided_match_ratio must be in (0, 1]");
+    }
     const auto summary =
         controllers::SequentialMatcherController(options).Run();
     out << "Pairs: " << summary.num_pairs << "\n"
@@ -180,6 +195,8 @@ int RunMatcherCommand(const std::vector<std::string>& args,
         << "\n"
         << "Verified pairs: " << summary.num_verified_pairs << "\n"
         << "Verified inliers: " << summary.num_verified_inliers << "\n"
+        << "Guided improved pairs: "
+        << summary.guided_matching.num_improved_pairs << "\n"
         << "Retrieval pairs: "
         << summary.pair_generation.num_retrieval_pairs << "\n"
         << "Sequential guard pairs: "

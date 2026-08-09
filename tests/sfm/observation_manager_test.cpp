@@ -97,7 +97,7 @@ TEST(ObservationManagerTest, MergesPointsAndReassignsSourceTrack) {
               1e-12);
 }
 
-TEST(ObservationManagerTest, MergesDistinctFeaturesFromSameImageLikeColmap) {
+TEST(ObservationManagerTest, ResolvesDistinctFeaturesFromSameImage) {
   Reconstruction reconstruction;
   reconstruction.AddCamera(MakeCamera());
   Image image = MakeImage(1);
@@ -120,9 +120,12 @@ TEST(ObservationManagerTest, MergesDistinctFeaturesFromSameImageLikeColmap) {
 
   EXPECT_TRUE(reconstruction.ExistsPoint3D(target_point3d_id));
   EXPECT_FALSE(reconstruction.ExistsPoint3D(source_point3d_id));
-  EXPECT_EQ(reconstruction.GetPoint3D(target_point3d_id).track.Length(), 2U);
-  EXPECT_EQ(reconstruction.GetImage(1).points2d[1].point3d_id,
-            target_point3d_id);
+  EXPECT_EQ(reconstruction.GetPoint3D(target_point3d_id).track.Length(), 1U);
+  const bool first_selected =
+      reconstruction.GetImage(1).points2d[0].point3d_id == target_point3d_id;
+  const bool second_selected =
+      reconstruction.GetImage(1).points2d[1].point3d_id == target_point3d_id;
+  EXPECT_NE(first_selected, second_selected);
 }
 
 TEST(ObservationManagerTest, MergesDuplicateFeaturesAtNearlySamePixel) {
@@ -148,11 +151,12 @@ TEST(ObservationManagerTest, MergesDuplicateFeaturesAtNearlySamePixel) {
 
   EXPECT_TRUE(reconstruction.ExistsPoint3D(target_point3d_id));
   EXPECT_FALSE(reconstruction.ExistsPoint3D(source_point3d_id));
-  EXPECT_EQ(reconstruction.GetImage(1).points2d[0].point3d_id,
-            target_point3d_id);
-  EXPECT_EQ(reconstruction.GetImage(1).points2d[1].point3d_id,
-            target_point3d_id);
-  EXPECT_EQ(reconstruction.GetPoint3D(target_point3d_id).track.Length(), 2U);
+  EXPECT_EQ(reconstruction.GetPoint3D(target_point3d_id).track.Length(), 1U);
+  const bool first_selected =
+      reconstruction.GetImage(1).points2d[0].point3d_id == target_point3d_id;
+  const bool second_selected =
+      reconstruction.GetImage(1).points2d[1].point3d_id == target_point3d_id;
+  EXPECT_NE(first_selected, second_selected);
 }
 
 }  // namespace colite

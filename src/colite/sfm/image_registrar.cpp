@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <optional>
@@ -12,6 +13,7 @@
 #include <Eigen/SVD>
 
 #include "colite/core/geometry.h"
+#include "colite/sfm/observation_manager.h"
 
 #ifdef COLITE_HAS_POSELIB
 #include <PoseLib/solvers/p3p.h>
@@ -402,28 +404,37 @@ void LinkInlierCorrespondencesToImage(
     const std::vector<PnPCorrespondence>& correspondences,
     const std::vector<std::size_t>& inlier_indices,
     Reconstruction* reconstruction) {
-  Image& image = reconstruction->GetImage(image_id);
+  const Image& image = reconstruction->GetImage(image_id);
+  const Camera& camera = reconstruction->GetCamera(image.camera_id);
+  std::map<Point3DId, std::pair<std::size_t, double>> best_by_point;
   for (const std::size_t correspondence_idx : inlier_indices) {
     const PnPCorrespondence& correspondence =
         correspondences[correspondence_idx];
-    Point2D& point2d = image.points2d[correspondence.point2d_idx];
-    if (point2d.HasPoint3D()) {
+    if (correspondence.point2d_idx >= image.points2d.size() ||
+        !reconstruction->ExistsPoint3D(correspondence.point3d_id)) {
       continue;
     }
-    point2d.point3d_id = correspondence.point3d_id;
+    const double error =
+        ReprojectionError(
+            camera, *image.cam_from_world,
+            reconstruction->GetPoint3D(correspondence.point3d_id).xyz,
+            image.points2d[correspondence.point2d_idx].xy)
+            .value_or(std::numeric_limits<double>::infinity());
+    const auto best_it = best_by_point.find(correspondence.point3d_id);
+    if (best_it == best_by_point.end() || error < best_it->second.second ||
+        (error == best_it->second.second &&
+         correspondence.point2d_idx <
+             correspondences[best_it->second.first].point2d_idx)) {
+      best_by_point[correspondence.point3d_id] = {correspondence_idx, error};
+    }
+  }
 
-    Point3D& point3d = reconstruction->GetPoint3D(correspondence.point3d_id);
-    bool already_has_observation = false;
-    for (const TrackElement& element : point3d.track.elements) {
-      if (element.image_id == image_id &&
-          element.point2d_idx == correspondence.point2d_idx) {
-        already_has_observation = true;
-        break;
-      }
-    }
-    if (!already_has_observation) {
-      point3d.track.AddElement(image_id, correspondence.point2d_idx);
-    }
+  ObservationManager observation_manager(reconstruction);
+  for (const auto& [point3d_id, selected] : best_by_point) {
+    const PnPCorrespondence& correspondence =
+        correspondences[selected.first];
+    observation_manager.AddObservation(point3d_id, image_id,
+                                       correspondence.point2d_idx);
   }
 }
 

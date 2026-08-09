@@ -363,7 +363,8 @@ std::vector<std::filesystem::path> ListImageFiles(
   }
 
   std::vector<std::filesystem::path> image_paths;
-  for (const auto& entry : std::filesystem::directory_iterator(image_dir)) {
+  for (const auto& entry :
+       std::filesystem::recursive_directory_iterator(image_dir)) {
     if (entry.is_regular_file() && IsSupportedImageExtension(entry.path())) {
       image_paths.push_back(entry.path());
     }

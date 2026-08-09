@@ -25,10 +25,33 @@ struct SourceImageAccumulator {
   std::size_t num_shared_points = 0;
   double angle_sum_degrees = 0.0;
   std::size_t num_scored_angles = 0;
+  std::vector<double> triangulation_angles_degrees;
   double scale_ratio_sum = 0.0;
   std::size_t num_scored_scale_ratios = 0;
   std::unordered_set<std::size_t> occupied_target_grid_cells;
 };
+
+double Percentile(std::vector<double> values, double percentile) {
+  if (values.empty()) {
+    return 0.0;
+  }
+  const double index =
+      percentile / 100.0 * static_cast<double>(values.size() - 1);
+  const std::size_t left_index =
+      static_cast<std::size_t>(std::floor(index));
+  const std::size_t right_index =
+      static_cast<std::size_t>(std::ceil(index));
+  std::nth_element(values.begin(), values.begin() + right_index,
+                   values.end());
+  const double right = values[right_index];
+  if (left_index == right_index) {
+    return right;
+  }
+  const double left =
+      *std::max_element(values.begin(), values.begin() + right_index);
+  return (static_cast<double>(right_index) - index) * left +
+         (index - static_cast<double>(left_index)) * right;
+}
 
 double AngleDegreesBetween(const Eigen::Vector3d& lhs,
                            const Eigen::Vector3d& rhs) {
@@ -179,6 +202,9 @@ std::vector<SourceImageScore> SelectSourceImages(
 
       const double angle_degrees = ComputeTrackTriangulationAngleDegrees(
           reconstruction, target_image_id, source_image_id, point3d.xyz);
+      if (std::isfinite(angle_degrees)) {
+        accumulator.triangulation_angles_degrees.push_back(angle_degrees);
+      }
       if (angle_degrees >= options.min_triangulation_angle_degrees &&
           angle_degrees <= options.max_triangulation_angle_degrees) {
         accumulator.angle_sum_degrees += angle_degrees;
@@ -204,10 +230,18 @@ std::vector<SourceImageScore> SelectSourceImages(
   std::vector<SourceImageScore> scores;
   scores.reserve(source_accumulators.size());
   for (const auto& [image_id, accumulator] : source_accumulators) {
-    if (accumulator.num_shared_points >= options.min_num_shared_points) {
+    const double angle_percentile =
+        Percentile(accumulator.triangulation_angles_degrees,
+                   options.triangulation_angle_percentile);
+    const bool passes_colmap_angle_gate =
+        options.source_selection_mode != SourceSelectionMode::kColmap ||
+        angle_percentile >= options.min_triangulation_angle_degrees;
+    if (accumulator.num_shared_points >= options.min_num_shared_points &&
+        passes_colmap_angle_gate) {
       SourceImageScore score;
       score.image_id = image_id;
       score.num_shared_points = accumulator.num_shared_points;
+      score.triangulation_angle_percentile_degrees = angle_percentile;
       if (accumulator.num_scored_angles > 0) {
         score.mean_triangulation_angle_degrees =
             accumulator.angle_sum_degrees /
@@ -224,10 +258,14 @@ std::vector<SourceImageScore> SelectSourceImages(
             static_cast<double>(options.coverage_grid_size *
                                 options.coverage_grid_size);
       }
-      score.score =
-          ScoreSourceView(score.mean_triangulation_angle_degrees,
-                          score.num_shared_points, score.mean_scale_ratio,
-                          score.coverage_score, options);
+      if (options.source_selection_mode == SourceSelectionMode::kColmap) {
+        score.score = static_cast<double>(score.num_shared_points);
+      } else {
+        score.score =
+            ScoreSourceView(score.mean_triangulation_angle_degrees,
+                            score.num_shared_points, score.mean_scale_ratio,
+                            score.coverage_score, options);
+      }
       scores.push_back(score);
     }
   }

@@ -9,6 +9,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -760,8 +761,9 @@ bool IsCompleteFusionPixel(const StereoFusionViewData& view_data,
        !view_data.cost_map.IsValid(row, col))) {
     return false;
   }
-  if (options.require_consistency_graph ||
-      !view_data.consistency_graph.Empty()) {
+  if (!options.prefer_fallback_source_images &&
+      (options.require_consistency_graph ||
+       !view_data.consistency_graph.Empty())) {
     if (view_data.consistency_graph.Count(row, col) <
         options.min_num_consistent_sources) {
       return false;
@@ -2223,6 +2225,12 @@ MultiSourcePatchMatchCost ComputeMultiSourcePlaneHypothesisCost(
 
   std::vector<float> valid_costs;
   valid_costs.reserve(source_views.size());
+  std::vector<float> geometric_errors;
+  geometric_errors.reserve(source_views.size());
+  PatchMatchCostOptions source_cost_options = options;
+  if (options.robust_geometric_aggregation) {
+    source_cost_options.geometric_consistency_weight = 0.0F;
+  }
   for (std::size_t i = 0; i < source_views.size(); ++i) {
     const DenseDepthMap* source_depth_map =
         source_depth_maps == nullptr ? nullptr : &source_depth_maps->at(i);
@@ -2230,9 +2238,20 @@ MultiSourcePatchMatchCost ComputeMultiSourcePlaneHypothesisCost(
         ComputePlaneHypothesisCost(reference_view, source_views[i],
                                    reference_image, source_images[i],
                                    reference_xy, depth, reference_normal,
-                                   options, source_depth_map);
+                                   source_cost_options, source_depth_map);
     if (cost.valid) {
       valid_costs.push_back(cost.cost);
+    }
+    if (options.robust_geometric_aggregation && source_depth_map != nullptr &&
+        options.geometric_consistency_weight > 0.0F) {
+      const std::optional<float> reprojection_error =
+          ComputeSourceDepthReprojectionError(
+              reference_view, source_views[i], reference_xy, depth,
+              *source_depth_map);
+      if (reprojection_error.has_value()) {
+        geometric_errors.push_back(std::min(
+            options.geometric_max_reprojection_error, *reprojection_error));
+      }
     }
   }
 
@@ -2256,6 +2275,22 @@ MultiSourcePatchMatchCost ComputeMultiSourcePlaneHypothesisCost(
   result.valid = true;
   result.num_used_sources = num_used;
   result.cost = static_cast<float>(total_cost / static_cast<double>(num_used));
+  if (options.robust_geometric_aggregation && source_depth_maps != nullptr &&
+      options.geometric_consistency_weight > 0.0F) {
+    float geometric_cost = options.geometric_max_reprojection_error;
+    if (!geometric_errors.empty()) {
+      std::sort(geometric_errors.begin(), geometric_errors.end());
+      const std::size_t num_geometric_used =
+          std::max<std::size_t>(1, (geometric_errors.size() + 1) / 2);
+      geometric_cost = std::accumulate(
+                           geometric_errors.begin(),
+                           geometric_errors.begin() + num_geometric_used,
+                           0.0F) /
+                       static_cast<float>(num_geometric_used);
+    }
+    result.cost +=
+        0.5F * options.geometric_consistency_weight * geometric_cost;
+  }
   return result;
 }
 
@@ -2734,6 +2769,79 @@ PatchMatchNormalRefinementSummary RefineNormalMapFromDepth(
     }
   }
   return summary;
+}
+
+std::size_t OrientNormalMapTowardsCamera(
+    const PatchMatchView& reference_view,
+    NormalMap* normal_map) {
+  if (normal_map == nullptr) {
+    throw std::invalid_argument(
+        "Normal orientation requires a non-null normal map.");
+  }
+  if (reference_view.camera.width == 0 ||
+      reference_view.camera.height == 0) {
+    throw std::invalid_argument(
+        "Normal orientation requires non-zero camera dimensions.");
+  }
+  Camera camera = reference_view.camera;
+  if (normal_map->Width() != camera.width ||
+      normal_map->Height() != camera.height) {
+    camera = ScaleCameraForPyramidLevel(
+        camera,
+        static_cast<double>(normal_map->Width()) /
+            static_cast<double>(camera.width),
+        static_cast<double>(normal_map->Height()) /
+            static_cast<double>(camera.height),
+        normal_map->Width(), normal_map->Height());
+  }
+
+  const bool pinhole =
+      (camera.model_id == CameraModelId::kPinhole &&
+       camera.params.size() >= 4) ||
+      (camera.model_id == CameraModelId::kSimplePinhole &&
+       camera.params.size() >= 3);
+  double fx = 1.0;
+  double fy = 1.0;
+  double cx = 0.0;
+  double cy = 0.0;
+  if (pinhole) {
+    fx = camera.params[0];
+    if (camera.model_id == CameraModelId::kPinhole) {
+      fy = camera.params[1];
+      cx = camera.params[2];
+      cy = camera.params[3];
+    } else {
+      fy = fx;
+      cx = camera.params[1];
+      cy = camera.params[2];
+    }
+  }
+
+  std::size_t num_flipped = 0;
+  for (std::size_t row = 0; row < normal_map->Height(); ++row) {
+    for (std::size_t col = 0; col < normal_map->Width(); ++col) {
+      if (!normal_map->IsValid(row, col)) {
+        continue;
+      }
+      const Eigen::Vector3d view_ray =
+          pinhole
+              ? Eigen::Vector3d(
+                    (static_cast<double>(col) - cx) / fx,
+                    (static_cast<double>(row) - cy) / fy, 1.0)
+              : UnprojectPixel(
+                    camera,
+                    Eigen::Vector2d(static_cast<double>(col),
+                                    static_cast<double>(row)),
+                    1.0);
+      const Eigen::Vector3f normal = normal_map->Get(row, col);
+      if (view_ray.allFinite() &&
+          normal.cast<double>().dot(view_ray) > 0.0) {
+        normal_map->Set(row, col, -normal);
+        ++num_flipped;
+      }
+    }
+  }
+  return num_flipped;
 }
 
 PatchMatchStereoResult RunPatchMatchStereoForImageSingleScale(
@@ -3279,6 +3387,43 @@ RunPatchMatchStereoForImageWithSourceDepthsAndCudaWorkspace(
       cuda_workspace);
 }
 
+PatchMatchStereoResult
+RunPatchMatchStereoForImageWithSourceDepthPointersAndCudaWorkspace(
+    const PatchMatchView& reference_view,
+    const std::vector<PatchMatchView>& source_views,
+    const MvsImage& reference_image,
+    const std::vector<MvsImage>& source_images,
+    const std::vector<const DenseDepthMap*>& source_depth_maps,
+    float depth_min,
+    float depth_max,
+    CudaPatchMatchWorkspace* cuda_workspace,
+    const PatchMatchStereoOptions& options,
+    const PatchMatchMaps* initial_maps) {
+  CudaPatchMatchRequest request;
+  request.reference_view = &reference_view;
+  request.source_views = &source_views;
+  request.reference_image = &reference_image;
+  request.source_images = &source_images;
+  request.source_depth_map_ptrs = &source_depth_maps;
+  request.initial_maps = initial_maps;
+  request.depth_min = depth_min;
+  request.depth_max = depth_max;
+  request.options = options;
+  request.workspace = cuda_workspace;
+  std::string unavailable_reason;
+  std::optional<PatchMatchStereoResult> result =
+      RunCudaPatchMatchStereo(request, &unavailable_reason);
+  if (!result.has_value()) {
+    throw std::runtime_error(
+        unavailable_reason.empty()
+            ? "CUDA PatchMatch backend is unavailable."
+            : unavailable_reason);
+  }
+  result->summary.requested_backend = options.backend;
+  result->summary.actual_backend = PatchMatchBackend::kCuda;
+  return std::move(*result);
+}
+
 PatchMatchPhotometricStats ComputePatchMatchPhotometricStats(
     const DenseCostMap& cost_map) {
   PatchMatchPhotometricStats stats;
@@ -3663,12 +3808,8 @@ StereoFusionResult FuseStereoDepthMapsWithViewCache(
     widths[image_idx] = view_data->depth_map.Width();
     heights[image_idx] = view_data->depth_map.Height();
     num_pixels[image_idx] = view_data->depth_map.NumPixels();
-    for (std::size_t row = 0; row < heights[image_idx]; ++row) {
-      for (std::size_t col = 0; col < widths[image_idx]; ++col) {
-        result.summary.num_depth_pixels +=
-            view_data->depth_map.IsValid(row, col) ? 1 : 0;
-      }
-    }
+    result.summary.num_depth_pixels +=
+        view_data->depth_map.ValidPixelCount();
     image_idx_by_id[views[image_idx].image_id] = image_idx;
     if (!dense_image_idx_by_id.empty()) {
       dense_image_idx_by_id[views[image_idx].image_id] = image_idx;
@@ -3805,12 +3946,17 @@ StereoFusionResult FuseStereoDepthMapsWithViewCache(
                 const std::shared_ptr<const StereoFusionViewData>
                     current_view_data =
                         load_task_view(current.image_idx);
-                if (current_view_data->consistency_graph.Empty()) {
-                  continue;
+                ConsistencyGraph::ImageIdRange source_image_ids;
+                if (options.prefer_fallback_source_images ||
+                    current_view_data->consistency_graph.Empty()) {
+                  source_image_ids = ConsistencyGraph::ImageIdRange(
+                      current_view_data->fallback_source_image_ids.data(),
+                      current_view_data->fallback_source_image_ids.size());
+                } else {
+                  source_image_ids =
+                      current_view_data->consistency_graph.SourceImageIds(
+                          current.row, current.col);
                 }
-                const ConsistencyGraph::ImageIdRange source_image_ids =
-                    current_view_data->consistency_graph.SourceImageIds(
-                        current.row, current.col);
                 for (const ImageId source_image_id : source_image_ids) {
                   const std::size_t source_idx =
                       find_image_idx(source_image_id);
