@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -35,6 +36,8 @@ struct SfmCameraSetup {
   std::vector<Camera> cameras;
   std::vector<Image> images;
   std::vector<InitialFocalLengthEstimate> focal_estimates;
+  std::optional<GeodeticCoordinate> gps_origin;
+  std::size_t num_position_priors = 0;
 };
 
 std::vector<double> ParseCameraParams(std::string_view value);

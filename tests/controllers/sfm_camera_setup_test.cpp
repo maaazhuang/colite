@@ -51,6 +51,9 @@ TEST(SfmCameraSetupTest, IndividualModeReadsExifForEveryImage) {
   const std::filesystem::path exif_image =
       std::filesystem::path(COLITE_SOURCE_DIR) / "data" / "building-18" /
       "P1180166.JPG";
+  if (!std::filesystem::exists(exif_image)) {
+    GTEST_SKIP() << "Local building-18 dataset is not available.";
+  }
   const std::filesystem::path no_exif_image = root / "without_exif.png";
   const cv::Mat decoded =
       cv::imread(exif_image.string(), cv::IMREAD_COLOR);
@@ -140,6 +143,9 @@ TEST(SfmCameraSetupTest, AutoGroupsCompleteMatchingExifIdentity) {
   const std::filesystem::path source =
       std::filesystem::path(COLITE_SOURCE_DIR) / "data" / "building-18" /
       "P1180166.JPG";
+  if (!std::filesystem::exists(source)) {
+    GTEST_SKIP() << "Local building-18 dataset is not available.";
+  }
   const std::filesystem::path image1 = root / "image1.JPG";
   const std::filesystem::path image2 = root / "image2.JPG";
   std::filesystem::copy_file(source, image1);
@@ -196,6 +202,19 @@ TEST(SfmCameraSetupTest, AppliesExplicitModelParameters) {
   EXPECT_EQ(setup.cameras[0].model_id, CameraModelId::kOpenCV);
   EXPECT_EQ(setup.cameras[0].params, options.camera_params);
   EXPECT_TRUE(setup.cameras[0].has_prior_focal_length);
+}
+
+TEST(SfmCameraSetupTest, ConvertsGeodeticCoordinatesToLocalEnu) {
+  const GeodeticCoordinate origin{46.65, 6.53, 780.0};
+  const GeodeticCoordinate east{46.65, 6.531, 780.0};
+  const GeodeticCoordinate north{46.651, 6.53, 780.0};
+  const Eigen::Vector3d east_enu = GeodeticToLocalEnu(east, origin);
+  const Eigen::Vector3d north_enu = GeodeticToLocalEnu(north, origin);
+
+  EXPECT_GT(east_enu.x(), 70.0);
+  EXPECT_LT(std::abs(east_enu.y()), 1.0);
+  EXPECT_GT(north_enu.y(), 100.0);
+  EXPECT_LT(std::abs(north_enu.x()), 1.0);
 }
 
 }  // namespace

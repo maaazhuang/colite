@@ -351,5 +351,47 @@ TEST(GlobalBundleAdjusterTest, SupportsEveryRegisteredCameraModel) {
   }
 }
 
+TEST(GlobalBundleAdjusterTest, PositionPriorsAnchorSimilarityGauge) {
+  const Camera camera = MakeCamera();
+  const std::vector<Eigen::Vector3d> points = MakeScenePoints();
+  const std::vector<Eigen::Vector3d> centers = {
+      {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0},
+      {0.35, 0.15, 0.0}, {0.75, -0.2, 0.0}};
+  const Eigen::Vector3d offset(8.0, -5.0, 3.0);
+  Reconstruction reconstruction;
+  reconstruction.AddCamera(camera);
+  for (std::size_t idx = 0; idx < centers.size(); ++idx) {
+    const Pose3 true_pose = CameraAt(centers[idx]);
+    Image image = MakeRegisteredImage(idx + 1, CameraAt(centers[idx] + offset));
+    image.prior_position = centers[idx];
+    AddImageObservations(camera, true_pose, &image, points);
+    reconstruction.AddImage(std::move(image));
+  }
+  for (std::size_t point_idx = 0; point_idx < points.size(); ++point_idx) {
+    Track track;
+    for (ImageId image_id = 1; image_id <= centers.size(); ++image_id) {
+      track.AddElement(image_id, point_idx);
+    }
+    reconstruction.AddPoint3D(points[point_idx] + offset, std::move(track));
+  }
+
+  GlobalBundleAdjustmentOptions options;
+  options.max_num_iterations = 50;
+  options.loss_scale = 0.0;
+  options.gauge_fixing = BundleGaugeFixing::kNone;
+  options.use_position_priors = true;
+  options.position_prior_stddev = 0.5;
+  options.position_prior_loss_scale = 0.0;
+  const GlobalBundleAdjustmentSummary summary =
+      AdjustGlobalBundle(options, &reconstruction);
+
+  ASSERT_TRUE(summary.success);
+  EXPECT_EQ(summary.num_position_priors, centers.size());
+  EXPECT_GT(summary.initial_mean_position_error, 5.0);
+  EXPECT_LT(summary.final_mean_position_error,
+            summary.initial_mean_position_error * 0.05);
+  EXPECT_LT(summary.final_mean_reprojection_error, 0.05);
+}
+
 }  // namespace
 }  // namespace colite

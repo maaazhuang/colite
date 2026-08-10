@@ -1,3 +1,12 @@
+/*
+ * Portions adapted from VLFeat SIFT.
+ * Copyright (C) 2007-11, Andrea Vedaldi and Brian Fulkerson
+ * Copyright (C) 2012-13, The VLFeat Team
+ *
+ * VLFeat is distributed under the BSD 2-Clause License. The complete notice
+ * and disclaimer are retained in THIRD_PARTY_NOTICES.md.
+ */
+
 #define COLITE_VLFEAT_IMPLEMENTATION 1
 #include "sift_vlfeat.h"
 #if defined(COLITE_VLFEAT_ENABLE_PARALLEL) && defined(__cplusplus)

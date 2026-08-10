@@ -33,6 +33,30 @@ struct Observation {
   Eigen::Vector2d xy = Eigen::Vector2d::Zero();
 };
 
+struct PositionPriorCost {
+  PositionPriorCost(Eigen::Vector3d position, double inverse_stddev)
+      : position_(std::move(position)), inverse_stddev_(inverse_stddev) {}
+
+  template <typename T>
+  bool operator()(const T* const q_xyzw,
+                  const T* const translation,
+                  T* residuals) const {
+    const Eigen::Quaternion<T> rotation(q_xyzw[3], q_xyzw[0], q_xyzw[1],
+                                        q_xyzw[2]);
+    const Eigen::Matrix<T, 3, 1> t(translation[0], translation[1],
+                                   translation[2]);
+    const Eigen::Matrix<T, 3, 1> center = rotation.conjugate() * (-t);
+    for (int idx = 0; idx < 3; ++idx) {
+      residuals[idx] =
+          (center[idx] - T(position_[idx])) * T(inverse_stddev_);
+    }
+    return true;
+  }
+
+  Eigen::Vector3d position_;
+  double inverse_stddev_ = 1.0;
+};
+
 bool ProjectWithParams(CameraModelId model_id,
                        const double* params,
                        const Eigen::Vector3d& point_camera,
@@ -422,6 +446,24 @@ double MeanReprojectionError(const Reconstruction& reconstruction,
   return num_errors == 0 ? -1.0 : total_error / static_cast<double>(num_errors);
 }
 
+double MeanPositionPriorError(const Reconstruction& reconstruction,
+                              std::size_t* num_priors) {
+  double total_error = 0.0;
+  std::size_t count = 0;
+  for (const ImageId image_id : reconstruction.RegisteredImageIds()) {
+    const Image& image = reconstruction.GetImage(image_id);
+    if (!image.cam_from_world.has_value() ||
+        !image.prior_position.has_value()) {
+      continue;
+    }
+    total_error +=
+        (image.cam_from_world->CameraCenter() - *image.prior_position).norm();
+    ++count;
+  }
+  if (num_priors != nullptr) *num_priors = count;
+  return count == 0 ? -1.0 : total_error / static_cast<double>(count);
+}
+
 }  // namespace
 
 GlobalBundleAdjustmentSummary AdjustGlobalBundle(
@@ -438,6 +480,8 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
   summary.num_residuals = observations.size();
   summary.initial_mean_reprojection_error =
       MeanReprojectionError(*reconstruction, observations);
+  summary.initial_mean_position_error =
+      MeanPositionPriorError(*reconstruction, &summary.num_position_priors);
   if (reconstruction->RegisteredImageIds().empty() ||
       reconstruction->Points3D().empty() || observations.empty()) {
     summary.message = "Global bundle has no observations";
@@ -556,6 +600,29 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
         camera_blocks.at(image.camera_id).data());
   }
 
+  if (options.use_position_priors) {
+    if (!std::isfinite(options.position_prior_stddev) ||
+        options.position_prior_stddev <= 0.0) {
+      summary.message = "Position prior standard deviation must be positive";
+      return summary;
+    }
+    for (const auto& [image_id, block] : pose_blocks) {
+      const Image& image = reconstruction->GetImage(image_id);
+      if (!image.prior_position.has_value()) continue;
+      ceres::LossFunction* loss =
+          options.position_prior_loss_scale > 0.0
+              ? new ceres::HuberLoss(options.position_prior_loss_scale /
+                                     options.position_prior_stddev)
+              : nullptr;
+      problem.AddResidualBlock(
+          new ceres::AutoDiffCostFunction<PositionPriorCost, 3, 4, 3>(
+              new PositionPriorCost(*image.prior_position,
+                                    1.0 / options.position_prior_stddev)),
+          loss, pose_blocks.at(image_id).q_xyzw,
+          pose_blocks.at(image_id).t);
+    }
+  }
+
   ceres::Solver::Options solver_options;
   solver_options.max_num_iterations = options.max_num_iterations;
   solver_options.linear_solver_type = ceres::SPARSE_SCHUR;
@@ -578,6 +645,8 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
 
   summary.final_mean_reprojection_error =
       MeanReprojectionError(*reconstruction, observations);
+  summary.final_mean_position_error =
+      MeanPositionPriorError(*reconstruction, nullptr);
   summary.success = solver_summary.IsSolutionUsable();
   summary.message = solver_summary.BriefReport();
   return summary;

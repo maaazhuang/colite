@@ -9,6 +9,6 @@ __pycache__/
 CMakeUserPresets.json
 /references/
 output/
-/data/house/
-/data/building-18/1.ini
+/data/
+/*.log
 /thirdparty/vcglib/

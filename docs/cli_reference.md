@@ -23,6 +23,14 @@ $COLITE <command> --help
 | `vocab_tree_matcher` | workspace、可选词树 | 检索候选匹配和几何 |
 | `mapper` | 已匹配 workspace | 稀疏模型和带 RGB PLY |
 | `compare_colmap` | 两个 COLMAP 模型 | Sim(3) 位姿/结构差异报告 |
+| `model_analyzer` | COLMAP 稀疏模型 | 相机、图像、点、观测、track、误差和边界统计 |
+| `model_transformer` | 稀疏模型、3×4/4×4 矩阵 | 应用 Sim(3) 并写兼容模型 |
+| `model_aligner` | 稀疏模型、按图像名 XYZ | 鲁棒位置对齐 |
+| `model_cropper` | 稀疏模型、三维边界 | 裁剪点及其反向观测 |
+| `model_splitter` | 稀疏模型 | 按 track 连通分量输出多个模型 |
+| `bundle_adjuster` | 稀疏模型 | 独立全局 BA，可选位置先验 |
+| `point_triangulator` | workspace、已有模型 | 独立重三角化、complete/merge |
+| `image_registrator` | workspace、已有模型 | 独立注册指定或全部未注册图像 |
 | `recon_sfm` | 原图 | 完整稀疏重建 |
 | `image_undistorter` | 原图、稀疏模型 | 去畸变 MVS workspace |
 | `patch_match_stereo` | 去畸变 workspace | 深度、法线、代价、一致性图 |
@@ -43,6 +51,15 @@ $COLITE <command> --help
 - `--dry_run`：只打印执行计划。
 
 manifest 位于输出根的 `.colite/stages/<stage>.json`。
+
+## 全局日志参数
+
+所有独立程序和 `colite <command>` 统一支持 `--log_dir <dir>`、
+`--log_level INFO|WARNING|ERROR|FATAL`、`--log_to_stderr <0|1>` 与
+`--v <n>`。参数会在子命令解析前移除，因此可放在命令参数任意位置。未指定
+`log_dir` 时默认写 stderr，便于测试目录重定向保留；指定目录后默认写 glog
+滚动文件。INFO 记录阶段开始、缓存命中、核心数量/后端、耗时和结束状态，
+逐图细节只在 `--v 1` 或更高等级输出。
 
 ## SfM 单步骤
 
@@ -180,6 +197,12 @@ $COLITE recon_sfm \
 - `--ba_refine_focal_length`、`--ba_refine_extra_params` 默认 1，与 COLMAP
   增量 Mapper 一致；`--ba_refine_principal_point` 默认 0。
 - `--ba_refine_params <fx,fy,k1,...>` 按名称指定内参优化。
+- `--use_position_priors 1` 从 JPEG EXIF GPS 读取 WGS84 坐标，以全组中位坐标
+  为原点转换为米制 ENU；每个稀疏模型先用至少 3 个已注册相机中心执行 Sim(3)
+  对齐，再在最终全局 BA 中加入鲁棒位置残差。默认关闭以保持无 GPS 数据的旧
+  行为。`--position_prior_stddev` 默认 5 m，
+  `--position_prior_loss_scale` 默认 2 m，
+  `--position_prior_alignment_max_error` 默认 20 m。
 - `--input_model_path <dir>` 从已有 COLMAP text model 继续注册；完整 `recon_sfm`
   会重新计算前端特征/匹配，若只需复用已有前端结果，优先使用分阶段 `mapper`。
 - `--multiple_models 0|1`、`--merge_models 0|1` 默认均为 1；
@@ -193,6 +216,31 @@ diagnostics 和 summary。最大模型位于输出根目录，全部模型位于
 特征/匹配/内点数量，以及各流程耗时。当前 CUDA 后端加速首轮全局 BF；极线
 走廊 guided 重搜索仍走 CPU。`recon_auto` 通过 `--sfm.<option>` 转发上述
 相机模型、参数和分组策略。
+
+## 稀疏模型维护与独立 SfM 内核
+
+所有模型命令读取 `--input_format auto|txt|bin`，写出
+`--output_format txt|bin|both`（默认 both），保持 COLMAP 模型兼容。
+
+```bash
+$COLITE model_analyzer --input_path sparse/0
+$COLITE model_transformer --input_path sparse/0 --output_path transformed \
+  --transform_path sim3.txt
+$COLITE model_aligner --input_path sparse/0 --output_path aligned \
+  --ref_images_path positions.txt --max_error 20
+$COLITE model_cropper --input_path sparse/0 --output_path cropped \
+  --min "-10,-10,-2" --max "10,10,20"
+$COLITE model_splitter --input_path sparse/0 --output_path split
+$COLITE bundle_adjuster --input_path sparse/0 --output_path ba
+$COLITE point_triangulator --workspace_path workspace \
+  --input_path sparse/0 --output_path triangulated
+$COLITE image_registrator --workspace_path workspace \
+  --input_path sparse/0 --output_path registered
+```
+
+`positions.txt` 每行格式为 `IMAGE_NAME X Y Z`。`point_triangulator` 是显式的
+重三角化/track complete/merge 工具，输出后建议继续执行独立 BA 和稳健过滤；
+`image_registrator` 可用 `--image_id` 只注册一张图，否则按 ID 尝试全部未注册图。
 
 ## MVS 单步骤
 

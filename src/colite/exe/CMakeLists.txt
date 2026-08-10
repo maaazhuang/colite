@@ -3,6 +3,7 @@ add_library(colite_sfm_command_exe
   sequential_matcher.cpp
   mapper.cpp
   compare_colmap.cpp
+  model_tools.cpp
 )
 
 target_link_libraries(colite_sfm_command_exe
@@ -76,6 +77,22 @@ target_link_libraries(recon_sfm PRIVATE colite_recon_sfm_exe)
 
 add_executable(recon_mvs recon_mvs_main.cpp)
 target_link_libraries(recon_mvs PRIVATE colite_recon_mvs_exe)
+
+install(
+  TARGETS
+    colite
+    feature_extractor
+    exhaustive_matcher
+    sequential_matcher
+    spatial_matcher
+    vocab_tree_matcher
+    vocab_tree_builder
+    mapper
+    compare_colmap
+    recon_sfm
+    recon_mvs
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
 
 if(MSVC)
   target_compile_options(colite PRIVATE /W4)

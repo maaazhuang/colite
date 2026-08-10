@@ -7,6 +7,8 @@ project(
   LANGUAGES C CXX
 )
 
+include(GNUInstallDirs)
+
 option(COLITE_BUILD_TESTS "Build unit tests" ON)
 option(COLITE_ENABLE_CUDA_SIFT "Build the optimized CUDA SIFT feature backend when CUDA is available" ON)
 option(COLITE_ENABLE_CUDA_MATCHER "Build the CUDA brute-force descriptor matcher" ON)
@@ -30,8 +32,6 @@ endif()
 
 if((COLITE_ENABLE_CUDA_SIFT OR COLITE_ENABLE_CUDA_MATCHER OR COLITE_ENABLE_CUDA_MVS) AND
    CMAKE_CUDA_COMPILER)
-  set(CMAKE_CUDA_ARCHITECTURES "89" CACHE STRING
-      "CUDA architectures used for optional CUDA backends")
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -42,6 +42,19 @@ elseif(COLITE_ENABLE_CUDA_SIFT OR COLITE_ENABLE_CUDA_MATCHER OR COLITE_ENABLE_CU
   set(COLITE_ENABLE_CUDA_MATCHER OFF)
   set(COLITE_ENABLE_CUDA_MVS OFF)
 endif()
+
+install(
+  FILES
+    LICENSE
+    THIRD_PARTY_NOTICES.md
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/colite
+)
+
+install(
+  DIRECTORY docs/
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/colite/docs
+  FILES_MATCHING PATTERN "*.md"
+)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

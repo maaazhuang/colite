@@ -1106,3 +1106,18 @@ mean 3.179876→3.177407；仅用于已完成模型续建时，相对严格控�
 观测、mean +0.000550，wall 增加 0.56 s。该方案收益不足，未进入生产路径；原始
 数据位于 `output/p2_track_cycle_closure_house_20260809/` 和
 `output/p2_track_cycle_closure_postmap_mapper_house_20260809/`。
+
+### 严格特征上限与 mean track（2026-08-09）
+
+保持 CUDA VLFeat 算法不变，仅扫描严格输出上限。House 的 COLMAP 数据库共有
+368,100 个描述子（均值 10,225/图）；Colite 上限 10,240 得到 368,640 个，差
+0.147%，是当前最接近的点数口径。但完整 SfM 得到 57,828 点、188,281 观测、
+mean track 3.255880，低于 8192 上限基线的 3.300469，也低于 COLMAP 的
+3.738058。将 guided ratio 收紧到 0.8 虽得到 mean 4.332738，却只保留 101,945
+观测（COLMAP 的 69.0%），属于删除短轨迹换均值，未采用为默认配置。因此后续
+长轨迹优化应继续针对 verified 图闭环与冲突一致性，不应继续增加特征数或收紧
+过滤。完整结果位于：
+
+- `output/feature_cap_scan_house_20260809/`
+- `output/feature_cap10240_sfm_house_20260809/`
+- `output/feature_cap10240_guided08_sfm_house_20260809/`

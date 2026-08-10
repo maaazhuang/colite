@@ -8,6 +8,8 @@
 #include <sstream>
 #include <system_error>
 
+#include <glog/logging.h>
+
 namespace colite::exe {
 namespace {
 
@@ -118,6 +120,11 @@ void WriteManifest(const StageSpec& spec, const std::string& status,
 int RunStage(const StageSpec& spec, const StageOptions& options,
              const std::function<int()>& runner, std::ostream& out,
              std::ostream& err) {
+  LOG(INFO) << "Stage " << spec.name << ": output="
+            << spec.output_root.string() << " resume="
+            << (options.resume ? 1 : 0) << " force="
+            << (options.force ? 1 : 0) << " dry_run="
+            << (options.dry_run ? 1 : 0);
   const std::string input_fingerprint = FingerprintPaths(spec.inputs);
   const std::string options_fingerprint = FingerprintArguments(spec.arguments);
   const auto manifest = spec.output_root / ".colite" / "stages" /
@@ -127,10 +134,12 @@ int RunStage(const StageSpec& spec, const StageOptions& options,
       ReadJsonString(manifest, "input_fingerprint") == input_fingerprint &&
       ReadJsonString(manifest, "options_fingerprint") == options_fingerprint) {
     out << "SKIP " << spec.name << " (manifest and outputs are current)\n";
+    LOG(INFO) << "Stage " << spec.name << " skipped: cache current";
     return 0;
   }
   if (options.dry_run) {
     out << "PLAN " << spec.name << "\n";
+    LOG(INFO) << "Stage " << spec.name << " planned only";
     return 0;
   }
   out << "RUN " << spec.name << "\n";
@@ -142,6 +151,8 @@ int RunStage(const StageSpec& spec, const StageOptions& options,
                                .count();
     WriteManifest(spec, result == 0 ? "complete" : "failed",
                   input_fingerprint, options_fingerprint, elapsed);
+    LOG(INFO) << "Stage " << spec.name << " complete: exit_code=" << result
+              << " elapsed_seconds=" << elapsed;
     if (result != 0) err << "Stage failed: " << spec.name << "\n";
     return result;
   } catch (...) {
@@ -150,6 +161,8 @@ int RunStage(const StageSpec& spec, const StageOptions& options,
                                .count();
     WriteManifest(spec, "failed", input_fingerprint, options_fingerprint,
                   elapsed);
+    LOG(ERROR) << "Stage " << spec.name
+               << " failed with exception after " << elapsed << " seconds";
     throw;
   }
 }

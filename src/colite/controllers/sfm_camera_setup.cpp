@@ -21,6 +21,7 @@ struct ImageMetadata {
   std::uint32_t height = 0;
   InitialFocalLengthEstimate focal;
   ExifCameraMetadata exif;
+  std::optional<GeodeticCoordinate> gps;
 };
 
 ImageMetadata ReadImageMetadata(const std::filesystem::path& image_path,
@@ -35,6 +36,7 @@ ImageMetadata ReadImageMetadata(const std::filesystem::path& image_path,
   metadata.focal = EstimateInitialFocalLengthPriorFromImage(
       image_path, options.focal_length, options.default_focal_length_factor);
   metadata.exif = ReadExifCameraMetadata(image_path);
+  metadata.gps = ReadExifGpsCoordinate(image_path);
   return metadata;
 }
 
@@ -201,6 +203,20 @@ SfmCameraSetup BuildSfmCameraSetup(
     setup.focal_estimates.push_back(metadata.back().focal);
   }
 
+  std::vector<double> gps_latitudes;
+  std::vector<double> gps_longitudes;
+  std::vector<double> gps_altitudes;
+  for (const ImageMetadata& item : metadata) {
+    if (!item.gps.has_value()) continue;
+    gps_latitudes.push_back(item.gps->latitude_degrees);
+    gps_longitudes.push_back(item.gps->longitude_degrees);
+    gps_altitudes.push_back(item.gps->altitude_meters);
+  }
+  if (!gps_latitudes.empty()) {
+    setup.gps_origin = GeodeticCoordinate{
+        Median(gps_latitudes), Median(gps_longitudes), Median(gps_altitudes)};
+  }
+
   const std::filesystem::path image_root =
       options.image_root.empty() ? CommonImageRoot(image_paths)
                                  : std::filesystem::absolute(options.image_root);
@@ -276,6 +292,11 @@ SfmCameraSetup BuildSfmCameraSetup(
     image.camera_id = camera_ids[idx];
     image.name = RelativeImageName(image_paths[idx], image_root);
     image.file_path = image_paths[idx].string();
+    if (metadata[idx].gps.has_value() && setup.gps_origin.has_value()) {
+      image.prior_position =
+          GeodeticToLocalEnu(*metadata[idx].gps, *setup.gps_origin);
+      ++setup.num_position_priors;
+    }
     setup.images.push_back(std::move(image));
   }
   return setup;

@@ -4,6 +4,8 @@
 #include <optional>
 #include <string>
 
+#include <Eigen/Core>
+
 namespace colite {
 
 enum class InitialFocalLengthSource {
@@ -32,8 +34,25 @@ struct ExifCameraMetadata {
   }
 };
 
+struct GeodeticCoordinate {
+  double latitude_degrees = 0.0;
+  double longitude_degrees = 0.0;
+  double altitude_meters = 0.0;
+};
+
 ExifCameraMetadata ReadExifCameraMetadata(
     const std::filesystem::path& image_path);
+
+// Reads WGS84 latitude/longitude and optional altitude from JPEG GPS IFD.
+// Missing altitude is represented as zero; malformed coordinates return null.
+std::optional<GeodeticCoordinate> ReadExifGpsCoordinate(
+    const std::filesystem::path& image_path);
+
+// WGS84 conversion helpers. Local ENU is centered at origin and expressed in
+// meters, suitable for Image::prior_position and spatial matching/BA.
+Eigen::Vector3d GeodeticToEcef(const GeodeticCoordinate& coordinate);
+Eigen::Vector3d GeodeticToLocalEnu(const GeodeticCoordinate& coordinate,
+                                   const GeodeticCoordinate& origin);
 
 // 从 JPEG EXIF 中读取 35mm 等效焦距。没有 EXIF 或字段不可用时返回空。
 std::optional<double> ReadExifFocalLength35mm(

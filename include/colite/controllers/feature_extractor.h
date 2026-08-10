@@ -27,6 +27,7 @@ struct FeatureExtractorControllerSummary {
   bool cache_hit = false;
   std::size_t num_images = 0;
   std::size_t num_cameras = 0;
+  std::size_t num_features = 0;
   double elapsed_seconds = 0.0;
 };
 

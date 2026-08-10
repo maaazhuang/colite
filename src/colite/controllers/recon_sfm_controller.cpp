@@ -24,6 +24,7 @@
 #include <vector>
 
 #include <opencv2/imgcodecs.hpp>
+#include <glog/logging.h>
 
 #include "colite/core/camera.h"
 #include "colite/core/parallel.h"
@@ -32,6 +33,8 @@
 #include "colite/core/reconstruction.h"
 #include "colite/features/sift_extractor.h"
 #include "colite/io/camera_prior.h"
+#include "colite/sfm/global_bundle_adjuster.h"
+#include "colite/sfm/similarity_transform.h"
 #include "colite/io/sfm_workspace.h"
 #include "colite/matching/descriptor_matcher.h"
 #include "colite/matching/match_graph_consistency.h"
@@ -625,6 +628,14 @@ void WriteRunSummary(const std::filesystem::path& output_path,
                << "num_cameras " << run_stats.num_cameras << "\n"
                << "num_prior_focal_images "
                << run_stats.num_prior_focal_images << "\n"
+               << "num_position_prior_images "
+               << run_stats.num_position_prior_images << "\n"
+               << "position_prior_aligned_models "
+               << run_stats.num_position_prior_aligned_models << "\n"
+               << "position_prior_initial_mean_error "
+               << run_stats.position_prior_initial_mean_error << "\n"
+               << "position_prior_final_mean_error "
+               << run_stats.position_prior_final_mean_error << "\n"
                << "min_initial_focal_length "
                << run_stats.min_initial_focal_length << "\n"
                << "max_initial_focal_length "
@@ -672,6 +683,8 @@ void WriteRunSummary(const std::filesystem::path& output_path,
                << "\n"
                << "incremental_mapping_seconds "
                << run_stats.incremental_mapping_seconds << "\n"
+               << "position_prior_refinement_seconds "
+               << run_stats.position_prior_refinement_seconds << "\n"
                << "mapper_initialization_seconds "
                << summary.initialization_seconds << "\n"
                << "mapper_candidate_selection_seconds "
@@ -1085,7 +1098,7 @@ std::string ReconFeatureConfigHash(
     const std::vector<std::filesystem::path>& image_paths) {
   std::vector<std::pair<std::string, std::string>> entries = {
       {"stage", "features"},
-      {"algorithm_version", "recon_sfm_features_v1"},
+      {"algorithm_version", "recon_sfm_features_v2_exif_gps"},
       {"feature_backend", std::to_string(static_cast<int>(options.feature_backend))},
       {"max_num_features", std::to_string(options.max_num_features)},
       {"camera_mode",
@@ -1144,7 +1157,14 @@ std::string ReconSparseConfigHash(
        {"max_initialization_trials",
         std::to_string(options.max_initialization_trials)},
        {"ba_groups",
-        std::to_string(static_cast<int>(options.ba_refine_camera_params))}});
+        std::to_string(static_cast<int>(options.ba_refine_camera_params))},
+       {"use_position_priors", options.use_position_priors ? "1" : "0"},
+       {"position_prior_stddev",
+        std::to_string(options.position_prior_stddev)},
+       {"position_prior_loss_scale",
+        std::to_string(options.position_prior_loss_scale)},
+       {"position_prior_alignment_max_error",
+        std::to_string(options.position_prior_alignment_max_error)}});
 }
 
 std::vector<std::filesystem::path> ReconFeatureRequiredFiles(
@@ -1202,6 +1222,16 @@ int ReconSfmController::Run(std::ostream& out) const {
   if (image_paths.size() < 2) {
     throw std::runtime_error("Need at least two input images.");
   }
+  LOG(INFO) << "SfM pipeline: images=" << image_paths.size()
+            << " image_path=" << image_dir.string()
+            << " output_path=" << output_dir.string()
+            << " feature_backend="
+            << SiftBackendName(ResolveSiftBackend(options.feature_backend))
+            << " max_features=" << options.max_num_features
+            << " matcher=" << static_cast<int>(options.matcher_backend)
+            << " cpu_threads=" << options.feature_num_threads
+            << " resume=" << (options.resume ? 1 : 0)
+            << " force=" << (options.force ? 1 : 0);
   const std::string feature_hash =
       ReconFeatureConfigHash(options, image_paths);
   const std::string frontend_hash =
@@ -1215,6 +1245,9 @@ int ReconSfmController::Run(std::ostream& out) const {
     out << "SfM cache hit: 1\n"
         << "Registered images: " << metadata.values.at("registered_images")
         << "\nPoints3D: " << metadata.values.at("points3d") << "\n";
+    LOG(INFO) << "SfM cache hit: registered_images="
+              << metadata.values.at("registered_images")
+              << " points3d=" << metadata.values.at("points3d");
     return 0;
   }
 
@@ -1322,6 +1355,7 @@ int ReconSfmController::Run(std::ostream& out) const {
   run_stats.camera_sharing_mode =
       CameraSharingModeName(options.camera_sharing_mode);
   run_stats.num_cameras = camera_setup.cameras.size();
+  run_stats.num_position_prior_images = camera_setup.num_position_priors;
   run_stats.min_initial_focal_length = initial_focal.pixels;
   run_stats.max_initial_focal_length = initial_focal.pixels;
   for (const InitialFocalLengthEstimate& focal :
@@ -1526,6 +1560,60 @@ int ReconSfmController::Run(std::ostream& out) const {
       mapping_result.num_unregistered_images;
   run_stats.incremental_mapping_seconds = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - mapping_start).count();
+  if (options.use_position_priors) {
+    const auto prior_start = std::chrono::steady_clock::now();
+    double initial_error_sum = 0.0;
+    double final_error_sum = 0.0;
+    std::size_t error_count = 0;
+    for (Reconstruction& model : mapping_result.models) {
+      const PositionPriorAlignmentSummary alignment =
+          AlignReconstructionToPositionPriors(
+              options.position_prior_alignment_max_error, &model);
+      if (!alignment.success) {
+        LOG(WARNING) << "Position-prior alignment skipped: priors="
+                     << alignment.num_priors;
+        continue;
+      }
+      ++run_stats.num_position_prior_aligned_models;
+      GlobalBundleAdjustmentOptions prior_ba =
+          mapping_options.global_bundle_adjustment;
+      prior_ba.gauge_fixing = BundleGaugeFixing::kNone;
+      prior_ba.use_position_priors = true;
+      prior_ba.position_prior_stddev = options.position_prior_stddev;
+      prior_ba.position_prior_loss_scale =
+          options.position_prior_loss_scale;
+      const GlobalBundleAdjustmentSummary prior_summary =
+          AdjustGlobalBundle(prior_ba, &model);
+      if (!prior_summary.success) {
+        LOG(WARNING) << "Position-prior BA failed: "
+                     << prior_summary.message;
+        continue;
+      }
+      initial_error_sum += prior_summary.initial_mean_position_error *
+                           prior_summary.num_position_priors;
+      final_error_sum += prior_summary.final_mean_position_error *
+                         prior_summary.num_position_priors;
+      error_count += prior_summary.num_position_priors;
+      LOG(INFO) << "Position-prior refinement: priors="
+                << prior_summary.num_position_priors
+                << " alignment_inliers=" << alignment.num_inliers
+                << " scale=" << alignment.scale
+                << " initial_error="
+                << prior_summary.initial_mean_position_error
+                << " final_error="
+                << prior_summary.final_mean_position_error;
+    }
+    if (error_count > 0) {
+      run_stats.position_prior_initial_mean_error =
+          initial_error_sum / static_cast<double>(error_count);
+      run_stats.position_prior_final_mean_error =
+          final_error_sum / static_cast<double>(error_count);
+    }
+    run_stats.position_prior_refinement_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                     prior_start)
+            .count();
+  }
   const auto color_start = std::chrono::steady_clock::now();
   for (Reconstruction& model : mapping_result.models) {
     ExtractPointColors(&model);
@@ -1592,6 +1680,13 @@ int ReconSfmController::Run(std::ostream& out) const {
              .mean_reprojection_error
       << "\n"
       << "Output: " << output_dir.string() << "\n";
+  LOG(INFO) << "SfM complete: success=" << (summary.success ? 1 : 0)
+            << " registered_images=" << summary.num_registered_images
+            << " points3d=" << summary.num_points3d
+            << " models=" << mapping_result.models.size()
+            << " observations="
+            << ComputeReconstructionQualityStats(primary).num_observations
+            << " total_seconds=" << run_stats.total_seconds;
   return summary.success ? 0 : 2;
 }
 

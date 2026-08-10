@@ -9,6 +9,7 @@
 #include "colite/exe/compare_colmap.h"
 #include "colite/exe/feature_extractor.h"
 #include "colite/exe/mapper.h"
+#include "colite/exe/model_tools.h"
 #include "colite/exe/mvs_stages.h"
 #include "colite/exe/mvs_tools.h"
 #include "colite/exe/recon_auto.h"
@@ -45,6 +46,22 @@ constexpr Command kCommands[] = {
     {"mapper", "Run incremental SfM from a file workspace.", &RunMapper},
     {"compare_colmap", "Write fixed COLMAP text model difference reports.",
      &RunCompareColmap},
+    {"model_analyzer", "Analyze a COLMAP-compatible sparse model.",
+     &RunModelAnalyzer},
+    {"model_transformer", "Apply a Sim(3) matrix to a sparse model.",
+     &RunModelTransformer},
+    {"model_aligner", "Align a sparse model to named XYZ positions.",
+     &RunModelAligner},
+    {"model_cropper", "Crop sparse points to an axis-aligned box.",
+     &RunModelCropper},
+    {"model_splitter", "Split a sparse model by track connectivity.",
+     &RunModelSplitter},
+    {"bundle_adjuster", "Run standalone global bundle adjustment.",
+     &RunBundleAdjuster},
+    {"point_triangulator", "Triangulate and complete tracks in an existing model.",
+     &RunPointTriangulator},
+    {"image_registrator", "Register remaining images against an existing model.",
+     &RunImageRegistrator},
     {"recon_sfm", "Run the compact end-to-end SfM pipeline.", &RunReconSfm},
     {"recon_mvs", "Run the compact MVS pipeline from a sparse model.",
      &RunReconMvs},

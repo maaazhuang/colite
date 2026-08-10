@@ -27,6 +27,7 @@
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <glog/logging.h>
 
 #include "colite/core/camera.h"
 #include "colite/core/geometry.h"
@@ -616,7 +617,13 @@ void WriteInitialPatchMatchDiagnostics(
 using CudaWorkspacePool = std::vector<mvs::CudaPatchMatchWorkspacePtr>;
 
 bool UsesCudaWorkspacePool(const mvs::PatchMatchStereoOptions& options) {
-  return options.backend != mvs::PatchMatchBackend::kCpu;
+  if (options.backend == mvs::PatchMatchBackend::kCpu) {
+    return false;
+  }
+  if (options.backend == mvs::PatchMatchBackend::kCuda) {
+    return true;
+  }
+  return mvs::IsCudaPatchMatchAvailable();
 }
 
 CudaWorkspacePool CreateCudaWorkspacePool(
@@ -2603,6 +2610,14 @@ mvs::StereoFusionSummary FusePersistedStereoMaps(
 
 int ReconMvsController::Run(std::ostream& out) const {
   ReconMvsControllerOptions cli_options = options_;
+  LOG(INFO) << "MVS pipeline: model_path=" << cli_options.model_path.string()
+            << " image_path=" << cli_options.image_path.string()
+            << " output_path=" << cli_options.output_path.string()
+            << " undistort=" << (cli_options.image_undistorter ? 1 : 0)
+            << " patch_match=" << (cli_options.run_patch_match ? 1 : 0)
+            << " fusion=" << (cli_options.fuse_stereo ? 1 : 0)
+            << " backend=" << cli_options.patch_match_backend
+            << " threads=" << cli_options.num_threads;
   Reconstruction reconstruction =
       ReadColmapReconstruction(cli_options.model_path);
   const std::filesystem::path output_path(cli_options.output_path);
@@ -2692,6 +2707,12 @@ int ReconMvsController::Run(std::ostream& out) const {
       << "Fused observations: "
       << fusion_summary.num_fused_observations << "\n"
       << "Output: " << output_path.string() << "\n";
+  LOG(INFO) << "MVS complete: success=" << (summary.success ? 1 : 0)
+            << " images=" << summary.num_images
+            << " patch_match_images=" << num_patch_match_images
+            << " fused_points=" << fusion_summary.num_fused_points
+            << " fused_observations="
+            << fusion_summary.num_fused_observations;
   return summary.success ? 0 : 2;
 }
 

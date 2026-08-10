@@ -870,9 +870,14 @@ TEST(SfmCommandExeTest, FeatureExtractorUsesExifFocalPriorByDefault) {
   const std::filesystem::path image_dir = workspace / "images";
   std::filesystem::remove_all(workspace);
   std::filesystem::create_directories(image_dir);
-  std::filesystem::copy_file(
+  const std::filesystem::path source_image =
       std::filesystem::path(COLITE_SOURCE_DIR) / "data" / "building-18" /
-          "P1180166.JPG",
+      "P1180166.JPG";
+  if (!std::filesystem::exists(source_image)) {
+    GTEST_SKIP() << "Local building-18 dataset is not available.";
+  }
+  std::filesystem::copy_file(
+      source_image,
       image_dir / "P1180166.JPG",
       std::filesystem::copy_options::overwrite_existing);
 
@@ -1022,6 +1027,9 @@ TEST(CameraPriorTest, EstimatesFocalLengthFromJpegExif) {
   const std::filesystem::path image_path =
       std::filesystem::path(COLITE_SOURCE_DIR) / "data" / "building-18" /
       "P1180166.JPG";
+  if (!std::filesystem::exists(image_path)) {
+    GTEST_SKIP() << "Local building-18 dataset is not available.";
+  }
 
   EXPECT_NEAR(EstimateInitialFocalLengthFromImage(image_path, 0.0),
               2484.86249133349,

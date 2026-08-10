@@ -103,7 +103,7 @@ Core 当前登记并完整支持 12 个模型：
 
 多模型与断点续建语义：
 
-1. 输入模型使用 COLMAP text 格式。恢复时以图像名而不是历史 ID 关联当前图像清单，因此可在
+1. 输入模型支持 COLMAP text 和 binary 格式。恢复时以图像名而不是历史 ID 关联当前图像清单，因此可在
    原数据集加入新图或改变枚举顺序；当前图像路径和位置先验保留，历史优化内参、位姿、点及
    track 恢复。
 2. 相机模型和图像尺寸必须与当前 schema 兼容；若当前策略要求多个图像共享同一 Camera，而
@@ -364,7 +364,7 @@ global/local seam leveling、共面 virtual faces、孔洞闭合和 mesh refinem
 
 1. Texturer 已实现近共面小视图孤岛合并和受拓扑支持的孔洞恢复；全局曝光 +
    局部 seam 顶点场已降低跨视图色差，仍未实现局部窄带 Poisson seam blending。
-2. House SfM 的共享 Camera 局部 BA/全模型过滤错误和 guided matching 缺口均已修复；相同 CUDA VLFeat 8192 配置最终为 48,794 点、147,407 observations。与 COLMAP 的剩余差异主要是 descriptor 数、SIFT 实现和相机模型，而不是 GPS。
+2. House SfM 的共享 Camera 局部 BA/全模型过滤错误和 guided matching 缺口均已修复。EXIF GPS 现可转换为局部 ENU，并可选用于模型 Sim(3) 对齐和最终全局 BA；无 GPS 的 House 长轨迹差异仍主要来自 verified 匹配图闭环拓扑，而不是位置先验。
 3. House GUI High 等价 2400×1597、20 sources、radius 5 配置中，平面单应
    + FP32 ZNCC 将 PatchMatch 从 3537.21 s 降至 772.17 s，比同输入 COLMAP
    1504.87 s 快 48.7%。峰值 RSS 8,968,060 KiB，仍高于 COLMAP，后续重点是

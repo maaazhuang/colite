@@ -12,6 +12,8 @@
 #include <vector>
 #include <memory>
 
+#include <glog/logging.h>
+
 #include "colite/core/parallel.h"
 #include "colite/io/sfm_workspace.h"
 #include "colite/matching/two_view_geometry_batch.h"
@@ -168,6 +170,12 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
   if (cameras.empty() || images.size() < 2) {
     throw std::runtime_error("Workspace must contain at least two images");
   }
+  LOG(INFO) << "Matching: images=" << images.size()
+            << " strategy=" << MatchingStrategyName(options_.matching_strategy)
+            << " backend=" << static_cast<int>(options_.matcher_backend)
+            << " ratio=" << options_.max_ratio
+            << " guided=" << (options_.guided_matching ? 1 : 0)
+            << " guided_ratio=" << options_.guided_match_ratio;
 
   MatchGraph graph;
   ReadWorkspaceFeatureSets(options_.workspace_path, &graph);
@@ -394,6 +402,12 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
 
   summary.success = true;
   summary.num_images = images.size();
+  LOG(INFO) << "Matching complete: pairs=" << summary.num_pairs
+            << " verified_pairs=" << summary.num_verified_pairs
+            << " verified_inliers=" << summary.num_verified_inliers
+            << " raw_cache_hit=" << (summary.raw_match_cache_hit ? 1 : 0)
+            << " geometry_cache_hit="
+            << (summary.geometry_cache_hit ? 1 : 0);
   return summary;
 }
 

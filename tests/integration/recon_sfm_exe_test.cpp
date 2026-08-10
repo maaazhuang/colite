@@ -149,6 +149,9 @@ TEST(ReconSfmExeTest, EstimatesInitialFocalLengthFromJpegExif) {
   const std::filesystem::path image_path =
       std::filesystem::path(COLITE_SOURCE_DIR) / "data" / "building-18" /
       "P1180166.JPG";
+  if (!std::filesystem::exists(image_path)) {
+    GTEST_SKIP() << "Local building-18 dataset is not available.";
+  }
 
   const double focal_length =
       EstimateInitialFocalLengthFromImage(image_path, 0.0);

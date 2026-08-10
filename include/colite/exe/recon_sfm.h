@@ -49,6 +49,10 @@ struct ReconSfmCliOptions {
   bool ba_refine_principal_point = false;
   bool ba_refine_extra_params = true;
   std::set<std::string> ba_refine_params;
+  bool use_position_priors = false;
+  double position_prior_stddev = 5.0;
+  double position_prior_loss_scale = 2.0;
+  double position_prior_alignment_max_error = 20.0;
 };
 
 int RunReconSfm(const std::vector<std::string>& args,

@@ -17,13 +17,24 @@ namespace colite {
 namespace {
 
 constexpr std::uint16_t kExifTagExifIfd = 0x8769;
+constexpr std::uint16_t kExifTagGpsIfd = 0x8825;
 constexpr std::uint16_t kExifTagMake = 0x010F;
 constexpr std::uint16_t kExifTagModel = 0x0110;
 constexpr std::uint16_t kExifTagFocalLengthIn35mmFilm = 0xA405;
 constexpr std::uint16_t kExifTagFocalLength = 0x920A;
 constexpr std::uint16_t kExifTagFocalPlaneXResolution = 0xA20E;
 constexpr std::uint16_t kExifTagFocalPlaneResolutionUnit = 0xA210;
+constexpr std::uint16_t kGpsTagLatitudeRef = 0x0001;
+constexpr std::uint16_t kGpsTagLatitude = 0x0002;
+constexpr std::uint16_t kGpsTagLongitudeRef = 0x0003;
+constexpr std::uint16_t kGpsTagLongitude = 0x0004;
+constexpr std::uint16_t kGpsTagAltitudeRef = 0x0005;
+constexpr std::uint16_t kGpsTagAltitude = 0x0006;
 constexpr double kFullFrameDiagonalMillimeters = 43.27;
+constexpr double kWgs84SemiMajorMeters = 6378137.0;
+constexpr double kWgs84EccentricitySquared =
+    6.6943799901413165e-3;
+constexpr double kPi = 3.14159265358979323846;
 
 std::uint16_t ReadUInt16(const std::vector<std::uint8_t>& bytes,
                          std::size_t offset,
@@ -222,6 +233,80 @@ std::optional<std::string> ReadIfdAsciiValue(
   return std::nullopt;
 }
 
+std::optional<std::vector<double>> ReadIfdRationalValues(
+    const std::vector<std::uint8_t>& tiff,
+    const std::size_t ifd_offset,
+    const std::uint16_t desired_tag,
+    const bool little_endian) {
+  if (ifd_offset + 2 > tiff.size()) return std::nullopt;
+  const std::uint16_t num_entries =
+      ReadUInt16(tiff, ifd_offset, little_endian);
+  for (std::uint16_t i = 0; i < num_entries; ++i) {
+    const std::size_t entry_offset = ifd_offset + 2 + 12 * i;
+    if (entry_offset + 12 > tiff.size()) return std::nullopt;
+    if (ReadUInt16(tiff, entry_offset, little_endian) != desired_tag) continue;
+    const std::uint16_t type =
+        ReadUInt16(tiff, entry_offset + 2, little_endian);
+    const std::uint32_t count =
+        ReadUInt32(tiff, entry_offset + 4, little_endian);
+    if (type != 5 || count == 0) return std::nullopt;
+    const std::size_t value_offset =
+        ReadUInt32(tiff, entry_offset + 8, little_endian);
+    if (value_offset + static_cast<std::size_t>(count) * 8 > tiff.size()) {
+      return std::nullopt;
+    }
+    std::vector<double> values;
+    values.reserve(count);
+    for (std::uint32_t idx = 0; idx < count; ++idx) {
+      const std::size_t offset = value_offset + static_cast<std::size_t>(idx) * 8;
+      const std::uint32_t numerator =
+          ReadUInt32(tiff, offset, little_endian);
+      const std::uint32_t denominator =
+          ReadUInt32(tiff, offset + 4, little_endian);
+      if (denominator == 0) return std::nullopt;
+      values.push_back(static_cast<double>(numerator) / denominator);
+    }
+    return values;
+  }
+  return std::nullopt;
+}
+
+std::optional<std::uint8_t> ReadIfdByteValue(
+    const std::vector<std::uint8_t>& tiff,
+    const std::size_t ifd_offset,
+    const std::uint16_t desired_tag,
+    const bool little_endian) {
+  if (ifd_offset + 2 > tiff.size()) return std::nullopt;
+  const std::uint16_t num_entries =
+      ReadUInt16(tiff, ifd_offset, little_endian);
+  for (std::uint16_t i = 0; i < num_entries; ++i) {
+    const std::size_t entry_offset = ifd_offset + 2 + 12 * i;
+    if (entry_offset + 12 > tiff.size()) return std::nullopt;
+    if (ReadUInt16(tiff, entry_offset, little_endian) != desired_tag) continue;
+    const std::uint16_t type =
+        ReadUInt16(tiff, entry_offset + 2, little_endian);
+    const std::uint32_t count =
+        ReadUInt32(tiff, entry_offset + 4, little_endian);
+    if (type != 1 || count != 1) return std::nullopt;
+    return tiff[entry_offset + 8];
+  }
+  return std::nullopt;
+}
+
+bool ParseTiffHeader(const std::vector<std::uint8_t>& tiff,
+                     bool* little_endian,
+                     std::uint32_t* ifd0_offset) {
+  if (little_endian == nullptr || ifd0_offset == nullptr || tiff.size() < 8) {
+    return false;
+  }
+  const bool little = tiff[0] == 'I' && tiff[1] == 'I';
+  const bool big = tiff[0] == 'M' && tiff[1] == 'M';
+  if ((!little && !big) || ReadUInt16(tiff, 2, little) != 42) return false;
+  *little_endian = little;
+  *ifd0_offset = ReadUInt32(tiff, 4, little);
+  return *ifd0_offset < tiff.size();
+}
+
 struct ExifFocalMetadata {
   std::optional<std::string> make;
   std::optional<std::string> model;
@@ -235,13 +320,11 @@ std::optional<ExifFocalMetadata> ReadExifFocalMetadata(
     const std::filesystem::path& image_path) {
   const auto tiff = ReadJpegExifTiff(image_path);
   if (!tiff.has_value() || tiff->size() < 8) return std::nullopt;
-  const bool little_endian = (*tiff)[0] == 'I' && (*tiff)[1] == 'I';
-  const bool big_endian = (*tiff)[0] == 'M' && (*tiff)[1] == 'M';
-  if ((!little_endian && !big_endian) ||
-      ReadUInt16(*tiff, 2, little_endian) != 42) {
+  bool little_endian = false;
+  std::uint32_t ifd0_offset = 0;
+  if (!ParseTiffHeader(*tiff, &little_endian, &ifd0_offset)) {
     return std::nullopt;
   }
-  const std::uint32_t ifd0_offset = ReadUInt32(*tiff, 4, little_endian);
   const auto exif_ifd_offset =
       ReadIfdUIntValue(*tiff, ifd0_offset, kExifTagExifIfd, little_endian);
   if (!exif_ifd_offset.has_value()) return std::nullopt;
@@ -274,6 +357,100 @@ ExifCameraMetadata ReadExifCameraMetadata(
   result.focal_length = metadata->focal_mm;
   result.focal_length_35mm = metadata->focal_35mm;
   return result;
+}
+
+std::optional<GeodeticCoordinate> ReadExifGpsCoordinate(
+    const std::filesystem::path& image_path) {
+  const auto tiff = ReadJpegExifTiff(image_path);
+  if (!tiff.has_value()) return std::nullopt;
+  bool little_endian = false;
+  std::uint32_t ifd0_offset = 0;
+  if (!ParseTiffHeader(*tiff, &little_endian, &ifd0_offset)) {
+    return std::nullopt;
+  }
+  const auto gps_ifd_offset =
+      ReadIfdUIntValue(*tiff, ifd0_offset, kExifTagGpsIfd, little_endian);
+  if (!gps_ifd_offset.has_value()) return std::nullopt;
+  const auto latitude_ref = ReadIfdAsciiValue(
+      *tiff, *gps_ifd_offset, kGpsTagLatitudeRef, little_endian);
+  const auto longitude_ref = ReadIfdAsciiValue(
+      *tiff, *gps_ifd_offset, kGpsTagLongitudeRef, little_endian);
+  const auto latitude = ReadIfdRationalValues(
+      *tiff, *gps_ifd_offset, kGpsTagLatitude, little_endian);
+  const auto longitude = ReadIfdRationalValues(
+      *tiff, *gps_ifd_offset, kGpsTagLongitude, little_endian);
+  if (!latitude_ref.has_value() || !longitude_ref.has_value() ||
+      !latitude.has_value() || latitude->size() != 3 ||
+      !longitude.has_value() || longitude->size() != 3) {
+    return std::nullopt;
+  }
+  GeodeticCoordinate result;
+  result.latitude_degrees =
+      (*latitude)[0] + (*latitude)[1] / 60.0 + (*latitude)[2] / 3600.0;
+  result.longitude_degrees =
+      (*longitude)[0] + (*longitude)[1] / 60.0 + (*longitude)[2] / 3600.0;
+  if (!latitude_ref->empty() &&
+      (latitude_ref->front() == 'S' || latitude_ref->front() == 's')) {
+    result.latitude_degrees = -result.latitude_degrees;
+  }
+  if (!longitude_ref->empty() &&
+      (longitude_ref->front() == 'W' || longitude_ref->front() == 'w')) {
+    result.longitude_degrees = -result.longitude_degrees;
+  }
+  const auto altitude = ReadIfdRationalValues(
+      *tiff, *gps_ifd_offset, kGpsTagAltitude, little_endian);
+  if (altitude.has_value() && altitude->size() == 1) {
+    result.altitude_meters = altitude->front();
+    if (ReadIfdByteValue(*tiff, *gps_ifd_offset, kGpsTagAltitudeRef,
+                         little_endian)
+            .value_or(0) == 1) {
+      result.altitude_meters = -result.altitude_meters;
+    }
+  }
+  if (!std::isfinite(result.latitude_degrees) ||
+      !std::isfinite(result.longitude_degrees) ||
+      !std::isfinite(result.altitude_meters) ||
+      std::abs(result.latitude_degrees) > 90.0 ||
+      std::abs(result.longitude_degrees) > 180.0) {
+    return std::nullopt;
+  }
+  return result;
+}
+
+Eigen::Vector3d GeodeticToEcef(const GeodeticCoordinate& coordinate) {
+  const double latitude = coordinate.latitude_degrees * kPi / 180.0;
+  const double longitude = coordinate.longitude_degrees * kPi / 180.0;
+  const double sin_latitude = std::sin(latitude);
+  const double cos_latitude = std::cos(latitude);
+  const double radius = kWgs84SemiMajorMeters /
+      std::sqrt(1.0 - kWgs84EccentricitySquared *
+                          sin_latitude * sin_latitude);
+  return Eigen::Vector3d(
+      (radius + coordinate.altitude_meters) * cos_latitude *
+          std::cos(longitude),
+      (radius + coordinate.altitude_meters) * cos_latitude *
+          std::sin(longitude),
+      (radius * (1.0 - kWgs84EccentricitySquared) +
+       coordinate.altitude_meters) * sin_latitude);
+}
+
+Eigen::Vector3d GeodeticToLocalEnu(const GeodeticCoordinate& coordinate,
+                                   const GeodeticCoordinate& origin) {
+  const Eigen::Vector3d delta =
+      GeodeticToEcef(coordinate) - GeodeticToEcef(origin);
+  const double latitude = origin.latitude_degrees * kPi / 180.0;
+  const double longitude = origin.longitude_degrees * kPi / 180.0;
+  const double sin_latitude = std::sin(latitude);
+  const double cos_latitude = std::cos(latitude);
+  const double sin_longitude = std::sin(longitude);
+  const double cos_longitude = std::cos(longitude);
+  Eigen::Matrix3d ecef_to_enu;
+  ecef_to_enu << -sin_longitude, cos_longitude, 0.0,
+      -sin_latitude * cos_longitude, -sin_latitude * sin_longitude,
+      cos_latitude,
+      cos_latitude * cos_longitude, cos_latitude * sin_longitude,
+      sin_latitude;
+  return ecef_to_enu * delta;
 }
 
 std::optional<double> ReadExifFocalLength35mm(

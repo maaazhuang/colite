@@ -40,6 +40,7 @@ add_library(colite_core
   core/reconstruction.cpp
   core/parallel.cpp
   core/version.cpp
+  exe/logging.cpp
   controllers/recon_sfm_controller.cpp
   controllers/sfm_camera_setup.cpp
   controllers/recon_mvs_controller.cpp
@@ -81,6 +82,7 @@ add_library(colite_core
   sfm/observation_manager.cpp
   sfm/observation_filter.cpp
   sfm/reconstruction_manager.cpp
+  sfm/similarity_transform.cpp
 )
 
 target_include_directories(colite_core

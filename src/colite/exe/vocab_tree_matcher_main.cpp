@@ -2,19 +2,14 @@
 #include <string>
 #include <vector>
 
-#include <glog/logging.h>
-
+#include "colite/exe/logging.h"
 #include "colite/exe/sequential_matcher.h"
 
 int main(int argc, char** argv) {
-  google::InitGoogleLogging(argv[0]);
-  std::vector<std::string> args;
-  args.reserve(static_cast<std::size_t>(argc));
-  for (int i = 0; i < argc; ++i) {
-    args.emplace_back(argv[i]);
-  }
+  const std::vector<std::string> args =
+      colite::exe::InitializeLoggingAndBuildArgs(argc, argv);
   const int exit_code =
       colite::exe::RunVocabTreeMatcher(args, std::cout, std::cerr);
-  google::ShutdownGoogleLogging();
+  colite::exe::ShutdownLogging();
   return exit_code;
 }

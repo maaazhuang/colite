@@ -9,10 +9,13 @@
 #include <utility>
 #include <vector>
 
+#include <glog/logging.h>
+
 #include "colite/controllers/recon_sfm_controller.h"
 #include "colite/io/sfm_workspace.h"
 #include "colite/sfm/incremental_mapper.h"
 #include "colite/sfm/reconstruction_manager.h"
+#include "colite/sfm/similarity_transform.h"
 
 namespace colite::controllers {
 namespace {
@@ -56,7 +59,13 @@ std::string MapperConfigHash(const MapperControllerOptions& options) {
             ? "1"
             : "0"},
        {"min_pair_median_triangulation_angle_deg", "1"},
-       {"local_retriangulation_min_angle_deg", "1"}});
+       {"local_retriangulation_min_angle_deg", "1"},
+       {"use_position_priors", options.use_position_priors ? "1" : "0"},
+       {"position_prior_stddev", std::to_string(options.position_prior_stddev)},
+       {"position_prior_loss_scale",
+        std::to_string(options.position_prior_loss_scale)},
+       {"position_prior_alignment_max_error",
+        std::to_string(options.position_prior_alignment_max_error)}});
 }
 
 std::optional<MapperControllerSummary> ReadCachedMapperSummary(
@@ -78,6 +87,14 @@ std::optional<MapperControllerSummary> ReadCachedMapperSummary(
       std::stoull(metadata.values.at("models")));
   summary.num_unregistered_images = static_cast<std::size_t>(
       std::stoull(metadata.values.at("unregistered_images")));
+  if (const auto it = metadata.values.find("position_prior_aligned_models");
+      it != metadata.values.end()) {
+    summary.num_position_prior_aligned_models = std::stoull(it->second);
+  }
+  if (const auto it = metadata.values.find("final_mean_position_error");
+      it != metadata.values.end()) {
+    summary.final_mean_position_error = std::stod(it->second);
+  }
   return summary;
 }
 
@@ -117,10 +134,18 @@ MapperController::MapperController(MapperControllerOptions options)
     : options_(std::move(options)) {}
 
 MapperControllerSummary MapperController::Run() const {
+  LOG(INFO) << "Mapper: workspace=" << options_.workspace_path.string()
+            << " multiple_models=" << (options_.multiple_models ? 1 : 0)
+            << " merge_models=" << (options_.merge_models ? 1 : 0)
+            << " input_model=" << options_.input_model_path.string();
   const std::string config_hash = MapperConfigHash(options_);
   if (options_.input_model_path.empty()) {
     if (const auto cached_summary =
             ReadCachedMapperSummary(options_.workspace_path, config_hash)) {
+      LOG(INFO) << "Mapper cache hit: registered_images="
+                << cached_summary->num_registered_images
+                << " points3d=" << cached_summary->num_points3d
+                << " models=" << cached_summary->num_models;
       return *cached_summary;
     }
   }
@@ -177,6 +202,34 @@ MapperControllerSummary MapperController::Run() const {
               return result.models[lhs].RegisteredImageIds().size() >
                      result.models[rhs].RegisteredImageIds().size();
             });
+  std::size_t position_prior_aligned_models = 0;
+  double position_error_sum = 0.0;
+  std::size_t position_error_count = 0;
+  if (options_.use_position_priors) {
+    for (Reconstruction& model : result.models) {
+      const PositionPriorAlignmentSummary alignment =
+          AlignReconstructionToPositionPriors(
+              options_.position_prior_alignment_max_error, &model);
+      if (!alignment.success) continue;
+      GlobalBundleAdjustmentOptions ba =
+          mapping_options.global_bundle_adjustment;
+      ba.gauge_fixing = BundleGaugeFixing::kNone;
+      ba.use_position_priors = true;
+      ba.position_prior_stddev = options_.position_prior_stddev;
+      ba.position_prior_loss_scale = options_.position_prior_loss_scale;
+      const GlobalBundleAdjustmentSummary ba_summary =
+          AdjustGlobalBundle(ba, &model);
+      if (!ba_summary.success) continue;
+      ++position_prior_aligned_models;
+      position_error_sum += ba_summary.final_mean_position_error *
+                            ba_summary.num_position_priors;
+      position_error_count += ba_summary.num_position_priors;
+      LOG(INFO) << "Mapper position-prior refinement: priors="
+                << ba_summary.num_position_priors
+                << " inliers=" << alignment.num_inliers
+                << " final_error=" << ba_summary.final_mean_position_error;
+    }
+  }
   for (Reconstruction& model : result.models) {
     ExtractPointColors(&model);
   }
@@ -217,6 +270,13 @@ MapperControllerSummary MapperController::Run() const {
                << "points3d " << mapping_summary.num_points3d << "\n"
                << "models " << result.models.size() << "\n"
                << "unregistered_images " << result.num_unregistered_images
+               << "\n"
+               << "position_prior_aligned_models "
+               << position_prior_aligned_models << "\n"
+               << "final_mean_position_error "
+               << (position_error_count == 0
+                       ? -1.0
+                       : position_error_sum / position_error_count)
                << "\n"
                << "initialization_attempts "
                << mapping_summary.initialization.num_initialization_attempts
@@ -267,6 +327,10 @@ MapperControllerSummary MapperController::Run() const {
   summary.num_points3d = mapping_summary.num_points3d;
   summary.num_models = result.models.size();
   summary.num_unregistered_images = result.num_unregistered_images;
+  summary.num_position_prior_aligned_models = position_prior_aligned_models;
+  summary.final_mean_position_error =
+      position_error_count == 0 ? -1.0
+                                : position_error_sum / position_error_count;
   WriteWorkspaceCacheMetadata(
       options_.workspace_path, "sparse", config_hash,
       {{"success", mapping_summary.success ? "1" : "0"},
@@ -274,8 +338,17 @@ MapperControllerSummary MapperController::Run() const {
        {"points3d", std::to_string(mapping_summary.num_points3d)},
        {"models", std::to_string(result.models.size())},
        {"unregistered_images",
-        std::to_string(result.num_unregistered_images)}},
+        std::to_string(result.num_unregistered_images)},
+       {"position_prior_aligned_models",
+        std::to_string(position_prior_aligned_models)},
+       {"final_mean_position_error",
+        std::to_string(summary.final_mean_position_error)}},
       SparseRequiredFiles(result.models.size(), options_.output_model_format));
+  LOG(INFO) << "Mapper complete: success=" << (summary.success ? 1 : 0)
+            << " registered_images=" << summary.num_registered_images
+            << " points3d=" << summary.num_points3d
+            << " models=" << summary.num_models
+            << " unregistered_images=" << summary.num_unregistered_images;
   return summary;
 }
 

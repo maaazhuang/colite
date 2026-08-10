@@ -1,6 +1,6 @@
 # Colite 项目概况
 
-更新时间：2026-07-30。
+更新时间：2026-08-10。
 
 ## 目标与定位
 
@@ -12,7 +12,9 @@ Colite 是一个 C++17 编写的轻量三维重建系统，覆盖从原始图像
 - 不依赖外部下载的 PoissonRecon，源码随仓库构建；
 - 不引入 GUI、rig、多传感器和深度学习等当前非核心能力。
 
-当前版本为 `0.1.0`。系统已经能完成 `recon_sfm`、`recon_mvs` 和 `recon_auto`，也支持所有主要阶段的单步骤调用。
+当前版本为 `0.1.0-alpha` 发布候选。系统已经能完成 `recon_sfm`、`recon_mvs`
+和 `recon_auto`，也支持所有主要阶段的单步骤调用。公开发布阶段仍以研究、测试
+和可复现实验为定位，不承诺在所有数据集上与 COLMAP 数值等价。
 
 ## 已实现能力
 
@@ -24,8 +26,10 @@ Colite 是一个 C++17 编写的轻量三维重建系统，覆盖从原始图像
 | SfM | 初始化、图像注册、PnP、point-centric 多视图三角化、track complete/merge、局部/全局 BA、观测过滤、多连通分量模型、已有模型续建、鲁棒 Sim(3) 模型合并 |
 | MVS | source view 选择、CPU/CUDA PatchMatch、光度/几何一致性、binary/text dense maps、Stereo Fusion |
 | 表面 | Poisson、可见性 Delaunay graph-cut、QEM 简化、标定图像纹理图集 |
-| 编排 | SfM/MVS 两段流程、完整 `recon_auto`、SfM 多模型输出与 text-model 断点续建、单步骤 stage manifest、`--resume/--force/--dry_run` |
+| 编排 | SfM/MVS 两段流程、完整 `recon_auto`、SfM 多模型输出与 text/binary model 断点续建、单步骤 stage manifest、`--resume/--force/--dry_run` |
 | 输出 | 带 RGB 的稀疏/稠密 PLY、法线、可见性、PLY 网格、OBJ/MTL/PNG 纹理 |
+| 模型工具 | analyze/align/transform/crop/split、独立 BA、重三角化和图像注册 |
+| 运行诊断 | glog 分级日志、阶段耗时、后端/线程/数量摘要和可复现实验输出 |
 
 ## 当前成熟度
 
@@ -60,7 +64,7 @@ colite/
     exe/                 统一 CLI、单步骤包装和流程编排
   tests/                 单元和集成测试
   scripts/               A/B、格式比较、合成数据和参数扫描脚本
-  data/                  本地测试图像（如 building-18、house）
+  data/                  本地测试图像；整个目录不进入公开 Git 仓库
   thirdparty/            项目级第三方源码（PoissonRecon、vcglib）
   references/            只读参考项目源码，不参与 Colite 常规构建
   output/                每次测试独立的日志、指标和产物；Git 忽略
@@ -80,6 +84,7 @@ colite/
 | Sift 项目 | 本地优化版本 | 并行、AVX2、CUDA SIFT 迁移来源 | 属于本项目控制的参考实现，迁移后仍需保持测试和 ABI 边界 |
 
 `references/` 默认被 Git 忽略。它用于阅读、构建参考程序和 A/B，不应成为 Colite 头文件或链接依赖。
+`data/` 同样被 Git 忽略；公开克隆不包含 House、mine 或 building-18 图像。
 
 ## 设计取舍
 

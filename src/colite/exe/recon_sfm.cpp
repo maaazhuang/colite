@@ -85,7 +85,16 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
          "local/global BA, default 1.\n"
       << "  --ba_refine_params <names>\n"
          "                            Comma-separated camera params to refine, "
-         "e.g. fx,fy,k1,p2.\n";
+         "e.g. fx,fy,k1,p2.\n"
+      << "  --use_position_priors <0|1>\n"
+         "                            Read EXIF GPS, align the model and add "
+         "position residuals to final BA; default 0.\n"
+      << "  --position_prior_stddev <m>\n"
+         "                            Position prior standard deviation, default 5.\n"
+      << "  --position_prior_loss_scale <m>\n"
+         "                            Huber loss scale, default 2.\n"
+      << "  --position_prior_alignment_max_error <m>\n"
+         "                            Alignment inlier threshold, default 20.\n";
 }
 
 std::string RequireValue(const std::vector<std::string>& args,
@@ -232,6 +241,17 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--ba_refine_params") {
       options.ba_refine_params =
           ParseCommaSeparatedNames(RequireValue(args, &i, arg), arg);
+    } else if (arg == "--use_position_priors") {
+      options.use_position_priors =
+          ParseBoolFlagValue(RequireValue(args, &i, arg), arg);
+    } else if (arg == "--position_prior_stddev") {
+      options.position_prior_stddev = std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--position_prior_loss_scale") {
+      options.position_prior_loss_scale =
+          std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--position_prior_alignment_max_error") {
+      options.position_prior_alignment_max_error =
+          std::stod(RequireValue(args, &i, arg));
     } else if (arg == "--matcher") {
       const std::string matcher = RequireValue(args, &i, arg);
       if (matcher == "bf") {
@@ -311,6 +331,14 @@ void ValidateOptions(const ReconSfmCliOptions& options) {
     throw std::invalid_argument(
         "--registration_retry_max_error must be positive");
   }
+  if (!std::isfinite(options.position_prior_stddev) ||
+      options.position_prior_stddev <= 0.0 ||
+      !std::isfinite(options.position_prior_loss_scale) ||
+      options.position_prior_loss_scale < 0.0 ||
+      !std::isfinite(options.position_prior_alignment_max_error) ||
+      options.position_prior_alignment_max_error <= 0.0) {
+    throw std::invalid_argument("Invalid position prior configuration");
+  }
 }
 
 controllers::ReconSfmControllerOptions ToControllerOptions(
@@ -365,6 +393,12 @@ controllers::ReconSfmControllerOptions ToControllerOptions(
         CameraParameterGroup::kDistortion;
   }
   controller_options.ba_refine_camera_param_names = options.ba_refine_params;
+  controller_options.use_position_priors = options.use_position_priors;
+  controller_options.position_prior_stddev = options.position_prior_stddev;
+  controller_options.position_prior_loss_scale =
+      options.position_prior_loss_scale;
+  controller_options.position_prior_alignment_max_error =
+      options.position_prior_alignment_max_error;
   return controller_options;
 }
 

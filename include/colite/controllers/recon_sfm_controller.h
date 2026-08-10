@@ -50,6 +50,10 @@ struct ReconSfmControllerOptions {
   double registration_retry_max_reprojection_error_px = 8.0;
   CameraParameterGroup ba_refine_camera_params = CameraParameterGroup::kNone;
   std::set<std::string> ba_refine_camera_param_names;
+  bool use_position_priors = false;
+  double position_prior_stddev = 5.0;
+  double position_prior_loss_scale = 2.0;
+  double position_prior_alignment_max_error = 20.0;
 };
 
 struct NearbyPairMatchingOptions {
@@ -77,6 +81,8 @@ struct ReconSfmRunStats {
   std::string camera_sharing_mode;
   std::size_t num_cameras = 0;
   std::size_t num_prior_focal_images = 0;
+  std::size_t num_position_prior_images = 0;
+  std::size_t num_position_prior_aligned_models = 0;
   double min_initial_focal_length = 0.0;
   double max_initial_focal_length = 0.0;
   int cpu_threads = 1;
@@ -102,6 +108,9 @@ struct ReconSfmRunStats {
   double weak_descriptor_search_work_seconds = 0.0;
   double weak_geometry_verification_work_seconds = 0.0;
   double incremental_mapping_seconds = 0.0;
+  double position_prior_refinement_seconds = 0.0;
+  double position_prior_initial_mean_error = -1.0;
+  double position_prior_final_mean_error = -1.0;
   double color_extraction_seconds = 0.0;
   double output_write_seconds = 0.0;
   double total_seconds = 0.0;

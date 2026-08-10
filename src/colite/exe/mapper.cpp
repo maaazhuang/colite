@@ -1,6 +1,7 @@
 #include "colite/exe/mapper.h"
 
 #include <cstdlib>
+#include <cmath>
 #include <exception>
 #include <ostream>
 #include <stdexcept>
@@ -24,7 +25,11 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --multiple_models <0|1>  Reconstruct remaining components, default 1.\n"
       << "  --merge_models <0|1>     Merge Sim(3)-alignable models, default 1.\n"
       << "  --max_num_models <n>     Maximum output models, default 50.\n"
-      << "  --min_model_size <n>     Minimum registered images per model, default 2.\n";
+      << "  --min_model_size <n>     Minimum registered images per model, default 2.\n"
+      << "  --use_position_priors <0|1> Align to workspace positions and constrain final BA.\n"
+      << "  --position_prior_stddev <m> Default 5.\n"
+      << "  --position_prior_loss_scale <m> Default 2.\n"
+      << "  --position_prior_alignment_max_error <m> Default 20.\n";
 }
 
 std::string RequireValue(const std::vector<std::string>& args,
@@ -92,6 +97,18 @@ int RunMapper(const std::vector<std::string>& args,
       } else if (arg == "--min_model_size") {
         options.min_num_images_per_model = static_cast<std::size_t>(
             std::stoull(RequireValue(args, &i, arg)));
+      } else if (arg == "--use_position_priors") {
+        options.use_position_priors =
+            ParseBool(RequireValue(args, &i, arg), arg);
+      } else if (arg == "--position_prior_stddev") {
+        options.position_prior_stddev =
+            std::stod(RequireValue(args, &i, arg));
+      } else if (arg == "--position_prior_loss_scale") {
+        options.position_prior_loss_scale =
+            std::stod(RequireValue(args, &i, arg));
+      } else if (arg == "--position_prior_alignment_max_error") {
+        options.position_prior_alignment_max_error =
+            std::stod(RequireValue(args, &i, arg));
       } else {
         throw std::invalid_argument("Unknown argument: " + arg);
       }
@@ -104,12 +121,24 @@ int RunMapper(const std::vector<std::string>& args,
       throw std::invalid_argument(
           "--max_num_models must be positive and --min_model_size >= 2");
     }
+    if (!std::isfinite(options.position_prior_stddev) ||
+        options.position_prior_stddev <= 0.0 ||
+        !std::isfinite(options.position_prior_loss_scale) ||
+        options.position_prior_loss_scale < 0.0 ||
+        !std::isfinite(options.position_prior_alignment_max_error) ||
+        options.position_prior_alignment_max_error <= 0.0) {
+      throw std::invalid_argument("Invalid position prior configuration");
+    }
     const auto summary = controllers::MapperController(options).Run();
     out << "Registered images: " << summary.num_registered_images << "\n"
         << "Sparse cache hit: " << (summary.cache_hit ? 1 : 0) << "\n"
         << "Sparse models: " << summary.num_models << "\n"
         << "Unregistered images: " << summary.num_unregistered_images << "\n"
-        << "Points3D: " << summary.num_points3d << "\n";
+        << "Points3D: " << summary.num_points3d << "\n"
+        << "Position-prior aligned models: "
+        << summary.num_position_prior_aligned_models << "\n"
+        << "Final mean position error: "
+        << summary.final_mean_position_error << "\n";
     return summary.success ? EXIT_SUCCESS : EXIT_FAILURE;
   } catch (const std::exception& exception) {
     err << "Error: " << exception.what() << "\n\n";

@@ -1,0 +1,42 @@
+name: Linux CPU
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build pkg-config \
+            libopencv-dev libeigen3-dev libceres-dev libgoogle-glog-dev \
+            libflann-dev liblz4-dev libgtest-dev \
+            libcgal-dev libboost-graph-dev libgmp-dev libmpfr-dev
+
+      - name: Configure
+        run: cmake --preset wsl-release
+
+      - name: Build
+        run: cmake --build --preset wsl-release --parallel 2
+
+      - name: Test
+        run: ctest --preset wsl-release
+
+      - name: Install smoke test
+        run: |
+          cmake --install build-wsl-release --prefix "$RUNNER_TEMP/colite-install"
+          "$RUNNER_TEMP/colite-install/bin/colite" --help

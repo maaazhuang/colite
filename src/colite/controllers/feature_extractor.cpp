@@ -1,6 +1,7 @@
 #include "colite/controllers/feature_extractor.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <exception>
 #include <fstream>
@@ -14,6 +15,8 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include <glog/logging.h>
 
 #include "colite/controllers/recon_sfm_controller.h"
 #include "colite/core/camera.h"
@@ -98,6 +101,11 @@ std::optional<FeatureExtractorControllerSummary> ReadCachedFeatureSummary(
       std::stoull(metadata.values.at("images")));
   summary.num_cameras = static_cast<std::size_t>(
       std::stoull(metadata.values.at("cameras")));
+  if (const auto it = metadata.values.find("features");
+      it != metadata.values.end()) {
+    summary.num_features =
+        static_cast<std::size_t>(std::stoull(it->second));
+  }
   summary.elapsed_seconds =
       std::stod(metadata.values.at("feature_extraction_seconds"));
   return summary;
@@ -139,10 +147,19 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
   if (image_paths.empty()) {
     throw std::runtime_error("No input images found");
   }
+  LOG(INFO) << "Feature extraction: images=" << image_paths.size()
+            << " backend="
+            << SiftBackendName(ResolveSiftBackend(options_.backend))
+            << " max_features=" << options_.max_num_features
+            << " requested_threads=" << options_.num_threads
+            << " workspace=" << options_.workspace_path.string();
   const std::string config_hash =
       StableConfigHash(FeatureCacheEntries(options_, image_paths));
   if (const auto cached_summary =
           ReadCachedFeatureSummary(options_.workspace_path, config_hash)) {
+    LOG(INFO) << "Feature extraction cache hit: images="
+              << cached_summary->num_images
+              << " features=" << cached_summary->num_features;
     return *cached_summary;
   }
 
@@ -187,6 +204,7 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
   ImageJobQueue jobs(image_paths.size());
   std::exception_ptr first_exception;
   std::mutex exception_mutex;
+  std::atomic<std::size_t> num_features{0};
 
   const auto worker = [&]() {
     while (true) {
@@ -197,6 +215,12 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
       try {
         const FeatureSet features =
             ExtractSiftFeaturesFromFile(image_paths[*job_idx], sift_options);
+        num_features.fetch_add(features.keypoints.size(),
+                               std::memory_order_relaxed);
+        VLOG(1) << "Extracted image " << (*job_idx + 1) << "/"
+                << image_paths.size() << ": " << features.keypoints.size()
+                << " features from "
+                << image_paths[*job_idx].filename().string();
         WriteWorkspaceFeatureSet(options_.workspace_path,
                                  static_cast<ImageId>(*job_idx + 1),
                                  features);
@@ -226,6 +250,7 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
   summary.success = true;
   summary.num_images = image_paths.size();
   summary.num_cameras = camera_setup.cameras.size();
+  summary.num_features = num_features.load(std::memory_order_relaxed);
   summary.elapsed_seconds = std::chrono::duration<double>(end - start).count();
   std::filesystem::create_directories(
       WorkspaceFeaturesPath(options_.workspace_path));
@@ -235,14 +260,20 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
                << "cameras " << summary.num_cameras << "\n"
                << "camera_mode "
                << CameraSharingModeName(options_.camera_sharing_mode) << "\n"
+               << "features " << summary.num_features << "\n"
                << "feature_extraction_seconds " << summary.elapsed_seconds
                << "\n";
   WriteWorkspaceCacheMetadata(
       options_.workspace_path, "features", config_hash,
       {{"images", std::to_string(summary.num_images)},
        {"cameras", std::to_string(summary.num_cameras)},
+       {"features", std::to_string(summary.num_features)},
        {"feature_extraction_seconds", ToConfigValue(summary.elapsed_seconds)}},
       FeatureRequiredFiles(image_paths.size()));
+  LOG(INFO) << "Feature extraction complete: images=" << summary.num_images
+            << " cameras=" << summary.num_cameras
+            << " features=" << summary.num_features
+            << " elapsed_seconds=" << summary.elapsed_seconds;
   return summary;
 }
 

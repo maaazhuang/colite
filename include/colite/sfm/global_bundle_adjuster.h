@@ -29,6 +29,9 @@ struct GlobalBundleAdjustmentOptions {
   std::set<ImageId> constant_image_ids;
   std::map<ImageId, std::vector<int>> constant_image_translation_idxs;
   BundleGaugeFixing gauge_fixing = BundleGaugeFixing::kFirstTwoImages;
+  bool use_position_priors = false;
+  double position_prior_stddev = 5.0;
+  double position_prior_loss_scale = 2.0;
 };
 
 struct GlobalBundleAdjustmentSummary {
@@ -38,8 +41,11 @@ struct GlobalBundleAdjustmentSummary {
   std::size_t num_variable_cameras = 0;
   std::size_t num_gauge_constant_translation_images = 0;
   std::size_t num_residuals = 0;
+  std::size_t num_position_priors = 0;
   double initial_mean_reprojection_error = -1.0;
   double final_mean_reprojection_error = -1.0;
+  double initial_mean_position_error = -1.0;
+  double final_mean_position_error = -1.0;
   std::set<ImageId> gauge_constant_pose_image_ids;
   std::map<ImageId, std::vector<int>> gauge_constant_translation_idxs;
   std::string message;

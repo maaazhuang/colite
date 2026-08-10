@@ -112,6 +112,9 @@ void VerifyCpuGpuOverlap(const SiftBackend cpu_backend,
   const std::filesystem::path image_path =
       std::filesystem::path(COLITE_SOURCE_DIR) / "data" / "building-18" /
       "P1180166.JPG";
+  if (!std::filesystem::exists(image_path)) {
+    GTEST_SKIP() << "Local building-18 dataset is not available.";
+  }
   const cv::Mat image = cv::imread(image_path.string(), cv::IMREAD_GRAYSCALE);
   ASSERT_FALSE(image.empty()) << image_path.string();
   parallel::setNumThreads(20);
@@ -159,6 +162,9 @@ TEST(SiftCpuWorkloadTest, ReportsColiteDefault8192OutputWorkload) {
   const std::filesystem::path image_path =
       std::filesystem::path(COLITE_SOURCE_DIR) / "data" / "building-18" /
       "P1180166.JPG";
+  if (!std::filesystem::exists(image_path)) {
+    GTEST_SKIP() << "Local building-18 dataset is not available.";
+  }
   const cv::Mat image = cv::imread(image_path.string(), cv::IMREAD_GRAYSCALE);
   ASSERT_FALSE(image.empty()) << image_path.string();
   parallel::setNumThreads(20);

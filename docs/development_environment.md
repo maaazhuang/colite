@@ -1,6 +1,7 @@
 # Colite 开发、编译与测试环境
 
-更新时间：2026-07-18。本文记录可复现的主环境；版本变化后应同步更新。
+更新时间：2026-08-10。本文记录项目已验证环境；通用安装步骤见根目录
+[`INSTALL.md`](../INSTALL.md)。版本变化后应同步更新。
 
 ## 当前主机与工具链
 
@@ -52,7 +53,10 @@ cmake --build --preset wsl-colite-cuda --parallel 2
 ctest --preset wsl-colite-cuda
 ```
 
-该 preset 显式开启：CUDA SIFT、CUDA 描述子匹配、CUDA MVS、SIFT 多线程、AVX2/FMA、Poisson、Delaunay 和测试，CUDA 架构为 89。
+该 preset 显式开启：CUDA SIFT、CUDA 描述子匹配、CUDA MVS、SIFT 多线程、
+AVX2/FMA、Poisson、Delaunay 和测试。共享 preset 不再写死 CUDA 13.2 路径或
+架构 89；当前主机的既有 build cache 仍使用架构 89。新机器应按 GPU 和 Toolkit
+显式设置 `CMAKE_CUDA_ARCHITECTURES`。
 
 CPU/通用 Release：
 
@@ -108,13 +112,16 @@ cmake --build build-wsl-colite-cuda --parallel 2
 ctest --test-dir build-wsl-colite-cuda --output-on-failure --parallel 2
 ```
 
-2026-07-30 每图相机/EXIF/混合尺寸、CUDA matcher、SfM 并行/缓存、PatchMatch
-几何覆盖、COLMAP dense-map 兼容和 Stereo Fusion 候选解耦后为 320/320；
-全部测试通过，
+2026-08-10 GPS/位置先验、模型工具、统一日志和发布准备后，当前 CUDA Release
+完整本地套件为 352/352；全部测试通过，
 其中 1 个“CUDA 不可用时应失败”的条件测试在 CUDA 可用环境中按设计跳过。
 House 实测摘要同时记录 `feature_backend cuda_vlfeat`、
 `cuda_sift_available 1`、`cuda_matcher_available 1` 和 `cpu_threads 8`，
 不可只根据构建目录名称判断 CUDA 是否启用。
+
+公开仓库不包含 `data/` 和 `references/`。缺少本地数据时，与 building-18 EXIF
+和 CPU/CUDA 实图重叠相关的测试会按设计跳过；缺少 VLFeat reference tree 时，
+仅 reference-consistency 测试不会被登记。CI 仍执行其余合成和集成测试。
 
 定向测试：
 

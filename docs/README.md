@@ -1,5 +1,9 @@
 # Colite 开发文档
 
+公共项目简介和安装入口分别位于仓库根目录的
+[`README.md`](../README.md) 与 [`INSTALL.md`](../INSTALL.md)。本目录保存架构、
+算法、CLI、验证环境和基准等长期技术文档。
+
 本文档目录是项目长期维护入口。内容以当前代码和构建配置为准，不再保存逐日开发流水账；单次测试的完整命令、日志和产物统一放在仓库根目录的 `output/` 下。
 
 ## 推荐阅读顺序
@@ -14,7 +18,7 @@
 
 ## 五分钟快速开始
 
-Windows 工作区：
+内部已验证的 Windows 工作区：
 
 ```text
 D:\Code\CXX\colite
@@ -31,6 +35,9 @@ ctest --preset wsl-colite-cuda
 COLITE=./build-wsl-colite-cuda/src/colite/exe/colite
 $COLITE --help
 ```
+
+公开仓库不分发 `data/` 下的数据集。下列 building-18 示例仅适用于已经在本地
+准备相应数据的开发环境；普通用户应替换为自己的图像目录。
 
 快速查看完整流程但不执行：
 

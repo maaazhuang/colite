@@ -23,6 +23,10 @@ struct MapperControllerOptions {
   CameraParameterGroup ba_refine_camera_params =
       CameraParameterGroup::kFocalLength | CameraParameterGroup::kDistortion;
   std::set<std::string> ba_refine_camera_param_names;
+  bool use_position_priors = false;
+  double position_prior_stddev = 5.0;
+  double position_prior_loss_scale = 2.0;
+  double position_prior_alignment_max_error = 20.0;
 };
 
 struct MapperControllerSummary {
@@ -32,6 +36,8 @@ struct MapperControllerSummary {
   std::size_t num_points3d = 0;
   std::size_t num_models = 0;
   std::size_t num_unregistered_images = 0;
+  std::size_t num_position_prior_aligned_models = 0;
+  double final_mean_position_error = -1.0;
 };
 
 class MapperController {
