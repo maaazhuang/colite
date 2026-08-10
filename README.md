@@ -1,5 +1,7 @@
 # Colite
 
+English | [简体中文](README_zh-CN.md)
+
 Colite is an experimental C++17 structure-from-motion and multi-view stereo
 system. It reconstructs COLMAP-compatible sparse models, RGB dense point
 clouds, Poisson or Delaunay meshes, and textured OBJ models from images.

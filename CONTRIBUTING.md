@@ -17,6 +17,10 @@ Do not commit datasets, reconstruction outputs, build directories, reference
 source trees, IDE state or machine-specific presets. Test logs and generated
 artifacts belong in a unique ignored `output/` subdirectory.
 
+The repository intentionally normalizes text files to UTF-8 with LF line
+endings through `.gitattributes` and `.editorconfig`. This applies to Windows
+checkouts as well and avoids line-ending churn between native tools and WSL.
+
 ## Licensing and clean-room boundaries
 
 By contributing, you agree that your contribution is licensed under the
