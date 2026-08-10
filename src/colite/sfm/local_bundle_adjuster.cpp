@@ -9,10 +9,10 @@
 
 #include <Eigen/Geometry>
 #include <ceres/ceres.h>
-#include <ceres/local_parameterization.h>
 
 #include "colite/core/geometry.h"
 #include "colite/core/parallel.h"
+#include "ceres_manifold_compat.h"
 
 namespace colite {
 namespace {
@@ -634,8 +634,7 @@ LocalBundleAdjustmentSummary AdjustLocalBundle(
   summary.gauge_constant_translation_idxs = constant_translation_idxs;
 
   for (auto& [image_id, block] : pose_blocks) {
-    problem.AddParameterBlock(
-        block.q_xyzw, 4, new ceres::EigenQuaternionParameterization());
+    ceres_compat::AddEigenQuaternionParameterBlock(&problem, block.q_xyzw);
     problem.AddParameterBlock(block.t, 3);
     const bool is_local_image =
         local_image_ids.find(image_id) != local_image_ids.end();
@@ -651,9 +650,8 @@ LocalBundleAdjustmentSummary AdjustLocalBundle(
       const auto translation_it = constant_translation_idxs.find(image_id);
       if (translation_it != constant_translation_idxs.end() &&
           !translation_it->second.empty()) {
-        problem.SetParameterization(
-            block.t,
-            new ceres::SubsetParameterization(3, translation_it->second));
+        ceres_compat::SetSubsetParameterization(
+            &problem, block.t, 3, translation_it->second);
         ++summary.num_gauge_constant_translation_images;
       }
     }
@@ -701,10 +699,9 @@ LocalBundleAdjustmentSummary AdjustLocalBundle(
     } else {
       ++summary.num_variable_cameras;
       if (!constant_indices.empty()) {
-        problem.SetParameterization(
-            params.data(),
-            new ceres::SubsetParameterization(
-                static_cast<int>(params.size()), constant_indices));
+        ceres_compat::SetSubsetParameterization(
+            &problem, params.data(), static_cast<int>(params.size()),
+            constant_indices);
       }
     }
   }
