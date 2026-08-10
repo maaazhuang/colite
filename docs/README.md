@@ -53,7 +53,7 @@ $COLITE recon_auto \
 ```text
 项目位于 D:\Code\CXX\colite，主开发环境是 WSL Ubuntu-22.04，主构建目录是
 build-wsl-colite-cuda。请先完整阅读 docs/README.md 及其链接的项目概况、架构、
-开发环境和开发规范，再检查 AGENTS.md、git status、CMakeCache.txt 和相关测试。
+开发环境和开发规范，再检查 git status、CMakeCache.txt 和相关测试。
 不要重置已有工作树；参考源码只用于理解和 A/B，尤其不得直接复制 OpenMVS AGPL 代码。
 所有新测试的日志、中间结果和产物必须进入新的 output/<测试名>_<YYYYMMDD>/，
 并附中文测试说明。

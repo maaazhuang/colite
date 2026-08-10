@@ -28,7 +28,7 @@ std::vector<Eigen::Vector3d> ScenePoints(double x_offset = 0.0) {
   for (int y = 0; y < 4; ++y) {
     for (int x = 0; x < 6; ++x) {
       points.emplace_back(x_offset - 1.0 + 0.4 * x, -0.5 + 0.3 * y,
-                          4.0 + 0.07 * x + 0.09 * y);
+                          4.0 + 0.07 * x + 0.09 * y + 0.02 * x * y);
     }
   }
   return points;

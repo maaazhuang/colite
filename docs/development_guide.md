@@ -3,7 +3,7 @@
 ## 新任务开始前
 
 1. 阅读 [文档入口](README.md)、[项目概况](project_overview.md)、[架构](architecture_and_pipeline.md) 和本文件。
-2. 阅读根目录 `AGENTS.md`，确认输出目录规则。
+2. 阅读本开发规范，确认输出目录和测试记录规则。
 3. 在 WSL 执行 `git status --short`，识别用户已有改动；不得把脏工作树当成可清理内容。
 4. 检查目标构建的 `CMakeCache.txt`，确认 CUDA、CGAL、PoseLib 和 Build Type。
 5. 先运行相关定向测试建立基线，再修改代码。
