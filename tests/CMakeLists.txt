@@ -7,6 +7,7 @@ set(COLITE_CORE_TEST_SOURCES
   core/reconstruction_test.cpp
   features/sift_extractor_test.cpp
   features/aliked_extractor_test.cpp
+  features/official_onnx_golden_test.cpp
   features/sift_cpu_cuda_overlap_test.cpp
   integration/recon_mvs_exe_test.cpp
   integration/recon_sfm_exe_test.cpp
@@ -33,6 +34,7 @@ set(COLITE_CORE_TEST_SOURCES
   sfm/global_bundle_adjuster_test.cpp
   sfm/global_mapper_test.cpp
   sfm/global_pose_graph_test.cpp
+  sfm/hierarchical_mapper_test.cpp
   sfm/image_registrar_test.cpp
   sfm/incremental_initializer_test.cpp
   sfm/incremental_mapper_test.cpp

@@ -61,6 +61,7 @@ TEST(ReconSfmExeTest, PrintsHelp) {
   EXPECT_NE(out.str().find("--feature_type"), std::string::npos);
   EXPECT_NE(out.str().find("aliked_lightglue"), std::string::npos);
   EXPECT_NE(out.str().find("--mapper"), std::string::npos);
+  EXPECT_NE(out.str().find("hierarchical"), std::string::npos);
   EXPECT_NE(out.str().find("--feature_num_threads"), std::string::npos);
   EXPECT_NE(out.str().find("--camera_mode"), std::string::npos);
   EXPECT_NE(out.str().find("--camera_model"), std::string::npos);
@@ -156,6 +157,18 @@ TEST(ReconSfmExeTest, RejectsUnknownMapperType) {
       out, err);
   EXPECT_NE(exit_code, 0);
   EXPECT_NE(err.str().find("Unsupported mapper"), std::string::npos);
+}
+
+TEST(ReconSfmExeTest, RejectsInvalidHierarchicalClusterLimits) {
+  std::ostringstream out;
+  std::ostringstream err;
+  const int exit_code = exe::RunReconSfm(
+      {"recon_sfm", "--image_path", "images", "--output_path", "out",
+       "--mapper", "hierarchical", "--hierarchical_target_cluster_size",
+       "10", "--hierarchical_max_cluster_size", "5"},
+      out, err);
+  EXPECT_NE(exit_code, 0);
+  EXPECT_NE(err.str().find("cluster size"), std::string::npos);
 }
 
 TEST(ReconSfmExeTest, RejectsInvalidRegistrationRetryOptions) {

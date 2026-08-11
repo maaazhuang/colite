@@ -122,7 +122,7 @@ FeatureSet ExtractAlikedFeatures(const cv::Mat& image,
   features::ValidateOnnxNode(model.InputNames()[2], "min_score",
                              model.InputShapes()[2], {});
   features::ValidateOnnxNode(model.OutputNames()[0], "keypoints",
-                             model.OutputShapes()[0], {-1, -1, 2});
+                             model.OutputShapes()[0], {-1, -1, -1});
   features::ValidateOnnxNode(model.OutputNames()[1], "descriptors",
                              model.OutputShapes()[1], {-1, -1, -1});
   features::ValidateOnnxNode(model.OutputNames()[2], "scores",

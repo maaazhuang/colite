@@ -36,6 +36,7 @@
 #include "colite/io/camera_prior.h"
 #include "colite/sfm/global_bundle_adjuster.h"
 #include "colite/sfm/global_mapper.h"
+#include "colite/sfm/hierarchical_mapper.h"
 #include "colite/sfm/similarity_transform.h"
 #include "colite/io/sfm_workspace.h"
 #include "colite/matching/descriptor_matcher.h"
@@ -1263,6 +1264,12 @@ std::string ReconSparseConfigHash(
        {"algorithm_version", "recon_sfm_resume_multimodel_v6_pose_guided_tracks"},
        {"frontend_hash", frontend_hash},
        {"mapper_type", std::to_string(static_cast<int>(options.mapper_type))},
+       {"hierarchical_target_cluster_size",
+        std::to_string(options.hierarchical_target_cluster_size)},
+       {"hierarchical_max_cluster_size",
+        std::to_string(options.hierarchical_max_cluster_size)},
+       {"hierarchical_overlap",
+        std::to_string(options.hierarchical_overlap)},
        {"input_model", options.input_model_path.generic_string()},
        {"input_format", ColmapModelFormatToString(options.input_model_format)},
        {"output_format", ColmapModelFormatToString(options.output_model_format)},
@@ -1356,10 +1363,10 @@ int ReconSfmController::Run(std::ostream& out) const {
       options.learned_matcher_model_path.empty()) {
     throw std::invalid_argument("LightGlue matching requires a model path");
   }
-  if (options.mapper_type == SfmMapperType::kGlobal &&
+  if (options.mapper_type != SfmMapperType::kIncremental &&
       !options.input_model_path.empty()) {
     throw std::invalid_argument(
-        "Global mapping does not yet support continuing an input model");
+        "Global and hierarchical mapping do not support continuing an input model");
   }
   LOG(INFO) << "SfM pipeline: images=" << image_paths.size()
             << " image_path=" << image_dir.string()
@@ -1466,9 +1473,17 @@ int ReconSfmController::Run(std::ostream& out) const {
 
 
   ReconSfmRunStats run_stats;
-  run_stats.mapper_type = options.mapper_type == SfmMapperType::kGlobal
-                              ? "global"
-                              : "incremental";
+  switch (options.mapper_type) {
+    case SfmMapperType::kIncremental:
+      run_stats.mapper_type = "incremental";
+      break;
+    case SfmMapperType::kGlobal:
+      run_stats.mapper_type = "global";
+      break;
+    case SfmMapperType::kHierarchical:
+      run_stats.mapper_type = "hierarchical";
+      break;
+  }
   const SiftBackend resolved_feature_backend =
       ResolveSiftBackend(options.feature_backend);
   run_stats.feature_backend = options.feature_extractor_type ==
@@ -1727,6 +1742,48 @@ int ReconSfmController::Run(std::ostream& out) const {
     mapping_result.models.push_back(std::move(reconstruction));
     mapping_result.mapping_summaries.push_back(
         std::move(compatible_summary));
+  } else if (options.mapper_type == SfmMapperType::kHierarchical) {
+    HierarchicalMappingOptions hierarchical_options;
+    hierarchical_options.clustering.target_cluster_size =
+        options.hierarchical_target_cluster_size;
+    hierarchical_options.clustering.max_cluster_size =
+        options.hierarchical_max_cluster_size;
+    hierarchical_options.clustering.overlap =
+        options.hierarchical_overlap;
+    hierarchical_options.local_mapping = mapping_options;
+    hierarchical_options.merging = multi_options.merging;
+    hierarchical_options.final_bundle_adjustment =
+        mapping_options.global_bundle_adjustment;
+    hierarchical_options.min_num_images_per_local_model =
+        options.min_num_images_per_model;
+    const HierarchicalMappingSummary hierarchical_summary =
+        RunHierarchicalMapping(graph, hierarchical_options, &reconstruction);
+    if (!hierarchical_summary.success) {
+      throw std::runtime_error("Hierarchical SfM failed: " +
+                               hierarchical_summary.message);
+    }
+    IncrementalMappingSummary compatible_summary;
+    compatible_summary.success = true;
+    compatible_summary.num_registered_images =
+        hierarchical_summary.num_registered_images;
+    compatible_summary.num_points3d = hierarchical_summary.num_points3d;
+    compatible_summary.global_bundle_adjustment =
+        hierarchical_summary.final_bundle_adjustment;
+    compatible_summary.message = hierarchical_summary.message;
+    mapping_result.num_unregistered_images =
+        reconstruction.Images().size() -
+        reconstruction.RegisteredImageIds().size();
+    mapping_result.models.push_back(std::move(reconstruction));
+    mapping_result.mapping_summaries.push_back(
+        std::move(compatible_summary));
+    LOG(INFO) << "Hierarchical mapping: clusters="
+              << hierarchical_summary.clustering.num_clusters
+              << " local_models="
+              << hierarchical_summary.num_successful_local_models
+              << " merged="
+              << hierarchical_summary.num_merged_local_models
+              << " unmerged="
+              << hierarchical_summary.num_unmerged_local_models;
   } else {
     mapping_result = RunIncrementalMappingMultiple(
         graph, multi_options, std::move(reconstruction));

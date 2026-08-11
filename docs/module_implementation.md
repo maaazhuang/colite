@@ -57,6 +57,14 @@ OpenCV-like 高斯边界使用周期折叠的 reflect/`REFLECT_101` 映射，支
 但 view-graph calibration 和固定旋转的位置/结构优化仍需继续增强，不能视为
 与完整 GLOMAP 数值行为等价。
 
+层次 SfM 位于 `src/colite/sfm/hierarchical_mapper.cpp`：verified view graph 先按
+目标规模、最大规模和重叠图像数分区，每个 cluster 在显式 image-ID 约束下执行
+局部增量重建；局部模型按注册规模排序，通过 verified 3D-3D 对应估计鲁棒 Sim(3)
+并合并。暂时无法合并的模型会在其他模型并入后重试，以覆盖链式重叠；合并结果最终
+执行一次全局 BA。`recon_sfm --mapper hierarchical` 与
+`recon_auto --sfm.mapper hierarchical` 已接入同一输出协议。当前局部任务顺序执行，
+大规模数据集的并行调度、模型图联合优化和系统 A/B 仍是后续增强项。
+
 structure-less 注册是增量 mapper 的显式回退：PnP 失败后，从至少两个已注册
 邻居的 verified relative pose 生成一致位姿假设，再继续 track 创建和局部优化。
 默认关闭。`transitive_matcher` 只生成新候选 pair，匹配证据仍来自真实描述子匹配
@@ -134,10 +142,10 @@ Core 当前登记并完整支持 12 个模型：
 6. `sparse/` 或 `recon_sfm` 输出根目录保存最大模型；`models/<index>/` 保存全部模型。
    `multiple_models=0` 只保留一个初始化机会，`merge_models=0` 保留可对齐模型为独立结果。
 
-当前仍是多模型增量 Mapper，不是 hierarchical/global Mapper。下一阶段若面向数百至数千图，
-优先实现 hierarchical mapper：对 verified 图做重叠分区、局部增量重建、基于公共 track 的
-Sim(3) 模型图优化、分层合并和最终全局 BA。Global mapper 还需要独立的旋转平均、平移平均、
-全局三角化及其鲁棒退化处理，不能仅把当前增量注册循环替换为一次全局求解。
+incremental、global 与 hierarchical 三种 Mapper 均已形成可运行链路。后两者仍需在
+数百至数千图数据集上验证退化行为、内存和 wall time；hierarchical 后续重点是并行局部任务
+与模型图联合优化，global 后续重点是更完整的 view-graph calibration、固定旋转的位置/结构
+优化和分阶段重三角化。
 
 当前三角化语义：
 

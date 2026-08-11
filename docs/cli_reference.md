@@ -217,11 +217,15 @@ diagnostics 和 summary。最大模型位于输出根目录，全部模型位于
 
 新增前端和 mapper 参数：`--feature_type sift|aliked_n16rot|aliked_n32`、
 `--aliked_model_path`、`--learned_matcher_model_path`、
-`--mapper incremental|global`。全局模式从 verified view graph 完成旋转平均、
+`--mapper incremental|global|hierarchical`。全局模式从 verified view graph 完成旋转平均、
 相机中心估计、track 三角化和全局 BA；首版不接受 `--input_model_path`。
+层次模式通过 `--hierarchical_target_cluster_size`、
+`--hierarchical_max_cluster_size` 和 `--hierarchical_overlap` 控制重叠分区，
+逐簇执行局部增量重建，重试合并具有公共 verified track 的局部模型，最后执行全局 BA；
+该模式同样不接受 `--input_model_path`。
 增量模式可用 `--structureless_registration 1` 显式启用 PnP 失败后的多邻居
 相对位姿回退。`recon_auto` 中对应写法为 `--sfm.mapper global` 和
-`--sfm.structureless_registration 1`。
+`--sfm.mapper hierarchical`，以及 `--sfm.structureless_registration 1`。
 特征/匹配/内点数量，以及各流程耗时。当前 CUDA 后端加速首轮全局 BF；极线
 走廊 guided 重搜索仍走 CPU。`recon_auto` 通过 `--sfm.<option>` 转发上述
 相机模型、参数和分组策略。
