@@ -51,10 +51,15 @@ add_library(colite_core
   features/backends/sift_opencv.cpp
   features/backends/sift_vlfeat.c
   ${COLITE_CUDA_SIFT_SOURCES}
+  features/aliked_extractor.cpp
+  features/onnx_runtime.cpp
   features/sift_extractor.cpp
   io/camera_prior.cpp
+  io/image_reader.cpp
+  io/model_resource.cpp
   io/sfm_workspace.cpp
   matching/descriptor_matcher.cpp
+  matching/learned_matcher.cpp
   ${COLITE_CUDA_MATCHER_SOURCES}
   matching/guided_matching.cpp
   matching/match_graph_consistency.cpp
@@ -74,15 +79,21 @@ add_library(colite_core
   mvs/patch_match.cpp
   ${COLITE_CUDA_MVS_SOURCES}
   sfm/global_bundle_adjuster.cpp
+  sfm/global_mapper.cpp
+  sfm/global_positioner.cpp
   sfm/image_registrar.cpp
   sfm/incremental_initializer.cpp
   sfm/incremental_mapper.cpp
   sfm/incremental_triangulator.cpp
   sfm/local_bundle_adjuster.cpp
+  sfm/model_clusterer.cpp
   sfm/observation_manager.cpp
   sfm/observation_filter.cpp
   sfm/reconstruction_manager.cpp
+  sfm/rotation_averager.cpp
   sfm/similarity_transform.cpp
+  sfm/structureless_registrar.cpp
+  sfm/view_graph.cpp
 )
 
 target_include_directories(colite_core
@@ -126,6 +137,11 @@ target_link_libraries(colite_core
     ${LZ4_LIBRARY}
     ${OpenCV_LIBS}
 )
+
+if(COLITE_ENABLE_ONNX)
+  target_link_libraries(colite_core PUBLIC onnxruntime::onnxruntime)
+  target_compile_definitions(colite_core PUBLIC COLITE_ENABLE_ONNX=1)
+endif()
 
 if(PoseLib_FOUND)
   target_link_libraries(colite_core PRIVATE PoseLib::PoseLib)

@@ -15,6 +15,7 @@
 5. [模块实现说明](module_implementation.md)：SIFT、匹配、Mapper、PatchMatch、Fusion、网格和纹理的实现边界。
 6. [开发与验证规范](development_guide.md)：新任务检查清单、测试顺序、A/B 口径、输出目录和许可证约束。
 7. [开源项目对比测试](benchmark_comparison.md)：COLMAP、OpenMVG、OpenMVS 的代表性基准和剩余差距。
+8. [COLMAP 4.0 特性差异与路线图](colmap4_feature_gap_roadmap.md)：排除 rig 和特殊相机模型后的能力矩阵、优先级与验收标准。
 
 ## 五分钟快速开始
 

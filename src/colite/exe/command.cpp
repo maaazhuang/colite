@@ -41,6 +41,8 @@ constexpr Command kCommands[] = {
      &RunSpatialMatcher},
     {"vocab_tree_matcher", "Retrieve candidate pairs with visual words.",
      &RunVocabTreeMatcher},
+    {"transitive_matcher", "Expand verified paths and match new image pairs.",
+     &RunTransitiveMatcher},
     {"vocab_tree_builder", "Build a persistent hierarchical vocabulary tree.",
      &RunVocabTreeBuilder},
     {"mapper", "Run incremental SfM from a file workspace.", &RunMapper},

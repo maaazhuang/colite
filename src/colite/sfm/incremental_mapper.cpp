@@ -154,8 +154,14 @@ std::vector<ImageCandidate> CollectImageCandidates(
             max_num_registration_trials_per_image) {
       continue;
     }
-    if (candidate.num_visible_points >=
-        options.registration.min_num_correspondences) {
+    const bool pnp_ready = candidate.num_visible_points >=
+                           options.registration.min_num_correspondences;
+    const bool structureless_ready =
+        options.use_structureless_registration &&
+        candidate.num_registered_neighbors >=
+            options.structureless_registration
+                .min_num_registered_neighbors;
+    if (pnp_ready || structureless_ready) {
       candidates.push_back(candidate);
     }
   }
@@ -433,8 +439,27 @@ IncrementalMapperSummary RegisterNextImage(
                                       reconstruction);
   summary.registration_seconds = ElapsedSeconds(stage_start);
   if (!summary.registration.success) {
-    summary.message = summary.registration.message;
-    return summary;
+    if (!options.use_structureless_registration) {
+      summary.message = summary.registration.message;
+      return summary;
+    }
+    summary.structureless_registration = EstimateStructurelessPose(
+        graph, image_id, *reconstruction,
+        options.structureless_registration);
+    if (!summary.structureless_registration.success) {
+      summary.message = summary.registration.message + "; " +
+                        summary.structureless_registration.message;
+      return summary;
+    }
+    Image& image = reconstruction->GetImage(image_id);
+    image.cam_from_world = summary.structureless_registration.pose;
+    reconstruction->RegisterImage(image_id);
+    summary.used_structureless_registration = true;
+    summary.registration.success = true;
+    summary.registration.num_inliers =
+        summary.structureless_registration.num_consistent_hypotheses;
+    summary.registration.message =
+        "Registered from consistent relative-pose hypotheses";
   }
 
   // 2. 先把新图像能挂到已有 3D 点上的观测补齐，再创建新的 track。

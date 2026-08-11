@@ -24,6 +24,11 @@ bool IsCudaDescriptorMatcherAvailable();
 struct DescriptorMatchingOptions {
   DescriptorMatcherBackend backend = DescriptorMatcherBackend::kBruteForce;
 
+  // Logical matcher contract. P0 only executes the SIFT brute-force family;
+  // learned matchers use this field to reject incompatible feature types
+  // before inference is attempted.
+  FeatureMatcherType matcher_type = FeatureMatcherType::kSiftBruteForce;
+
   // Lowe ratio test 阈值。COLMAP SIFT 默认值为 0.8。
   double max_ratio = 0.8;
 

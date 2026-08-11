@@ -17,6 +17,74 @@
 namespace colite {
 namespace {
 
+constexpr std::uint32_t kFeatureFileMagic = 0x434C4654U;
+constexpr std::uint32_t kFeatureFileVersion = 2;
+constexpr std::uint64_t kFnvOffsetBasis = 14695981039346656037ULL;
+constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
+constexpr std::uint64_t kMaxFeatureFilePayloadBytes = 8ULL * 1024 * 1024 * 1024;
+
+void HashBytes(std::uint64_t* hash, const void* data, std::size_t size) {
+  const auto* bytes = static_cast<const std::uint8_t*>(data);
+  for (std::size_t idx = 0; idx < size; ++idx) {
+    *hash ^= bytes[idx];
+    *hash *= kFnvPrime;
+  }
+}
+
+std::uint64_t FeaturePayloadChecksum(const FeatureSet& features) {
+  std::uint64_t hash = kFnvOffsetBasis;
+  for (const FeatureKeypoint& keypoint : features.keypoints) {
+    HashBytes(&hash, &keypoint.x, sizeof(keypoint.x));
+    HashBytes(&hash, &keypoint.y, sizeof(keypoint.y));
+    HashBytes(&hash, &keypoint.scale, sizeof(keypoint.scale));
+    HashBytes(&hash, &keypoint.orientation, sizeof(keypoint.orientation));
+    HashBytes(&hash, &keypoint.response, sizeof(keypoint.response));
+  }
+  if (features.descriptors.size() > 0) {
+    HashBytes(&hash, features.descriptors.data(),
+              static_cast<std::size_t>(features.descriptors.size()) *
+                  sizeof(float));
+  }
+  return hash;
+}
+
+FeatureExtractorType ParseFeatureExtractorType(std::uint32_t value) {
+  const auto type = static_cast<FeatureExtractorType>(value);
+  if (type != FeatureExtractorType::kSift &&
+      type != FeatureExtractorType::kAlikedN16Rot &&
+      type != FeatureExtractorType::kAlikedN32) {
+    throw std::runtime_error("Unsupported feature extractor type");
+  }
+  return type;
+}
+
+DescriptorScalarType ParseDescriptorScalarType(std::uint32_t value) {
+  const auto type = static_cast<DescriptorScalarType>(value);
+  if (type != DescriptorScalarType::kFloat32) {
+    throw std::runtime_error("Unsupported descriptor scalar type");
+  }
+  return type;
+}
+
+DescriptorMetric ParseDescriptorMetric(std::uint32_t value) {
+  const auto metric = static_cast<DescriptorMetric>(value);
+  if (metric != DescriptorMetric::kSiftAngular &&
+      metric != DescriptorMetric::kCosine) {
+    throw std::runtime_error("Unsupported descriptor metric");
+  }
+  return metric;
+}
+
+DescriptorNormalization ParseDescriptorNormalization(std::uint32_t value) {
+  const auto normalization = static_cast<DescriptorNormalization>(value);
+  if (normalization != DescriptorNormalization::kNone &&
+      normalization != DescriptorNormalization::kRootL1 &&
+      normalization != DescriptorNormalization::kL2) {
+    throw std::runtime_error("Unsupported descriptor normalization");
+  }
+  return normalization;
+}
+
 std::vector<std::string> DataLines(const std::filesystem::path& path) {
   std::ifstream file(path);
   if (!file) {
@@ -425,22 +493,43 @@ std::vector<Image> ReadWorkspaceImages(
 void WriteWorkspaceFeatureSet(const std::filesystem::path& workspace_path,
                               const ImageId image_id,
                               const FeatureSet& features) {
+  if (features.descriptors.size() != 0 &&
+      features.descriptors.rows() !=
+          static_cast<Eigen::Index>(features.keypoints.size())) {
+    throw std::invalid_argument(
+        "Feature keypoint and descriptor row counts do not match");
+  }
   std::filesystem::create_directories(WorkspaceFeaturesPath(workspace_path));
   std::ofstream file(WorkspaceFeaturesPath(workspace_path) /
                          (std::to_string(image_id) + ".bin"),
                      std::ios::binary);
-  const std::uint32_t magic = 0x434C4654U;
-  const std::uint32_t version = 1;
+  const std::uint32_t extractor_type =
+      static_cast<std::uint32_t>(features.extractor_type);
+  const std::uint32_t scalar_type =
+      static_cast<std::uint32_t>(features.descriptor_scalar_type);
+  const std::uint32_t descriptor_metric =
+      static_cast<std::uint32_t>(features.descriptor_metric);
+  const std::uint32_t descriptor_normalization =
+      static_cast<std::uint32_t>(features.descriptor_normalization);
   const std::uint64_t num_keypoints = features.keypoints.size();
   const std::uint64_t rows = static_cast<std::uint64_t>(
       features.descriptors.rows());
   const std::uint64_t cols = static_cast<std::uint64_t>(
       features.descriptors.cols());
-  WriteBinary(&file, magic);
-  WriteBinary(&file, version);
+  const std::uint64_t payload_bytes =
+      rows * cols * static_cast<std::uint64_t>(sizeof(float));
+  const std::uint64_t payload_checksum = FeaturePayloadChecksum(features);
+  WriteBinary(&file, kFeatureFileMagic);
+  WriteBinary(&file, kFeatureFileVersion);
+  WriteBinary(&file, extractor_type);
+  WriteBinary(&file, scalar_type);
+  WriteBinary(&file, descriptor_metric);
+  WriteBinary(&file, descriptor_normalization);
   WriteBinary(&file, num_keypoints);
   WriteBinary(&file, rows);
   WriteBinary(&file, cols);
+  WriteBinary(&file, payload_bytes);
+  WriteBinary(&file, payload_checksum);
   for (const FeatureKeypoint& keypoint : features.keypoints) {
     WriteBinary(&file, keypoint.x);
     WriteBinary(&file, keypoint.y);
@@ -474,11 +563,52 @@ FeatureSet ReadWorkspaceFeatureSet(const std::filesystem::path& workspace_path,
   ReadBinary(&file, &num_keypoints);
   ReadBinary(&file, &rows);
   ReadBinary(&file, &cols);
-  if (magic != 0x434C4654U || version != 1) {
+  if (magic != kFeatureFileMagic || (version != 1 && version != 2)) {
     throw std::runtime_error("Unsupported feature file format");
   }
 
   FeatureSet features;
+  std::uint64_t payload_bytes = 0;
+  std::uint64_t expected_checksum = 0;
+  if (version == 2) {
+    std::uint32_t extractor_type = 0;
+    std::uint32_t scalar_type = 0;
+    std::uint32_t descriptor_metric = 0;
+    std::uint32_t descriptor_normalization = 0;
+    // Version 2 metadata precedes the dimensions. Re-read the header from the
+    // first field after version, since version 1 placed dimensions here.
+    file.seekg(static_cast<std::streamoff>(2 * sizeof(std::uint32_t)),
+               std::ios::beg);
+    ReadBinary(&file, &extractor_type);
+    ReadBinary(&file, &scalar_type);
+    ReadBinary(&file, &descriptor_metric);
+    ReadBinary(&file, &descriptor_normalization);
+    ReadBinary(&file, &num_keypoints);
+    ReadBinary(&file, &rows);
+    ReadBinary(&file, &cols);
+    ReadBinary(&file, &payload_bytes);
+    ReadBinary(&file, &expected_checksum);
+    features.extractor_type = ParseFeatureExtractorType(extractor_type);
+    features.descriptor_scalar_type =
+        ParseDescriptorScalarType(scalar_type);
+    features.descriptor_metric = ParseDescriptorMetric(descriptor_metric);
+    features.descriptor_normalization =
+        ParseDescriptorNormalization(descriptor_normalization);
+  }
+  if ((rows != 0 && rows != num_keypoints) ||
+      rows > static_cast<std::uint64_t>(std::numeric_limits<int>::max()) ||
+      cols > static_cast<std::uint64_t>(std::numeric_limits<int>::max()) ||
+      (cols != 0 && rows > std::numeric_limits<std::uint64_t>::max() / cols) ||
+      rows * cols > std::numeric_limits<std::uint64_t>::max() / sizeof(float)) {
+    throw std::runtime_error("Invalid feature matrix dimensions");
+  }
+  const std::uint64_t expected_payload_bytes = rows * cols * sizeof(float);
+  if (expected_payload_bytes > kMaxFeatureFilePayloadBytes) {
+    throw std::runtime_error("Feature descriptor payload is unreasonably large");
+  }
+  if (version == 2 && payload_bytes != expected_payload_bytes) {
+    throw std::runtime_error("Invalid descriptor payload size");
+  }
   features.keypoints.resize(static_cast<std::size_t>(num_keypoints));
   for (FeatureKeypoint& keypoint : features.keypoints) {
     ReadBinary(&file, &keypoint.x);
@@ -495,6 +625,12 @@ FeatureSet ReadWorkspaceFeatureSet(const std::filesystem::path& workspace_path,
     if (!file) {
       throw std::runtime_error("Truncated descriptor matrix");
     }
+  }
+  if (version == 2 && FeaturePayloadChecksum(features) != expected_checksum) {
+    throw std::runtime_error("Feature payload checksum mismatch");
+  }
+  if (file.peek() != std::char_traits<char>::eof()) {
+    throw std::runtime_error("Feature file has trailing data");
   }
   return features;
 }

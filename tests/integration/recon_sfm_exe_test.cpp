@@ -58,6 +58,9 @@ TEST(ReconSfmExeTest, PrintsHelp) {
   EXPECT_EQ(exit_code, 0);
   EXPECT_NE(out.str().find("Usage:"), std::string::npos);
   EXPECT_NE(out.str().find("--feature_extractor"), std::string::npos);
+  EXPECT_NE(out.str().find("--feature_type"), std::string::npos);
+  EXPECT_NE(out.str().find("aliked_lightglue"), std::string::npos);
+  EXPECT_NE(out.str().find("--mapper"), std::string::npos);
   EXPECT_NE(out.str().find("--feature_num_threads"), std::string::npos);
   EXPECT_NE(out.str().find("--camera_mode"), std::string::npos);
   EXPECT_NE(out.str().find("--camera_model"), std::string::npos);
@@ -129,6 +132,30 @@ TEST(ReconSfmExeTest, RejectsInvalidRegistrationTrialLimit) {
   EXPECT_NE(exit_code, 0);
   EXPECT_NE(err.str().find("--max_registration_trials_per_image"),
             std::string::npos);
+}
+
+TEST(ReconSfmExeTest, RejectsIncompatibleLearnedFrontendTypes) {
+  std::ostringstream out;
+  std::ostringstream err;
+  const int exit_code = exe::RunReconSfm(
+      {"recon_sfm", "--image_path", "images", "--output_path", "out",
+       "--feature_type", "aliked_n16rot", "--aliked_model_path", "a.onnx",
+       "--matcher", "sift_lightglue", "--learned_matcher_model_path",
+       "lightglue.onnx"},
+      out, err);
+  EXPECT_NE(exit_code, 0);
+  EXPECT_NE(err.str().find("incompatible"), std::string::npos);
+}
+
+TEST(ReconSfmExeTest, RejectsUnknownMapperType) {
+  std::ostringstream out;
+  std::ostringstream err;
+  const int exit_code = exe::RunReconSfm(
+      {"recon_sfm", "--image_path", "images", "--output_path", "out",
+       "--mapper", "unknown"},
+      out, err);
+  EXPECT_NE(exit_code, 0);
+  EXPECT_NE(err.str().find("Unsupported mapper"), std::string::npos);
 }
 
 TEST(ReconSfmExeTest, RejectsInvalidRegistrationRetryOptions) {

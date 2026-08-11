@@ -1,4 +1,5 @@
 #include "colite/controllers/sfm_camera_setup.h"
+#include "colite/io/image_reader.h"
 
 #include <algorithm>
 #include <cmath>
@@ -26,7 +27,8 @@ struct ImageMetadata {
 
 ImageMetadata ReadImageMetadata(const std::filesystem::path& image_path,
                                 const SfmCameraSetupOptions& options) {
-  const cv::Mat image = cv::imread(image_path.string(), cv::IMREAD_COLOR);
+  const cv::Mat image = ReadImageWithExifOrientation(image_path,
+                                                      cv::IMREAD_COLOR);
   if (image.empty()) {
     throw std::runtime_error("Failed to read image: " + image_path.string());
   }

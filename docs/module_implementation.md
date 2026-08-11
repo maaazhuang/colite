@@ -47,6 +47,21 @@ OpenCV-like 高斯边界使用周期折叠的 reflect/`REFLECT_101` 映射，支
 
 主要入口位于 `src/colite/matching` 和 `src/colite/controllers/*matcher*`。
 
+学习前端通过可选 ONNX Runtime 提供 ALIKED N16Rot/N32、ALIKED cosine BF
+以及 SIFT/ALIKED LightGlue。官方模型 basename 会自动匹配内置 SHA-256 清单；
+自定义显式路径保持离线可用。EXIF Orientation 1–8 在统一图像读取层应用。
+
+全局 SfM 首版位于 `src/colite/sfm/global_mapper.cpp`：verified view graph
+依次经过约束筛选、旋转平均、带边尺度的相机中心求解、track 三角化/合并和
+全局 BA，并由 `recon_sfm --mapper global` 调用。该实现已经形成可运行垂直链路，
+但 view-graph calibration 和固定旋转的位置/结构优化仍需继续增强，不能视为
+与完整 GLOMAP 数值行为等价。
+
+structure-less 注册是增量 mapper 的显式回退：PnP 失败后，从至少两个已注册
+邻居的 verified relative pose 生成一致位姿假设，再继续 track 创建和局部优化。
+默认关闭。`transitive_matcher` 只生成新候选 pair，匹配证据仍来自真实描述子匹配
+和 two-view geometry verification。
+
 ## Incremental SfM
 
 ### Guided/verified 匹配图一致性

@@ -6,7 +6,9 @@
 #include <string>
 #include <vector>
 
+#include "colite/controllers/recon_sfm_controller.h"
 #include "colite/controllers/sfm_camera_setup.h"
+#include "colite/core/feature.h"
 #include "colite/features/sift_extractor.h"
 #include "colite/io/sfm_workspace.h"
 #include "colite/matching/descriptor_matcher.h"
@@ -32,13 +34,24 @@ struct ReconSfmCliOptions {
   double default_focal_length_factor = 1.2;
   int max_num_features = 4096;
   int feature_num_threads = -1;
+  FeatureExtractorType feature_extractor_type = FeatureExtractorType::kSift;
   SiftBackend feature_backend = SiftBackend::kAuto;
+  std::string aliked_model_path;
+  double aliked_min_score = 0.2;
   DescriptorMatcherBackend matcher_backend = DescriptorMatcherBackend::kFlann;
+  FeatureMatcherType matcher_type = FeatureMatcherType::kSiftBruteForce;
+  std::string learned_matcher_model_path;
+  double min_cosine_similarity = 0.85;
+  double lightglue_min_score = 0.1;
+  int learned_matcher_num_threads = 1;
+  controllers::SfmMapperType mapper_type =
+      controllers::SfmMapperType::kIncremental;
   std::size_t nearby_match_window = 0;
   double nearby_match_ratio = 0.8;
   double guided_match_ratio = 0.95;
   std::size_t max_registration_trials_per_image = 3;
   std::size_t max_initialization_trials = 3;
+  bool use_structureless_registration = false;
   bool multiple_models = true;
   bool merge_models = true;
   std::size_t max_num_models = 50;

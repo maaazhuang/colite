@@ -25,6 +25,8 @@ std::string_view StrategyName(const MatchingStrategy strategy) {
       return "spatial";
     case MatchingStrategy::kVocabTree:
       return "vocab_tree";
+    case MatchingStrategy::kTransitive:
+      return "transitive";
   }
   return "unknown";
 }
@@ -41,6 +43,9 @@ MatchingStrategy ParseMatchingStrategy(const std::string& name) {
   }
   if (name == "vocab_tree" || name == "vocab-tree" || name == "vocabtree") {
     return MatchingStrategy::kVocabTree;
+  }
+  if (name == "transitive") {
+    return MatchingStrategy::kTransitive;
   }
   throw std::invalid_argument("Unsupported matching type: " + name);
 }
@@ -59,7 +64,7 @@ void PrintHelp(std::string_view executable,
       << "Usage:\n"
       << "  " << executable << " --workspace_path <dir> [options]\n\n"
       << "Options:\n"
-      << "  --matching_type <exhaustive|sequential|spatial|vocab_tree>\n"
+      << "  --matching_type <exhaustive|sequential|spatial|vocab_tree|transitive>\n"
       << "                            Pair generation strategy, default "
       << StrategyName(default_strategy) << ".\n"
       << "  --overlap <n>             Match each image with next n images, "
@@ -84,7 +89,14 @@ void PrintHelp(std::string_view executable,
          "of building one in memory.\n"
       << "  --vocab_tree_sequential_overlap <n> Merge next-n temporal pairs; "
          "0 disables, default 2.\n"
-      << "  --matcher <bf|flann|cuda> Descriptor matcher backend, default flann.\n"
+      << "  --transitive_max_path_length <n> Verified-graph path limit, default 2.\n"
+      << "  --transitive_max_num_neighbors <n> New candidates per image, default 20.\n"
+      << "  --matcher <bf|flann|cuda|aliked_bf|sift_lightglue|aliked_lightglue>\n"
+      << "                            Descriptor matcher, default flann.\n"
+      << "  --learned_matcher_model_path <file> LightGlue ONNX model path.\n"
+      << "  --min_cosine_similarity <s> ALIKED BF threshold, default 0.85.\n"
+      << "  --lightglue_min_score <s> LightGlue score threshold, default 0.1.\n"
+      << "  --learned_matcher_num_threads <n> ONNX intra-op threads, default 1.\n"
       << "  --max_ratio <r>          Lowe ratio, default 0.8.\n"
       << "  --guided_matching <0|1> Re-search descriptors under verified geometry, default 0.\n"
       << "  --guided_match_ratio <r> Lowe ratio used by guided matching, default 0.8.\n"
@@ -154,6 +166,12 @@ int RunMatcherCommand(const std::vector<std::string>& args,
       } else if (arg == "--vocab_tree_sequential_overlap") {
         options.vocab_tree_sequential_overlap =
             static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
+      } else if (arg == "--transitive_max_path_length") {
+        options.transitive_max_path_length = static_cast<std::size_t>(
+            std::stoull(RequireValue(args, &i, arg)));
+      } else if (arg == "--transitive_max_num_neighbors") {
+        options.transitive_max_num_neighbors = static_cast<std::size_t>(
+            std::stoull(RequireValue(args, &i, arg)));
       } else if (arg == "--max_ratio") {
         options.max_ratio = std::stod(RequireValue(args, &i, arg));
       } else if (arg == "--guided_matching") {
@@ -168,13 +186,35 @@ int RunMatcherCommand(const std::vector<std::string>& args,
         const std::string matcher = RequireValue(args, &i, arg);
         if (matcher == "bf") {
           options.matcher_backend = DescriptorMatcherBackend::kBruteForce;
+          options.matcher_type = FeatureMatcherType::kSiftBruteForce;
         } else if (matcher == "flann") {
           options.matcher_backend = DescriptorMatcherBackend::kFlann;
+          options.matcher_type = FeatureMatcherType::kSiftBruteForce;
         } else if (matcher == "cuda") {
           options.matcher_backend = DescriptorMatcherBackend::kCudaBruteForce;
+          options.matcher_type = FeatureMatcherType::kSiftBruteForce;
+        } else if (matcher == "aliked_bf" || matcher == "aliked-bf") {
+          options.matcher_type = FeatureMatcherType::kAlikedBruteForce;
+        } else if (matcher == "sift_lightglue" ||
+                   matcher == "sift-lightglue") {
+          options.matcher_type = FeatureMatcherType::kSiftLightGlue;
+        } else if (matcher == "aliked_lightglue" ||
+                   matcher == "aliked-lightglue") {
+          options.matcher_type = FeatureMatcherType::kAlikedLightGlue;
         } else {
           throw std::invalid_argument("Unsupported matcher: " + matcher);
         }
+      } else if (arg == "--learned_matcher_model_path") {
+        options.learned_matcher_model_path = RequireValue(args, &i, arg);
+      } else if (arg == "--min_cosine_similarity") {
+        options.min_cosine_similarity =
+            std::stod(RequireValue(args, &i, arg));
+      } else if (arg == "--lightglue_min_score") {
+        options.lightglue_min_score =
+            std::stod(RequireValue(args, &i, arg));
+      } else if (arg == "--learned_matcher_num_threads") {
+        options.learned_matcher_num_threads =
+            std::stoi(RequireValue(args, &i, arg));
       } else {
         throw std::invalid_argument("Unknown argument: " + arg);
       }
@@ -185,6 +225,12 @@ int RunMatcherCommand(const std::vector<std::string>& args,
     if (options.guided_match_ratio <= 0.0 ||
         options.guided_match_ratio > 1.0) {
       throw std::invalid_argument("--guided_match_ratio must be in (0, 1]");
+    }
+    if ((options.matcher_type == FeatureMatcherType::kSiftLightGlue ||
+         options.matcher_type == FeatureMatcherType::kAlikedLightGlue) &&
+        options.learned_matcher_model_path.empty()) {
+      throw std::invalid_argument(
+          "--learned_matcher_model_path is required for LightGlue");
     }
     const auto summary =
         controllers::SequentialMatcherController(options).Run();
@@ -243,6 +289,12 @@ int RunVocabTreeMatcher(const std::vector<std::string>& args,
                         std::ostream& out,
                         std::ostream& err) {
   return RunMatcherCommand(args, MatchingStrategy::kVocabTree, out, err);
+}
+
+int RunTransitiveMatcher(const std::vector<std::string>& args,
+                         std::ostream& out,
+                         std::ostream& err) {
+  return RunMatcherCommand(args, MatchingStrategy::kTransitive, out, err);
 }
 
 int RunVocabTreeBuilder(const std::vector<std::string>& args,

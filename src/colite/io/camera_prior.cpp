@@ -1,4 +1,5 @@
 #include "colite/io/camera_prior.h"
+#include "colite/io/image_reader.h"
 
 #include <algorithm>
 #include <array>
@@ -20,6 +21,7 @@ constexpr std::uint16_t kExifTagExifIfd = 0x8769;
 constexpr std::uint16_t kExifTagGpsIfd = 0x8825;
 constexpr std::uint16_t kExifTagMake = 0x010F;
 constexpr std::uint16_t kExifTagModel = 0x0110;
+constexpr std::uint16_t kExifTagOrientation = 0x0112;
 constexpr std::uint16_t kExifTagFocalLengthIn35mmFilm = 0xA405;
 constexpr std::uint16_t kExifTagFocalLength = 0x920A;
 constexpr std::uint16_t kExifTagFocalPlaneXResolution = 0xA20E;
@@ -359,6 +361,20 @@ ExifCameraMetadata ReadExifCameraMetadata(
   return result;
 }
 
+int ReadExifOrientation(const std::filesystem::path& image_path) {
+  const auto tiff = ReadJpegExifTiff(image_path);
+  if (!tiff.has_value()) return 1;
+  bool little_endian = false;
+  std::uint32_t ifd0_offset = 0;
+  if (!ParseTiffHeader(*tiff, &little_endian, &ifd0_offset)) return 1;
+  const std::optional<std::uint32_t> orientation =
+      ReadIfdUIntValue(*tiff, ifd0_offset, kExifTagOrientation, little_endian);
+  if (!orientation.has_value() || *orientation < 1 || *orientation > 8) {
+    return 1;
+  }
+  return static_cast<int>(*orientation);
+}
+
 std::optional<GeodeticCoordinate> ReadExifGpsCoordinate(
     const std::filesystem::path& image_path) {
   const auto tiff = ReadJpegExifTiff(image_path);
@@ -474,7 +490,8 @@ InitialFocalLengthEstimate EstimateInitialFocalLengthPriorFromImage(
     return {user_focal_length, InitialFocalLengthSource::kUser, true};
   }
 
-  const cv::Mat image = cv::imread(image_path.string(), cv::IMREAD_COLOR);
+  const cv::Mat image = ReadImageWithExifOrientation(image_path,
+                                                      cv::IMREAD_COLOR);
   if (image.empty()) {
     throw std::runtime_error("Failed to read image: " + image_path.string());
   }

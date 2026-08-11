@@ -31,12 +31,15 @@
 #include "colite/core/geometry.h"
 #include "colite/core/match_graph.h"
 #include "colite/core/reconstruction.h"
+#include "colite/features/aliked_extractor.h"
 #include "colite/features/sift_extractor.h"
 #include "colite/io/camera_prior.h"
 #include "colite/sfm/global_bundle_adjuster.h"
+#include "colite/sfm/global_mapper.h"
 #include "colite/sfm/similarity_transform.h"
 #include "colite/io/sfm_workspace.h"
 #include "colite/matching/descriptor_matcher.h"
+#include "colite/matching/learned_matcher.h"
 #include "colite/matching/match_graph_consistency.h"
 #include "colite/matching/two_view_geometry_batch.h"
 #include "colite/matching/weak_pair_rematcher.h"
@@ -613,6 +616,7 @@ void WriteRunSummary(const std::filesystem::path& output_path,
                << "success " << (summary.success ? 1 : 0) << "\n"
                << "registered_images " << summary.num_registered_images << "\n"
                << "points3d " << summary.num_points3d << "\n"
+               << "mapper_type " << run_stats.mapper_type << "\n"
                << "feature_backend " << run_stats.feature_backend << "\n"
                << "cuda_sift_available "
                << (run_stats.cuda_sift_available ? 1 : 0) << "\n"
@@ -894,7 +898,9 @@ void WriteRegistrationDiagnostics(
          "\tlocal_ba_constant_cameras\tlocal_ba_variable_cameras"
          "\tlocal_ba_points\tlocal_ba_residuals"
          "\tlocal_ba_initial_mean_error\tlocal_ba_final_mean_error"
-         "\tfilter_removed_observations\tfilter_removed_points\n";
+         "\tfilter_removed_observations\tfilter_removed_points"
+         "\tused_structureless\tstructureless_hypotheses"
+         "\tstructureless_consistent_hypotheses\n";
 
   for (std::size_t idx = 0; idx < summary.registrations.size(); ++idx) {
     const IncrementalMapperSummary& registration = summary.registrations[idx];
@@ -936,7 +942,11 @@ void WriteRegistrationDiagnostics(
         << "\t"
         << registration.local_bundle_adjustment.final_mean_reprojection_error
         << "\t" << registration.observation_filter.num_removed_observations
-        << "\t" << registration.observation_filter.num_removed_points << "\n";
+        << "\t" << registration.observation_filter.num_removed_points << "\t"
+        << (registration.used_structureless_registration ? 1 : 0) << "\t"
+        << registration.structureless_registration.num_pose_hypotheses << "\t"
+        << registration.structureless_registration.num_consistent_hypotheses
+        << "\n";
   }
 
   std::ofstream failures_file(output_path / "registration_failures.tsv");
@@ -1018,27 +1028,96 @@ class FeatureExtractionJobQueue {
   std::mutex mutex_;
 };
 
+void MatchAllImagePairsTyped(
+    const std::vector<ImageId>& image_ids,
+    const std::map<ImageId, Camera>& cameras_by_image,
+    const ReconSfmControllerOptions& options,
+    const DescriptorMatchingOptions& base_options,
+    const NearbyPairMatchingOptions& nearby_options,
+    MatchGraph* graph) {
+  if (options.matcher_type == FeatureMatcherType::kSiftBruteForce) {
+    MatchAllImagePairs(image_ids, base_options, nearby_options, graph);
+    return;
+  }
+
+  std::vector<std::pair<std::size_t, std::size_t>> pair_indices;
+  for (std::size_t i = 0; i < image_ids.size(); ++i) {
+    for (std::size_t j = i + 1; j < image_ids.size(); ++j) {
+      pair_indices.emplace_back(i, j);
+    }
+  }
+  std::vector<std::vector<FeatureMatch>> pair_matches(pair_indices.size());
+  parallel::parallel_for_(
+      parallel::Range(0, static_cast<int>(pair_indices.size())),
+      [&](const parallel::Range& range) {
+        for (int pair_idx = range.start; pair_idx < range.end; ++pair_idx) {
+          const auto [i, j] = pair_indices[static_cast<std::size_t>(pair_idx)];
+          const ImageId image_id1 = image_ids[i];
+          const ImageId image_id2 = image_ids[j];
+          const FeatureSet* features1 = FindFeatures(*graph, image_id1);
+          const FeatureSet* features2 = FindFeatures(*graph, image_id2);
+          if (features1 == nullptr || features2 == nullptr) {
+            throw std::runtime_error("Missing features for exhaustive matching");
+          }
+          if (options.matcher_type == FeatureMatcherType::kAlikedBruteForce) {
+            CosineMatchingOptions learned_options;
+            learned_options.min_cosine_similarity =
+                static_cast<float>(options.min_cosine_similarity);
+            learned_options.max_ratio = static_cast<float>(
+                nearby_options.image_index_window > 0 &&
+                        j - i <= nearby_options.image_index_window
+                    ? nearby_options.max_ratio
+                    : base_options.max_ratio);
+            learned_options.mutual_check = base_options.mutual_check;
+            pair_matches[static_cast<std::size_t>(pair_idx)] =
+                MatchAlikedDescriptors(*features1, *features2, learned_options);
+          } else {
+            LightGlueMatchingOptions learned_options;
+            learned_options.matcher_type = options.matcher_type;
+            learned_options.model_path = options.learned_matcher_model_path;
+            learned_options.min_score =
+                static_cast<float>(options.lightglue_min_score);
+            learned_options.num_threads = options.learned_matcher_num_threads;
+            const Camera& camera1 = cameras_by_image.at(image_id1);
+            const Camera& camera2 = cameras_by_image.at(image_id2);
+            pair_matches[static_cast<std::size_t>(pair_idx)] =
+                MatchFeatureSetsLightGlue(
+                    *features1, static_cast<int>(camera1.width),
+                    static_cast<int>(camera1.height), *features2,
+                    static_cast<int>(camera2.width),
+                    static_cast<int>(camera2.height), learned_options);
+          }
+        }
+      });
+  for (std::size_t pair_idx = 0; pair_idx < pair_indices.size(); ++pair_idx) {
+    const auto [i, j] = pair_indices[pair_idx];
+    SetMatches(graph, image_ids[i], image_ids[j], pair_matches[pair_idx]);
+  }
+}
+
 std::vector<FeatureSet> ExtractFeaturesForImages(
     const std::vector<std::filesystem::path>& image_paths,
-    const SiftExtractionOptions& sift_options,
-    const int requested_num_threads) {
+    const ReconSfmControllerOptions& options) {
   std::vector<FeatureSet> features(image_paths.size());
   if (image_paths.empty()) {
     return features;
   }
 
-  int num_threads = EffectiveFeatureExtractionThreads(requested_num_threads);
-  const SiftBackend resolved_backend = ResolveSiftBackend(sift_options.backend);
+  int num_threads = EffectiveFeatureExtractionThreads(options.feature_num_threads);
+  const int inference_num_threads = num_threads;
+  const SiftBackend resolved_backend = ResolveSiftBackend(options.feature_backend);
 #if defined(COLITE_ENABLE_SIFT_PARALLEL)
   // CPU 优化实现已在尺度层、行带和描述子阶段并行，外层单图调度避免嵌套并行。
   const ScopedParallelThreads feature_thread_scope(
-      resolved_backend == SiftBackend::kCudaSift ||
+      options.feature_extractor_type != FeatureExtractorType::kSift ||
+              resolved_backend == SiftBackend::kCudaSift ||
               resolved_backend == SiftBackend::kCudaVlSift
           ? 1
           : num_threads);
   num_threads = 1;
 #else
-  if (resolved_backend == SiftBackend::kCudaSift ||
+  if (options.feature_extractor_type != FeatureExtractorType::kSift ||
+      resolved_backend == SiftBackend::kCudaSift ||
       resolved_backend == SiftBackend::kCudaVlSift) {
     num_threads = 1;
   }
@@ -1066,8 +1145,22 @@ std::vector<FeatureSet> ExtractFeaturesForImages(
       }
 
       try {
-        features[*job_idx] =
-            ExtractSiftFeaturesFromFile(image_paths[*job_idx], sift_options);
+        if (options.feature_extractor_type == FeatureExtractorType::kSift) {
+          SiftExtractionOptions sift_options;
+          sift_options.max_num_features = options.max_num_features;
+          sift_options.backend = options.feature_backend;
+          features[*job_idx] = ExtractSiftFeaturesFromFile(
+              image_paths[*job_idx], sift_options);
+        } else {
+          AlikedExtractionOptions aliked_options;
+          aliked_options.extractor_type = options.feature_extractor_type;
+          aliked_options.model_path = options.aliked_model_path;
+          aliked_options.max_num_features = options.max_num_features;
+          aliked_options.min_score = static_cast<float>(options.aliked_min_score);
+          aliked_options.num_threads = inference_num_threads;
+          features[*job_idx] = ExtractAlikedFeaturesFromFile(
+              image_paths[*job_idx], aliked_options);
+        }
       } catch (...) {
         std::lock_guard<std::mutex> lock(exception_mutex);
         if (first_exception == nullptr) {
@@ -1098,14 +1191,25 @@ std::string ReconFeatureConfigHash(
     const std::vector<std::filesystem::path>& image_paths) {
   std::vector<std::pair<std::string, std::string>> entries = {
       {"stage", "features"},
-      {"algorithm_version", "recon_sfm_features_v2_exif_gps"},
+      {"algorithm_version", "recon_sfm_features_v4_learned_frontend"},
+      {"feature_type", std::to_string(static_cast<int>(options.feature_extractor_type))},
       {"feature_backend", std::to_string(static_cast<int>(options.feature_backend))},
       {"max_num_features", std::to_string(options.max_num_features)},
+      {"aliked_model_path", options.aliked_model_path.generic_string()},
+      {"aliked_min_score", std::to_string(options.aliked_min_score)},
       {"camera_mode",
        std::string(CameraSharingModeName(options.camera_sharing_mode))},
       {"camera_model", std::to_string(static_cast<int>(options.camera_model_id))},
       {"focal_length", std::to_string(options.focal_length)},
       {"default_focal_factor", std::to_string(options.default_focal_length_factor)}};
+  if (!options.aliked_model_path.empty() &&
+      std::filesystem::exists(options.aliked_model_path)) {
+    entries.emplace_back("aliked_model_size", std::to_string(
+        std::filesystem::file_size(options.aliked_model_path)));
+    entries.emplace_back("aliked_model_mtime", std::to_string(
+        std::filesystem::last_write_time(options.aliked_model_path)
+            .time_since_epoch().count()));
+  }
   for (std::size_t idx = 0; idx < options.camera_params.size(); ++idx) {
     entries.emplace_back("camera_param_" + std::to_string(idx),
                          std::to_string(options.camera_params[idx]));
@@ -1128,14 +1232,27 @@ std::string ReconFeatureConfigHash(
 std::string ReconFrontendConfigHash(
     const ReconSfmControllerOptions& options,
     const std::string& feature_hash) {
-  return StableConfigHash(
+  std::vector<std::pair<std::string, std::string>> entries =
       {{"stage", "geometry"},
-       {"algorithm_version", "recon_sfm_guided_consistency_v2"},
+       {"algorithm_version", "recon_sfm_geometry_v4_learned_frontend"},
        {"feature_hash", feature_hash},
+       {"matcher_type", std::to_string(static_cast<int>(options.matcher_type))},
        {"matcher_backend", std::to_string(static_cast<int>(options.matcher_backend))},
+       {"learned_model_path", options.learned_matcher_model_path.generic_string()},
+       {"min_cosine_similarity", std::to_string(options.min_cosine_similarity)},
+       {"lightglue_min_score", std::to_string(options.lightglue_min_score)},
        {"nearby_window", std::to_string(options.nearby_match_window)},
        {"nearby_ratio", std::to_string(options.nearby_match_ratio)},
-       {"guided_ratio", std::to_string(options.guided_match_ratio)}});
+       {"guided_ratio", std::to_string(options.guided_match_ratio)}};
+  if (!options.learned_matcher_model_path.empty() &&
+      std::filesystem::exists(options.learned_matcher_model_path)) {
+    entries.emplace_back("learned_model_size", std::to_string(
+        std::filesystem::file_size(options.learned_matcher_model_path)));
+    entries.emplace_back("learned_model_mtime", std::to_string(
+        std::filesystem::last_write_time(options.learned_matcher_model_path)
+            .time_since_epoch().count()));
+  }
+  return StableConfigHash(entries);
 }
 
 std::string ReconSparseConfigHash(
@@ -1145,6 +1262,7 @@ std::string ReconSparseConfigHash(
       {{"stage", "recon_sfm"},
        {"algorithm_version", "recon_sfm_resume_multimodel_v6_pose_guided_tracks"},
        {"frontend_hash", frontend_hash},
+       {"mapper_type", std::to_string(static_cast<int>(options.mapper_type))},
        {"input_model", options.input_model_path.generic_string()},
        {"input_format", ColmapModelFormatToString(options.input_model_format)},
        {"output_format", ColmapModelFormatToString(options.output_model_format)},
@@ -1156,6 +1274,8 @@ std::string ReconSparseConfigHash(
         std::to_string(options.max_registration_trials_per_image)},
        {"max_initialization_trials",
         std::to_string(options.max_initialization_trials)},
+       {"structureless_registration",
+        options.use_structureless_registration ? "1" : "0"},
        {"ba_groups",
         std::to_string(static_cast<int>(options.ba_refine_camera_params))},
        {"use_position_priors", options.use_position_priors ? "1" : "0"},
@@ -1222,11 +1342,34 @@ int ReconSfmController::Run(std::ostream& out) const {
   if (image_paths.size() < 2) {
     throw std::runtime_error("Need at least two input images.");
   }
+  if (!IsFeatureMatcherCompatible(options.feature_extractor_type,
+                                  options.matcher_type)) {
+    throw std::invalid_argument(
+        "Feature extractor and matcher types are incompatible");
+  }
+  if (IsAlikedFeature(options.feature_extractor_type) &&
+      options.aliked_model_path.empty()) {
+    throw std::invalid_argument("ALIKED extraction requires a model path");
+  }
+  if ((options.matcher_type == FeatureMatcherType::kSiftLightGlue ||
+       options.matcher_type == FeatureMatcherType::kAlikedLightGlue) &&
+      options.learned_matcher_model_path.empty()) {
+    throw std::invalid_argument("LightGlue matching requires a model path");
+  }
+  if (options.mapper_type == SfmMapperType::kGlobal &&
+      !options.input_model_path.empty()) {
+    throw std::invalid_argument(
+        "Global mapping does not yet support continuing an input model");
+  }
   LOG(INFO) << "SfM pipeline: images=" << image_paths.size()
             << " image_path=" << image_dir.string()
             << " output_path=" << output_dir.string()
             << " feature_backend="
-            << SiftBackendName(ResolveSiftBackend(options.feature_backend))
+            << (options.feature_extractor_type == FeatureExtractorType::kSift
+                    ? std::string(SiftBackendName(
+                          ResolveSiftBackend(options.feature_backend)))
+                    : std::string(FeatureExtractorTypeName(
+                          options.feature_extractor_type)))
             << " max_features=" << options.max_num_features
             << " matcher=" << static_cast<int>(options.matcher_backend)
             << " cpu_threads=" << options.feature_num_threads
@@ -1268,10 +1411,6 @@ int ReconSfmController::Run(std::ostream& out) const {
   const SfmCameraSetup camera_setup =
       BuildSfmCameraSetup(image_paths, camera_options);
 
-  SiftExtractionOptions sift_options;
-  sift_options.max_num_features = options.max_num_features;
-  sift_options.backend = options.feature_backend;
-
   MatchGraph graph;
   Reconstruction reconstruction;
   for (const Camera& camera : camera_setup.cameras) {
@@ -1302,8 +1441,7 @@ int ReconSfmController::Run(std::ostream& out) const {
   } else {
     const auto feature_start = std::chrono::steady_clock::now();
     const std::vector<FeatureSet> extracted_features =
-        ExtractFeaturesForImages(image_paths, sift_options,
-                                 options.feature_num_threads);
+        ExtractFeaturesForImages(image_paths, options);
     feature_extraction_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - feature_start).count();
     for (std::size_t i = 0; i < extracted_features.size(); ++i) {
@@ -1328,9 +1466,17 @@ int ReconSfmController::Run(std::ostream& out) const {
 
 
   ReconSfmRunStats run_stats;
+  run_stats.mapper_type = options.mapper_type == SfmMapperType::kGlobal
+                              ? "global"
+                              : "incremental";
   const SiftBackend resolved_feature_backend =
       ResolveSiftBackend(options.feature_backend);
-  run_stats.feature_backend = SiftBackendName(resolved_feature_backend);
+  run_stats.feature_backend = options.feature_extractor_type ==
+                                      FeatureExtractorType::kSift
+                                  ? std::string(SiftBackendName(
+                                        resolved_feature_backend))
+                                  : std::string(FeatureExtractorTypeName(
+                                        options.feature_extractor_type));
   run_stats.cuda_sift_available = IsCudaSiftAvailable();
   run_stats.cuda_matcher_available = IsCudaDescriptorMatcherAvailable();
   const InitialFocalLengthEstimate& initial_focal =
@@ -1378,7 +1524,14 @@ int ReconSfmController::Run(std::ostream& out) const {
 
   DescriptorMatchingOptions matching_options;
   matching_options.backend = options.matcher_backend;
-  switch (options.matcher_backend) {
+  matching_options.matcher_type = options.matcher_type;
+  if (options.matcher_type == FeatureMatcherType::kAlikedBruteForce) {
+    run_stats.matcher_backend = "aliked_bf";
+  } else if (options.matcher_type == FeatureMatcherType::kSiftLightGlue) {
+    run_stats.matcher_backend = "sift_lightglue";
+  } else if (options.matcher_type == FeatureMatcherType::kAlikedLightGlue) {
+    run_stats.matcher_backend = "aliked_lightglue";
+  } else switch (options.matcher_backend) {
     case DescriptorMatcherBackend::kBruteForce:
       run_stats.matcher_backend = "bf";
       break;
@@ -1425,7 +1578,8 @@ int ReconSfmController::Run(std::ostream& out) const {
         ReadWorkspaceCacheMetadata(workspace_dir, "geometry");
     run_stats.num_raw_matches =
         static_cast<std::size_t>(std::stoull(metadata.values.at("raw_matches")));
-  } else if (matching_options.backend ==
+  } else if (options.matcher_type == FeatureMatcherType::kSiftBruteForce &&
+             matching_options.backend ==
       DescriptorMatcherBackend::kCudaBruteForce) {
     const FrontendPipelineSummary pipeline_summary =
         RunCudaFrontendPipeline(image_ids, cameras_by_image, matching_options,
@@ -1441,8 +1595,8 @@ int ReconSfmController::Run(std::ostream& out) const {
     weak_pair_summary = pipeline_summary.guided;
   } else {
     const auto matching_start = std::chrono::steady_clock::now();
-    controllers::MatchAllImagePairs(image_ids, matching_options,
-                                    nearby_options, &graph);
+    MatchAllImagePairsTyped(image_ids, cameras_by_image, options,
+                            matching_options, nearby_options, &graph);
     run_stats.matching_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - matching_start).count();
     for (const auto& [pair, matches] : graph.matches) {
@@ -1455,11 +1609,13 @@ int ReconSfmController::Run(std::ostream& out) const {
     run_stats.geometry_verification_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - geometry_start).count();
 
-    const auto rematching_start = std::chrono::steady_clock::now();
-    weak_pair_summary =
-        RematchWeakImagePairs(cameras_by_image, weak_pair_options, &graph);
-    run_stats.weak_pair_rematching_seconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - rematching_start).count();
+    if (options.matcher_type == FeatureMatcherType::kSiftBruteForce) {
+      const auto rematching_start = std::chrono::steady_clock::now();
+      weak_pair_summary =
+          RematchWeakImagePairs(cameras_by_image, weak_pair_options, &graph);
+      run_stats.weak_pair_rematching_seconds = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - rematching_start).count();
+    }
     run_stats.frontend_pipeline_seconds =
         run_stats.matching_seconds +
         run_stats.geometry_verification_seconds +
@@ -1527,6 +1683,8 @@ int ReconSfmController::Run(std::ostream& out) const {
       options.max_registration_trials_per_image;
   mapping_options.initialization.max_num_initialization_trials =
       options.max_initialization_trials;
+  mapping_options.mapper.use_structureless_registration =
+      options.use_structureless_registration;
   mapping_options.registration_retry_reprojection_error_multiplier =
       options.registration_retry_reprojection_error_multiplier;
   mapping_options.registration_retry_max_reprojection_error_px =
@@ -1539,8 +1697,40 @@ int ReconSfmController::Run(std::ostream& out) const {
   multi_options.min_num_images_per_model =
       options.min_num_images_per_model;
   multi_options.merge_models = options.merge_models;
-  MultiModelMappingResult mapping_result = RunIncrementalMappingMultiple(
-      graph, multi_options, std::move(reconstruction));
+  MultiModelMappingResult mapping_result;
+  if (options.mapper_type == SfmMapperType::kGlobal) {
+    GlobalMappingOptions global_options;
+    global_options.view_graph.min_num_inliers = 15;
+    global_options.view_graph.min_median_triangulation_angle_deg = 0.0;
+    global_options.triangulation = mapping_options.mapper.triangulation;
+    global_options.bundle_adjustment =
+        mapping_options.global_bundle_adjustment;
+    const GlobalMappingSummary global_summary =
+        RunGlobalMapping(graph, global_options, &reconstruction);
+    if (!global_summary.success) {
+      throw std::runtime_error("Global SfM failed: " +
+                               global_summary.message);
+    }
+    IncrementalMappingSummary compatible_summary;
+    compatible_summary.success = true;
+    compatible_summary.num_registered_images =
+        global_summary.num_registered_images;
+    compatible_summary.num_points3d = global_summary.num_points3d;
+    compatible_summary.global_track_completion =
+        global_summary.triangulation;
+    compatible_summary.global_bundle_adjustment =
+        global_summary.bundle_adjustment;
+    compatible_summary.message = global_summary.message;
+    mapping_result.num_unregistered_images =
+        reconstruction.Images().size() -
+        reconstruction.RegisteredImageIds().size();
+    mapping_result.models.push_back(std::move(reconstruction));
+    mapping_result.mapping_summaries.push_back(
+        std::move(compatible_summary));
+  } else {
+    mapping_result = RunIncrementalMappingMultiple(
+        graph, multi_options, std::move(reconstruction));
+  }
   if (mapping_result.models.empty()) {
     throw std::runtime_error("SfM did not produce a valid sparse model");
   }

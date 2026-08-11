@@ -1,4 +1,5 @@
 #include "colite/features/sift_extractor.h"
+#include "colite/io/image_reader.h"
 
 #include <algorithm>
 #include <array>
@@ -137,6 +138,9 @@ FeatureSet ExtractCvSiftFeatures(const cv::Mat& gray,
   }
   result.descriptors = features::ConvertSiftDescriptors(
       descriptors.data(), keypoints.size(), options.use_root_sift);
+  result.descriptor_normalization =
+      options.use_root_sift ? DescriptorNormalization::kRootL1
+                            : DescriptorNormalization::kNone;
   return result;
 }
 
@@ -272,6 +276,9 @@ FeatureSet ExtractVlSiftFeatures(const cv::Mat& gray,
   }
   result.descriptors = features::ConvertSiftDescriptors(
       descriptors.data(), result.keypoints.size(), options.use_root_sift);
+  result.descriptor_normalization =
+      options.use_root_sift ? DescriptorNormalization::kRootL1
+                            : DescriptorNormalization::kNone;
   return result;
 }
 
@@ -349,7 +356,8 @@ FeatureSet ExtractSiftFeatures(const cv::Mat& image,
 
 FeatureSet ExtractSiftFeaturesFromFile(const std::filesystem::path& image_path,
                                        const SiftExtractionOptions& options) {
-  const cv::Mat image = cv::imread(image_path.string(), cv::IMREAD_COLOR);
+  const cv::Mat image = ReadImageWithExifOrientation(image_path,
+                                                      cv::IMREAD_COLOR);
   if (image.empty()) {
     throw std::runtime_error("Failed to read image: " + image_path.string());
   }

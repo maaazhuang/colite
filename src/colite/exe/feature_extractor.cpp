@@ -26,11 +26,26 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
          "identities. Legacy shared/individual aliases remain accepted.\n"
       << "  --default_focal_length_factor <f>\n"
          "                            Missing-EXIF focal factor, default 1.2.\n"
-      << "  --max_num_features <n>   SIFT feature limit, default 4096.\n"
+      << "  --max_num_features <n>   Feature limit, default 4096.\n"
+      << "  --feature_type <sift|aliked_n16rot|aliked_n32>\n"
+      << "                            Feature family, default sift.\n"
       << "  --feature_num_threads <n> CPU feature threads, default -1.\n"
       << "  --feature_extractor <auto|vlsift|cvsift|cuda_opencv|cuda_vlfeat>\n"
       << "                            Default auto prefers CUDA OpenCV and falls "
-         "back to CPU OpenCV.\n";
+         "back to CPU OpenCV.\n"
+      << "  --aliked_model_path <file> Required ONNX model for ALIKED.\n"
+      << "  --aliked_min_score <s>    ALIKED score threshold, default 0.2.\n";
+}
+
+FeatureExtractorType ParseFeatureType(const std::string& value) {
+  if (value == "sift") return FeatureExtractorType::kSift;
+  if (value == "aliked_n16rot" || value == "aliked-n16rot") {
+    return FeatureExtractorType::kAlikedN16Rot;
+  }
+  if (value == "aliked_n32" || value == "aliked-n32") {
+    return FeatureExtractorType::kAlikedN32;
+  }
+  throw std::invalid_argument("Unsupported feature type: " + value);
 }
 
 std::string RequireValue(const std::vector<std::string>& args,
@@ -88,8 +103,15 @@ int RunFeatureExtractor(const std::vector<std::string>& args,
         options.max_num_features = std::stoi(RequireValue(args, &i, arg));
       } else if (arg == "--feature_num_threads") {
         options.num_threads = std::stoi(RequireValue(args, &i, arg));
+      } else if (arg == "--feature_type") {
+        options.extractor_type = ParseFeatureType(RequireValue(args, &i, arg));
       } else if (arg == "--feature_extractor") {
         options.backend = SiftBackendFromName(RequireValue(args, &i, arg));
+      } else if (arg == "--aliked_model_path") {
+        options.aliked_model_path = RequireValue(args, &i, arg);
+      } else if (arg == "--aliked_min_score") {
+        options.aliked_min_score =
+            std::stof(RequireValue(args, &i, arg));
       } else {
         throw std::invalid_argument("Unknown argument: " + arg);
       }
@@ -97,6 +119,11 @@ int RunFeatureExtractor(const std::vector<std::string>& args,
     if (options.image_path.empty() || options.workspace_path.empty()) {
       throw std::invalid_argument(
           "--image_path and --workspace_path are required");
+    }
+    if (IsAlikedFeature(options.extractor_type) &&
+        options.aliked_model_path.empty()) {
+      throw std::invalid_argument(
+          "--aliked_model_path is required for ALIKED extraction");
     }
     const auto summary =
         controllers::FeatureExtractorController(options).Run();
