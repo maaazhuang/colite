@@ -21,6 +21,7 @@ namespace colite::controllers {
 enum class SfmMapperType {
   kIncremental,
   kGlobal,
+  kHierarchical,
 };
 
 struct ReconSfmControllerOptions {
@@ -50,6 +51,9 @@ struct ReconSfmControllerOptions {
   double lightglue_min_score = 0.1;
   int learned_matcher_num_threads = 1;
   SfmMapperType mapper_type = SfmMapperType::kIncremental;
+  std::size_t hierarchical_target_cluster_size = 100;
+  std::size_t hierarchical_max_cluster_size = 150;
+  std::size_t hierarchical_overlap = 10;
   // Match the standalone exhaustive matcher unless relaxation is explicitly
   // requested by the caller.
   std::size_t nearby_match_window = 0;

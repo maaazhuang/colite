@@ -36,7 +36,9 @@ Colite 是一个 C++17 编写的轻量三维重建系统，覆盖从原始图像
 - SfM 主体结构在 `building-18` 上已接近 COLMAP 3.11：注册率、点数、观测数、平均 track length 和相机位姿均已做 Sim(3) 对齐验证。
 - SfM 可从 verified 匹配图的多个连通分量输出独立 sparse model，也可加载已有
   COLMAP text model 后继续注册当前图像集中的剩余图像；模型间有足够 verified
-  3D-3D 对应时执行鲁棒 Sim(3) 合并。当前尚未实现 hierarchical/global mapper。
+  3D-3D 对应时执行鲁棒 Sim(3) 合并。global mapper 已接通 view graph、旋转平均、
+  全局定位、三角化与 BA；hierarchical mapper 已接通重叠分区、局部增量重建、
+  局部模型 Sim(3) 重试合并与最终 BA。两条新路径仍需更大数据集的性能和退化验证。
 - PatchMatch 保留区域的深度误差已接近 COLMAP 4.0；CUDA source 采样已加入
   三角化角、入射角和局部单应分辨率先验。House High 共用相机基准的最终稠密
   点数与 COLMAP 相差 0.95%，同时 PatchMatch wall 更低。

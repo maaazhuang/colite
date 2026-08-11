@@ -99,8 +99,9 @@ OUTPUT/
 
 ## Current limitations
 
-- The mapper is incremental and multi-model; hierarchical and global mapping
-  are not implemented.
+- Sparse reconstruction supports incremental multi-model, global, and
+  hierarchical mapping. The global and hierarchical paths are initial
+  production implementations and still need broader large-dataset validation.
 - CUDA performance and memory usage vary substantially with image size, source
   count, GPU architecture, and cache configuration.
 - Texture seams, visibility recall, Delaunay behavior on degenerate geometry,

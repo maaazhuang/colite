@@ -7,11 +7,14 @@
 | 阶段 | 当前边界 | 后续闭环 |
 |---|---|---|
 | P0 | 已完成：类型化 feature/matcher/descriptor 契约、workspace feature v2、校验和与损坏检测、v1 兼容读取、缓存身份升级 | 兼容性维护 |
-| P1 | 核心链路已完成：可选 ONNX Runtime、ALIKED N16Rot/N32、ALIKED cosine BF、SIFT/ALIKED LightGlue、EXIF Orientation 1–8、独立命令及 `recon_sfm` 接入；官方模型清单和 SHA-256 自动校验已加入 | 官方模型 golden inference；四种组合端到端 SfM A/B；CUDA EP |
+| P1 | 核心链路已完成：可选 ONNX Runtime、ALIKED N16Rot/N32、ALIKED cosine BF、SIFT/ALIKED LightGlue、EXIF Orientation 1–8、独立命令及 `recon_sfm` 接入；官方模型清单、SHA-256 自动校验和四模型真实 CPU golden inference 已加入 | 四种组合端到端 SfM A/B；CUDA EP |
 | P2 | 首条全局流水线已接通：view-graph 筛选、旋转平均、全局相机中心、track 三角化/合并、全局 BA，并支持 `recon_sfm/recon_auto --sfm.mapper global` | 更鲁棒的 view-graph calibration、固定旋转的位置/结构优化、分阶段重三角化与大数据集 A/B |
-| P3 | `transitive_matcher`、重叠 view-graph 聚类器已实现；structure-less 多邻居位姿回退已接入增量 mapper，可显式启用并继续三角化 | generalized relative pose、hierarchical 局部重建/合并调度；position prior absolute-pose refinement |
+| P3 | `transitive_matcher`、重叠 view-graph 聚类器和 hierarchical mapper 已实现；局部增量重建、公共 verified track 的 Sim(3) 重试合并、最终 BA 已接通；structure-less 多邻居位姿回退已接入增量 mapper | generalized relative pose；局部任务并行/模型图联合优化；position prior absolute-pose refinement |
 
-当前验证基线：默认/CUDA 构建 375 项测试通过、0 失败、1 项按环境跳过；ONNX 开启构建的 P1–P3 定向测试 37 项通过。真实官方 ONNX 模型的数值 golden 与四组合端到端 SfM 尚未执行，因此不把 P1 标记为完整验收结束。
+官方 COLMAP 3.13.0 的 ALIKED N16Rot/N32、ALIKED-LightGlue 与 SIFT-LightGlue 已通过
+SHA-256 校验并完成真实 CPU golden inference；测试在缺少模型或 ONNX 构建时明确跳过，
+不把网络下载引入常规构建。当前 CUDA 与 ONNX 构建各发现 389 项测试，均为 0 失败；
+ONNX 构建中的四项官方模型 golden 全部实际执行并通过。四组合端到端 SfM A/B 仍待执行。
 
 ## 1. 结论
 
@@ -53,20 +56,20 @@ matching、增量 SfM、多模型、PatchMatch、Stereo Fusion、Poisson/Delauna
 | SIFT CPU/GPU、RootSIFT | 支持 | CPU/CUDA，多套语义和一致性测试 | 已覆盖 |
 | SIFT BF、ratio、cross-check、guided matching | 支持 | CPU/FLANN/CUDA，含极线走廊重搜索 | 已覆盖；实现路径不同 |
 | exhaustive/sequential/spatial/vocab-tree pairing | 支持 | 四类均有，另有本地词树 builder | 基本覆盖 |
-| transitive matcher | 独立命令 | 无独立 pair 扩展和匹配命令 | 缺失，P3 |
-| 类型化描述子 | SIFT/ALIKED 类型随存储和流水线传播，不匹配类型会失败 | `FeatureSet.descriptors` 为无类型 float 矩阵 | 基础缺口，P0 |
-| ALIKED N16Rot/N32 | ONNX，RGB 输入，float 描述子 | 无 | 缺失，P1 |
-| LightGlue | SIFT 与 ALIKED 的 ONNX matcher | 无 | 缺失，P1 |
+| transitive matcher | 独立命令 | 已实现受控 pair 扩展、真实匹配与几何验证 | 已覆盖，P3 |
+| 类型化描述子 | SIFT/ALIKED 类型随存储和流水线传播，不匹配类型会失败 | 类型、标量、距离与归一化随 workspace v2 持久化 | 已覆盖，P0 |
+| ALIKED N16Rot/N32 | ONNX，RGB 输入，float 描述子 | 已实现并通过官方模型 golden | 已覆盖，P1 |
+| LightGlue | SIFT 与 ALIKED 的 ONNX matcher | 两种官方模型均已通过真实 inference golden | 已覆盖，P1 |
 | ALIKED 可扩展检索 | 预训练 vocabulary tree | 当前词树围绕 SIFT/通用 float 接口设计 | 部分，P1/P3 |
-| EXIF 方向自动旋转 | 提取/匹配时自动转正并回写特征坐标 | 读取焦距/GPS，不处理 EXIF Orientation | 缺失，P1 |
+| EXIF 方向自动旋转 | 提取/匹配时自动转正并回写特征坐标 | Orientation 1–8 在统一读取层处理 | 已覆盖，P1 |
 | 增量 SfM、多模型、续建/合并 | 支持 | 支持 | 基本覆盖 |
 | structure-less 注册回退 | 无 3-view overlap 时用 generalized relative pose 注册 | 主要依赖 2D-3D PnP | 缺失，P3 |
 | position prior | 对齐、优化及 absolute pose refinement 可选使用 | GPS→ENU、Sim(3) 对齐、最终 BA；PnP refinement 未使用位置 prior | 部分，P3 |
-| GLOMAP global mapper | view graph calibration→旋转平均→track 建立→全局定位→分阶段 BA→重三角化 | 无全局 mapper | 核心缺失，P2 |
+| GLOMAP global mapper | view graph calibration→旋转平均→track 建立→全局定位→分阶段 BA→重三角化 | 首条全局流水线已接通，calibration/分阶段优化仍需增强 | 部分，P2 |
 | view graph calibration | 可独立运行，由 F/E 估计焦距并重估相对位姿 | 无 | 缺失，P2 |
-| rotation averaging/global positioning | 独立 estimator/CLI，并用于 global mapper | 无 | 缺失，P2 |
-| hierarchical mapper | 重叠聚类、并行局部增量重建、层次合并 | 仅按连通分量构建多个模型并尝试 Sim(3) 合并 | 缺失，P3 |
-| model clustering | 按场景连通性切分大型模型 | `model_splitter` 按 track 连通性拆分，不等价 | 缺失，P3 |
+| rotation averaging/global positioning | 独立 estimator/CLI，并用于 global mapper | 已实现并接入 global mapper | 核心覆盖，P2 |
+| hierarchical mapper | 重叠聚类、并行局部增量重建、层次合并 | 已实现重叠聚类、局部重建、Sim(3) 重试合并和最终 BA；局部任务暂顺序执行 | 核心覆盖，P3 |
+| model clustering | 按场景连通性切分大型模型 | 已实现 verified view-graph 目标规模/重叠分区 | 核心覆盖，P3 |
 | BA 点开关 | 可控制是否优化 3D 点 | local/global BA 已有 `refine_points` | 已覆盖；补 CLI 一致性检查 |
 | BA 性能改进 | 单 pose 参数块、SIMPLE_RADIAL 分析 Jacobian、失败时 CPU fallback | 常用相机有分析 Jacobian；没有同等通用 solver 抽象/fallback | 部分，P2/P4 |
 | LO-RANSAC 内部并行 | 支持 | image pair 级并行，单 pair RANSAC 循环串行 | 部分，P4 |

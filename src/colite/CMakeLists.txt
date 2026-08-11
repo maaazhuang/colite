@@ -81,6 +81,7 @@ add_library(colite_core
   sfm/global_bundle_adjuster.cpp
   sfm/global_mapper.cpp
   sfm/global_positioner.cpp
+  sfm/hierarchical_mapper.cpp
   sfm/image_registrar.cpp
   sfm/incremental_initializer.cpp
   sfm/incremental_mapper.cpp

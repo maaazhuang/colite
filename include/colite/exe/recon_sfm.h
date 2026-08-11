@@ -46,6 +46,9 @@ struct ReconSfmCliOptions {
   int learned_matcher_num_threads = 1;
   controllers::SfmMapperType mapper_type =
       controllers::SfmMapperType::kIncremental;
+  std::size_t hierarchical_target_cluster_size = 100;
+  std::size_t hierarchical_max_cluster_size = 150;
+  std::size_t hierarchical_overlap = 10;
   std::size_t nearby_match_window = 0;
   double nearby_match_ratio = 0.8;
   double guided_match_ratio = 0.95;

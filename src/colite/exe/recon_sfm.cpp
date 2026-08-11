@@ -53,7 +53,10 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --min_cosine_similarity <v> ALIKED BF threshold, default 0.85.\n"
       << "  --lightglue_min_score <v> LightGlue threshold, default 0.1.\n"
       << "  --learned_matcher_num_threads <n> ONNX threads, default 1.\n"
-      << "  --mapper <incremental|global> SfM mapper, default incremental.\n"
+      << "  --mapper <incremental|global|hierarchical> SfM mapper, default incremental.\n"
+      << "  --hierarchical_target_cluster_size <n> Core images per cluster, default 100.\n"
+      << "  --hierarchical_max_cluster_size <n> Core plus overlap, default 150.\n"
+      << "  --hierarchical_overlap <n> Boundary images per cluster, default 10.\n"
       << "  --nearby_match_window <n>\n"
          "                            Relax and re-match neighboring image pairs "
          "within this file-order window, default 0 disables it.\n"
@@ -318,9 +321,20 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
         options.mapper_type = controllers::SfmMapperType::kIncremental;
       } else if (mapper == "global") {
         options.mapper_type = controllers::SfmMapperType::kGlobal;
+      } else if (mapper == "hierarchical") {
+        options.mapper_type = controllers::SfmMapperType::kHierarchical;
       } else {
         throw std::invalid_argument("Unsupported mapper: " + mapper);
       }
+    } else if (arg == "--hierarchical_target_cluster_size") {
+      options.hierarchical_target_cluster_size = static_cast<std::size_t>(
+          std::stoull(RequireValue(args, &i, arg)));
+    } else if (arg == "--hierarchical_max_cluster_size") {
+      options.hierarchical_max_cluster_size = static_cast<std::size_t>(
+          std::stoull(RequireValue(args, &i, arg)));
+    } else if (arg == "--hierarchical_overlap") {
+      options.hierarchical_overlap = static_cast<std::size_t>(
+          std::stoull(RequireValue(args, &i, arg)));
     } else {
       throw std::invalid_argument("Unknown argument: " + arg);
     }
@@ -336,10 +350,15 @@ void ValidateOptions(const ReconSfmCliOptions& options) {
   if (options.resume && options.force) {
     throw std::invalid_argument("--resume and --force are mutually exclusive");
   }
-  if (options.mapper_type == controllers::SfmMapperType::kGlobal &&
+  if (options.mapper_type != controllers::SfmMapperType::kIncremental &&
       !options.input_model_path.empty()) {
     throw std::invalid_argument(
-        "--mapper global does not support --input_model_path yet");
+        "global/hierarchical mapper does not support --input_model_path yet");
+  }
+  if (options.hierarchical_target_cluster_size == 0 ||
+      options.hierarchical_max_cluster_size <
+          options.hierarchical_target_cluster_size) {
+    throw std::invalid_argument("Invalid hierarchical cluster size limits");
   }
   if (options.image_path.empty()) {
     throw std::invalid_argument("Missing required argument --image_path");
@@ -461,6 +480,11 @@ controllers::ReconSfmControllerOptions ToControllerOptions(
   controller_options.learned_matcher_num_threads =
       options.learned_matcher_num_threads;
   controller_options.mapper_type = options.mapper_type;
+  controller_options.hierarchical_target_cluster_size =
+      options.hierarchical_target_cluster_size;
+  controller_options.hierarchical_max_cluster_size =
+      options.hierarchical_max_cluster_size;
+  controller_options.hierarchical_overlap = options.hierarchical_overlap;
   controller_options.nearby_match_window = options.nearby_match_window;
   controller_options.nearby_match_ratio = options.nearby_match_ratio;
   controller_options.guided_match_ratio = options.guided_match_ratio;
