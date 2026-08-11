@@ -17,6 +17,7 @@ option(COLITE_ENABLE_SIFT_PARALLEL "Enable the persistent SIFT worker pool" ON)
 option(COLITE_ENABLE_AVX2 "Enable AVX2/FMA optimized CPU SIFT kernels" ON)
 option(COLITE_ENABLE_POISSON_MESHING "Build the bundled PoissonRecon mesher" ON)
 option(COLITE_ENABLE_DELAUNAY_MESHING "Build the CGAL Delaunay mesher when CGAL is available" ON)
+option(COLITE_ENABLE_ONNX "Build optional ONNX Runtime learned feature backends" OFF)
 
 if(COLITE_ENABLE_CUDA_SIFT OR COLITE_ENABLE_CUDA_MATCHER OR COLITE_ENABLE_CUDA_MVS)
   # WSL non-login shells commonly omit /usr/local/cuda/bin from PATH even
@@ -67,6 +68,10 @@ find_package(glog REQUIRED)
 find_package(PoseLib QUIET)
 find_library(FLANN_CPP_LIBRARY NAMES flann_cpp REQUIRED)
 find_library(LZ4_LIBRARY NAMES lz4 REQUIRED)
+
+if(COLITE_ENABLE_ONNX)
+  find_package(onnxruntime CONFIG REQUIRED)
+endif()
 
 if(COLITE_ENABLE_DELAUNAY_MESHING)
   find_package(CGAL QUIET)

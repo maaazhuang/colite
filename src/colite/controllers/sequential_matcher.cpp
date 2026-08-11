@@ -33,6 +33,8 @@ std::string MatchingStrategyName(MatchingStrategy strategy) {
       return "spatial";
     case MatchingStrategy::kVocabTree:
       return "vocab_tree";
+    case MatchingStrategy::kTransitive:
+      return "transitive";
   }
   return "unknown";
 }
@@ -97,6 +99,7 @@ std::vector<std::pair<std::string, std::string>> RawMatchCacheEntries(
     const std::vector<Image>& images,
     const std::string& feature_hash) {
   return {{"stage", "matches"},
+          {"algorithm_version", "typed_matcher_v2_transitive"},
           {"feature_hash", feature_hash},
           {"num_images", std::to_string(images.size())},
           {"matching_strategy", MatchingStrategyName(options.matching_strategy)},
@@ -117,7 +120,16 @@ std::vector<std::pair<std::string, std::string>> RawMatchCacheEntries(
           {"vocab_tree_sequential_overlap",
            std::to_string(options.vocab_tree_sequential_overlap)},
           {"vocab_tree_path", options.vocab_tree_path.lexically_normal().string()},
+          {"transitive_max_path_length",
+           std::to_string(options.transitive_max_path_length)},
+          {"transitive_max_num_neighbors",
+           std::to_string(options.transitive_max_num_neighbors)},
           {"matcher_backend", MatcherBackendName(options.matcher_backend)},
+          {"matcher_type", std::to_string(static_cast<int>(options.matcher_type))},
+          {"learned_matcher_model_path",
+           options.learned_matcher_model_path.lexically_normal().string()},
+          {"min_cosine_similarity", ToConfigValue(options.min_cosine_similarity)},
+          {"lightglue_min_score", ToConfigValue(options.lightglue_min_score)},
           {"max_ratio", ToConfigValue(options.max_ratio)},
           {"mutual_check", options.mutual_check ? "1" : "0"}};
 }
@@ -170,6 +182,11 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
   if (cameras.empty() || images.size() < 2) {
     throw std::runtime_error("Workspace must contain at least two images");
   }
+  if (options_.matcher_type != FeatureMatcherType::kSiftBruteForce &&
+      options_.guided_matching) {
+    throw std::invalid_argument(
+        "Guided descriptor re-search currently requires the SIFT brute-force matcher");
+  }
   LOG(INFO) << "Matching: images=" << images.size()
             << " strategy=" << MatchingStrategyName(options_.matching_strategy)
             << " backend=" << static_cast<int>(options_.matcher_backend)
@@ -179,9 +196,14 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
 
   MatchGraph graph;
   ReadWorkspaceFeatureSets(options_.workspace_path, &graph);
+  if (options_.matching_strategy == MatchingStrategy::kTransitive) {
+    ReadWorkspaceMatches(options_.workspace_path, &graph);
+    ReadWorkspaceVerifiedGeometries(options_.workspace_path, &graph);
+  }
 
   DescriptorMatchingOptions matching_options;
   matching_options.backend = options_.matcher_backend;
+  matching_options.matcher_type = options_.matcher_type;
   matching_options.max_ratio = options_.max_ratio;
   matching_options.mutual_check = options_.mutual_check;
 
@@ -191,6 +213,17 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
       StableConfigHash(RawMatchCacheEntries(options_, images, feature_hash));
   const std::string geometry_hash =
       StableConfigHash(GeometryCacheEntries(options_, raw_match_hash));
+
+  std::map<ImageId, Camera> cameras_by_image;
+  for (const Image& image : images) {
+    const auto camera_it = std::find_if(
+        cameras.begin(), cameras.end(),
+        [&](const Camera& camera) { return camera.id == image.camera_id; });
+    if (camera_it == cameras.end()) {
+      throw std::runtime_error("Workspace image references missing camera");
+    }
+    cameras_by_image.emplace(image.id, *camera_it);
+  }
 
   MatchingPairGeneratorOptions pair_options;
   pair_options.strategy = options_.matching_strategy;
@@ -207,6 +240,10 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
   pair_options.vocab_tree_sequential_overlap =
       options_.vocab_tree_sequential_overlap;
   pair_options.vocab_tree_path = options_.vocab_tree_path;
+  pair_options.transitive_max_path_length =
+      options_.transitive_max_path_length;
+  pair_options.transitive_max_num_neighbors =
+      options_.transitive_max_num_neighbors;
 
   if (const auto cached_num_pairs = ReadCacheSizeValue(
           options_.workspace_path, "matches", raw_match_hash, "pairs")) {
@@ -249,20 +286,22 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
     for (std::size_t image_idx = 0; image_idx < images.size(); ++image_idx) {
       prepared_indices.emplace(images[image_idx].id, image_idx);
     }
-    parallel::parallel_for_(
-        parallel::Range(0, static_cast<int>(images.size())),
-        [&](const parallel::Range& range) {
-          for (int image_idx = range.start; image_idx < range.end; ++image_idx) {
-            const FeatureSet* features =
-                FindFeatures(graph, images[static_cast<std::size_t>(image_idx)].id);
-            if (features == nullptr) {
-              throw std::runtime_error("Workspace features are incomplete");
+    if (options_.matcher_type == FeatureMatcherType::kSiftBruteForce) {
+      parallel::parallel_for_(
+          parallel::Range(0, static_cast<int>(images.size())),
+          [&](const parallel::Range& range) {
+            for (int image_idx = range.start; image_idx < range.end; ++image_idx) {
+              const FeatureSet* features = FindFeatures(
+                  graph, images[static_cast<std::size_t>(image_idx)].id);
+              if (features == nullptr) {
+                throw std::runtime_error("Workspace features are incomplete");
+              }
+              prepared[static_cast<std::size_t>(image_idx)] =
+                  std::make_unique<PreparedFeatureMatcher>(
+                      *features, matching_options.backend);
             }
-            prepared[static_cast<std::size_t>(image_idx)] =
-                std::make_unique<PreparedFeatureMatcher>(
-                    *features, matching_options.backend);
-          }
-        });
+          });
+    }
 
     std::vector<std::vector<FeatureMatch>> pair_matches(pairs.size());
     parallel::parallel_for_(
@@ -270,11 +309,49 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
         [&](const parallel::Range& range) {
           for (int pair_idx = range.start; pair_idx < range.end; ++pair_idx) {
             const ImagePair& pair = pairs[static_cast<std::size_t>(pair_idx)];
-            pair_matches[static_cast<std::size_t>(pair_idx)] =
-                MatchPreparedFeatureSets(
-                    *prepared.at(prepared_indices.at(pair.image_id1)),
-                    *prepared.at(prepared_indices.at(pair.image_id2)),
-                    matching_options);
+            if (options_.matcher_type ==
+                FeatureMatcherType::kSiftBruteForce) {
+              pair_matches[static_cast<std::size_t>(pair_idx)] =
+                  MatchPreparedFeatureSets(
+                      *prepared.at(prepared_indices.at(pair.image_id1)),
+                      *prepared.at(prepared_indices.at(pair.image_id2)),
+                      matching_options);
+            } else {
+              const FeatureSet* features1 = FindFeatures(graph, pair.image_id1);
+              const FeatureSet* features2 = FindFeatures(graph, pair.image_id2);
+              if (features1 == nullptr || features2 == nullptr) {
+                throw std::runtime_error("Workspace features are incomplete");
+              }
+              if (options_.matcher_type ==
+                  FeatureMatcherType::kAlikedBruteForce) {
+                CosineMatchingOptions learned_options;
+                learned_options.min_cosine_similarity =
+                    static_cast<float>(options_.min_cosine_similarity);
+                learned_options.max_ratio =
+                    static_cast<float>(options_.max_ratio);
+                learned_options.mutual_check = options_.mutual_check;
+                pair_matches[static_cast<std::size_t>(pair_idx)] =
+                    MatchAlikedDescriptors(*features1, *features2,
+                                           learned_options);
+              } else {
+                LightGlueMatchingOptions learned_options;
+                learned_options.matcher_type = options_.matcher_type;
+                learned_options.model_path =
+                    options_.learned_matcher_model_path;
+                learned_options.min_score =
+                    static_cast<float>(options_.lightglue_min_score);
+                learned_options.num_threads =
+                    options_.learned_matcher_num_threads;
+                const Camera& camera1 = cameras_by_image.at(pair.image_id1);
+                const Camera& camera2 = cameras_by_image.at(pair.image_id2);
+                pair_matches[static_cast<std::size_t>(pair_idx)] =
+                    MatchFeatureSetsLightGlue(
+                        *features1, static_cast<int>(camera1.width),
+                        static_cast<int>(camera1.height), *features2,
+                        static_cast<int>(camera2.width),
+                        static_cast<int>(camera2.height), learned_options);
+              }
+            }
           }
         });
     for (std::size_t pair_idx = 0; pair_idx < pairs.size(); ++pair_idx) {
@@ -298,16 +375,6 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
                                 {"matches/raw_matches.tsv"});
   }
 
-  std::map<ImageId, Camera> cameras_by_image;
-  for (const Image& image : images) {
-    const auto camera_it = std::find_if(
-        cameras.begin(), cameras.end(),
-        [&](const Camera& camera) { return camera.id == image.camera_id; });
-    if (camera_it == cameras.end()) {
-      throw std::runtime_error("Workspace image references missing camera");
-    }
-    cameras_by_image.emplace(image.id, *camera_it);
-  }
   TwoViewGeometryBatchOptions geometry_options;
   geometry_options.keep_degenerate = true;
   if (WorkspaceCacheIsValid(options_.workspace_path, "geometry",

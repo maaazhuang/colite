@@ -21,6 +21,7 @@ $COLITE <command> --help
 | `spatial_matcher` | 带位置先验 workspace | 空间邻近匹配和几何 |
 | `vocab_tree_builder` | 特征 workspace | 持久层次词树 |
 | `vocab_tree_matcher` | workspace、可选词树 | 检索候选匹配和几何 |
+| `transitive_matcher` | 已有 verified workspace | 沿已验证图生成受控新 pair，再执行真实匹配和几何验证 |
 | `mapper` | 已匹配 workspace | 稀疏模型和带 RGB PLY |
 | `compare_colmap` | 两个 COLMAP 模型 | Sim(3) 位姿/结构差异报告 |
 | `model_analyzer` | COLMAP 稀疏模型 | 相机、图像、点、观测、track、误差和边界统计 |
@@ -106,7 +107,7 @@ $COLITE sequential_matcher --workspace_path "$OUT/workspace" \
 |---|---:|---|
 | `--workspace_path` | 必填 | 已提取特征的 workspace |
 | `--matching_type` | 由命令决定 | `exhaustive|sequential|spatial|vocab_tree` |
-| `--matcher` | flann | `bf|flann|cuda`；`cuda` 是与 CPU BF 口径一致的精确 GPU 暴力匹配 |
+| `--matcher` | flann | `bf|flann|cuda|aliked_bf|sift_lightglue|aliked_lightglue`；`cuda` 是与 CPU BF 口径一致的精确 GPU 暴力匹配 |
 | `--max_ratio` | 0.8 | Lowe ratio |
 | `--guided_matching` | 0 | 几何验证后按 F 极线约束重搜描述子 |
 | `--guided_match_ratio` | 0.8 | standalone guided Lowe ratio；COLMAP High 同描述子语义 |
@@ -213,6 +214,14 @@ $COLITE recon_sfm \
 diagnostics 和 summary。最大模型位于输出根目录，全部模型位于
 `models/<index>/`。`summary.txt` 记录相机策略、相机数量、具有焦距先验的
 图像数、初始焦距范围、实际 SIFT/matcher 后端、CUDA 可用性、CPU 线程数、
+
+新增前端和 mapper 参数：`--feature_type sift|aliked_n16rot|aliked_n32`、
+`--aliked_model_path`、`--learned_matcher_model_path`、
+`--mapper incremental|global`。全局模式从 verified view graph 完成旋转平均、
+相机中心估计、track 三角化和全局 BA；首版不接受 `--input_model_path`。
+增量模式可用 `--structureless_registration 1` 显式启用 PnP 失败后的多邻居
+相对位姿回退。`recon_auto` 中对应写法为 `--sfm.mapper global` 和
+`--sfm.structureless_registration 1`。
 特征/匹配/内点数量，以及各流程耗时。当前 CUDA 后端加速首轮全局 BF；极线
 走廊 guided 重搜索仍走 CPU。`recon_auto` 通过 `--sfm.<option>` 转发上述
 相机模型、参数和分组策略。

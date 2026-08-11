@@ -6,12 +6,16 @@ set(COLITE_CORE_TEST_SOURCES
   core/parallel_test.cpp
   core/reconstruction_test.cpp
   features/sift_extractor_test.cpp
+  features/aliked_extractor_test.cpp
   features/sift_cpu_cuda_overlap_test.cpp
   integration/recon_mvs_exe_test.cpp
   integration/recon_sfm_exe_test.cpp
   integration/sfm_workspace_and_commands_test.cpp
   integration/sfm_dependency_boundary_test.cpp
+  io/image_reader_test.cpp
+  io/model_resource_test.cpp
   matching/descriptor_matcher_test.cpp
+  matching/learned_matcher_test.cpp
   matching/guided_matching_test.cpp
   matching/match_graph_consistency_test.cpp
   matching/pair_generator_test.cpp
@@ -27,15 +31,19 @@ set(COLITE_CORE_TEST_SOURCES
   mvs/mesh_texturer_test.cpp
   mvs/patch_match_test.cpp
   sfm/global_bundle_adjuster_test.cpp
+  sfm/global_mapper_test.cpp
+  sfm/global_pose_graph_test.cpp
   sfm/image_registrar_test.cpp
   sfm/incremental_initializer_test.cpp
   sfm/incremental_mapper_test.cpp
   sfm/incremental_triangulator_test.cpp
   sfm/local_bundle_adjuster_test.cpp
+  sfm/model_clusterer_test.cpp
   sfm/observation_manager_test.cpp
   sfm/observation_filter_test.cpp
   sfm/reconstruction_manager_test.cpp
   sfm/similarity_transform_test.cpp
+  sfm/structureless_registrar_test.cpp
 )
 
 set(COLITE_VLFEAT_REFERENCE_DIR

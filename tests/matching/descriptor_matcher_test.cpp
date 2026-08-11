@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <initializer_list>
+#include <stdexcept>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -95,6 +96,23 @@ TEST(DescriptorMatcherTest, PreparedFlannMatchesOneShotMatcher) {
   const PreparedFeatureMatcher prepared2(features2, options.backend);
   EXPECT_EQ(ToPairs(MatchPreparedFeatureSets(prepared1, prepared2, options)),
             ToPairs(MatchFeatureSets(features1, features2, options)));
+}
+
+TEST(DescriptorMatcherTest, RejectsIncompatibleLearnedFeatureContract) {
+  FeatureSet sift;
+  FeatureSet aliked;
+  sift.descriptors = MakeBlockDescriptors({0});
+  aliked.extractor_type = FeatureExtractorType::kAlikedN16Rot;
+  aliked.descriptor_metric = DescriptorMetric::kCosine;
+  aliked.descriptors = MakeBlockDescriptors({0});
+
+  DescriptorMatchingOptions options;
+  options.matcher_type = FeatureMatcherType::kSiftBruteForce;
+  EXPECT_THROW(MatchFeatureSets(sift, aliked, options), std::invalid_argument);
+
+  options.matcher_type = FeatureMatcherType::kAlikedBruteForce;
+  EXPECT_THROW(MatchFeatureSets(aliked, aliked, options),
+               std::invalid_argument);
 }
 
 TEST(DescriptorMatcherTest, CudaMatchesCpuBruteForceExactly) {

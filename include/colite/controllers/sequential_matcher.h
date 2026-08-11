@@ -4,6 +4,7 @@
 #include <filesystem>
 
 #include "colite/matching/descriptor_matcher.h"
+#include "colite/matching/learned_matcher.h"
 #include "colite/matching/pair_generator.h"
 #include "colite/matching/weak_pair_rematcher.h"
 
@@ -22,7 +23,14 @@ struct SequentialMatcherControllerOptions {
   std::size_t vocab_tree_max_num_features = 5000;
   std::size_t vocab_tree_sequential_overlap = 2;
   std::filesystem::path vocab_tree_path;
+  std::size_t transitive_max_path_length = 2;
+  std::size_t transitive_max_num_neighbors = 20;
   DescriptorMatcherBackend matcher_backend = DescriptorMatcherBackend::kFlann;
+  FeatureMatcherType matcher_type = FeatureMatcherType::kSiftBruteForce;
+  std::filesystem::path learned_matcher_model_path;
+  double min_cosine_similarity = 0.85;
+  double lightglue_min_score = 0.1;
+  int learned_matcher_num_threads = 1;
   double max_ratio = 0.8;
   bool mutual_check = true;
   bool guided_matching = false;

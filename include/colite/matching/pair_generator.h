@@ -15,6 +15,7 @@ enum class MatchingStrategy {
   kSequential,
   kSpatial,
   kVocabTree,
+  kTransitive,
 };
 
 struct MatchingPairGeneratorOptions {
@@ -40,6 +41,11 @@ struct MatchingPairGeneratorOptions {
   // COLITE_VOCAB_TREE <version> <descriptor_dim>
   // 后续每行一个 visual word descriptor。为空时保留轻量临时训练路径。
   std::filesystem::path vocab_tree_path;
+
+  // transitive: expand only previously verified connectivity, then run the
+  // configured real descriptor matcher and geometric verification.
+  std::size_t transitive_max_path_length = 2;
+  std::size_t transitive_max_num_neighbors = 20;
 };
 
 struct MatchingPairGeneratorSummary {

@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -32,6 +33,11 @@ std::string ReadTextFile(const std::filesystem::path& path) {
           std::istreambuf_iterator<char>()};
 }
 
+template <typename T>
+void WriteBinaryTestValue(std::ofstream* file, const T& value) {
+  file->write(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
 FeatureSet MakeTinyFeatures() {
   FeatureSet features;
   features.keypoints = {{10.0F, 20.0F, 1.5F, 0.1F, 2.0F},
@@ -40,6 +46,18 @@ FeatureSet MakeTinyFeatures() {
   features.descriptors.setZero();
   features.descriptors(0, 0) = 1.0F;
   features.descriptors(1, 127) = 2.0F;
+  return features;
+}
+
+FeatureSet MakeTinyAlikedFeatures() {
+  FeatureSet features = MakeTinyFeatures();
+  features.extractor_type = FeatureExtractorType::kAlikedN16Rot;
+  features.descriptor_metric = DescriptorMetric::kCosine;
+  features.descriptor_normalization = DescriptorNormalization::kL2;
+  features.descriptors.resize(2, 4);
+  features.descriptors.setZero();
+  features.descriptors(0, 0) = 1.0F;
+  features.descriptors(1, 1) = 1.0F;
   return features;
 }
 
@@ -305,6 +323,13 @@ TEST(SfmWorkspaceTest, RoundTripsManifestFeaturesAndMatches) {
   EXPECT_NEAR(images[1].prior_position->y(), 2.0, 1e-12);
   EXPECT_NEAR(images[1].prior_position->z(), 3.0, 1e-12);
   ASSERT_EQ(loaded_features.keypoints.size(), 2U);
+  EXPECT_EQ(loaded_features.extractor_type, FeatureExtractorType::kSift);
+  EXPECT_EQ(loaded_features.descriptor_scalar_type,
+            DescriptorScalarType::kFloat32);
+  EXPECT_EQ(loaded_features.descriptor_metric,
+            DescriptorMetric::kSiftAngular);
+  EXPECT_EQ(loaded_features.descriptor_normalization,
+            DescriptorNormalization::kRootL1);
   EXPECT_FLOAT_EQ(loaded_features.keypoints[1].response, 3.0F);
   ASSERT_EQ(loaded_features.descriptors.rows(), 2);
   EXPECT_FLOAT_EQ(loaded_features.descriptors(1, 127), 2.0F);
@@ -325,6 +350,87 @@ TEST(SfmWorkspaceTest, RoundTripsManifestFeaturesAndMatches) {
                                       "raw_matches.tsv"));
   EXPECT_TRUE(std::filesystem::exists(workspace / "matches" /
                                       "verified_matches.tsv"));
+}
+
+TEST(SfmWorkspaceTest, ReadsLegacyVersionOneFeatureFilesAsSift) {
+  const std::filesystem::path workspace =
+      std::filesystem::temp_directory_path() / "colite_feature_v1_test";
+  std::filesystem::remove_all(workspace);
+  std::filesystem::create_directories(workspace / "features");
+  const FeatureSet source = MakeTinyFeatures();
+  std::ofstream file(workspace / "features" / "7.bin", std::ios::binary);
+  const std::uint32_t magic = 0x434C4654U;
+  const std::uint32_t version = 1;
+  const std::uint64_t count = source.keypoints.size();
+  const std::uint64_t rows = source.descriptors.rows();
+  const std::uint64_t cols = source.descriptors.cols();
+  WriteBinaryTestValue(&file, magic);
+  WriteBinaryTestValue(&file, version);
+  WriteBinaryTestValue(&file, count);
+  WriteBinaryTestValue(&file, rows);
+  WriteBinaryTestValue(&file, cols);
+  for (const FeatureKeypoint& keypoint : source.keypoints) {
+    WriteBinaryTestValue(&file, keypoint.x);
+    WriteBinaryTestValue(&file, keypoint.y);
+    WriteBinaryTestValue(&file, keypoint.scale);
+    WriteBinaryTestValue(&file, keypoint.orientation);
+    WriteBinaryTestValue(&file, keypoint.response);
+  }
+  file.write(reinterpret_cast<const char*>(source.descriptors.data()),
+             source.descriptors.size() * sizeof(float));
+  file.close();
+
+  const FeatureSet loaded = ReadWorkspaceFeatureSet(workspace, 7);
+  EXPECT_EQ(loaded.extractor_type, FeatureExtractorType::kSift);
+  EXPECT_EQ(loaded.descriptor_metric, DescriptorMetric::kSiftAngular);
+  ASSERT_EQ(loaded.descriptors.rows(), source.descriptors.rows());
+  EXPECT_FLOAT_EQ(loaded.descriptors(1, 127), 2.0F);
+}
+
+TEST(SfmWorkspaceTest, RejectsCorruptedVersionTwoFeaturePayload) {
+  const std::filesystem::path workspace =
+      std::filesystem::temp_directory_path() / "colite_feature_v2_corrupt_test";
+  std::filesystem::remove_all(workspace);
+  WriteWorkspaceFeatureSet(workspace, 9, MakeTinyFeatures());
+  const std::filesystem::path path = workspace / "features" / "9.bin";
+  std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+  file.seekg(-1, std::ios::end);
+  char value = 0;
+  file.read(&value, 1);
+  value ^= 0x01;
+  file.seekp(-1, std::ios::end);
+  file.write(&value, 1);
+  file.close();
+
+  EXPECT_THROW(ReadWorkspaceFeatureSet(workspace, 9), std::runtime_error);
+}
+
+TEST(SfmWorkspaceTest, RoundTripsLearnedDescriptorMetadata) {
+  const std::filesystem::path workspace =
+      std::filesystem::temp_directory_path() / "colite_feature_metadata_test";
+  std::filesystem::remove_all(workspace);
+  FeatureSet source = MakeTinyFeatures();
+  source.extractor_type = FeatureExtractorType::kAlikedN32;
+  source.descriptor_metric = DescriptorMetric::kCosine;
+  WriteWorkspaceFeatureSet(workspace, 11, source);
+
+  const FeatureSet loaded = ReadWorkspaceFeatureSet(workspace, 11);
+  EXPECT_EQ(loaded.extractor_type, FeatureExtractorType::kAlikedN32);
+  EXPECT_EQ(loaded.descriptor_scalar_type, DescriptorScalarType::kFloat32);
+  EXPECT_EQ(loaded.descriptor_metric, DescriptorMetric::kCosine);
+  EXPECT_EQ(loaded.descriptor_normalization,
+            DescriptorNormalization::kRootL1);
+  EXPECT_TRUE(loaded.descriptors.isApprox(source.descriptors));
+}
+
+TEST(SfmWorkspaceTest, RejectsPartialDescriptorRows) {
+  const std::filesystem::path workspace =
+      std::filesystem::temp_directory_path() / "colite_feature_rows_test";
+  std::filesystem::remove_all(workspace);
+  FeatureSet features = MakeTinyFeatures();
+  features.descriptors.conservativeResize(1, Eigen::NoChange);
+  EXPECT_THROW(WriteWorkspaceFeatureSet(workspace, 12, features),
+               std::invalid_argument);
 }
 
 TEST(SfmWorkspaceTest, RoundTripsStageCacheMetadata) {
@@ -535,6 +641,46 @@ TEST(SfmWorkspaceTest, SequentialMatcherReusesRawAndGeometryCaches) {
   EXPECT_TRUE(second.geometry_cache_hit);
   EXPECT_EQ(second.num_pairs, first.num_pairs);
   EXPECT_EQ(second.num_verified_inliers, first.num_verified_inliers);
+}
+
+TEST(SfmWorkspaceTest, ExhaustiveMatcherSupportsPersistedAlikedDescriptors) {
+  const std::filesystem::path workspace =
+      std::filesystem::temp_directory_path() / "colite_aliked_match_test";
+  std::filesystem::remove_all(workspace);
+  Camera camera;
+  camera.id = 1;
+  camera.model_id = CameraModelId::kPinhole;
+  camera.width = 640;
+  camera.height = 480;
+  camera.params = {500.0, 500.0, 320.0, 240.0};
+  Image image1;
+  image1.id = 1;
+  image1.camera_id = 1;
+  image1.name = "image1.jpg";
+  Image image2 = image1;
+  image2.id = 2;
+  image2.name = "image2.jpg";
+  WriteWorkspaceCameras(workspace, {camera});
+  WriteWorkspaceImages(workspace, {image1, image2});
+  WriteWorkspaceFeatureSet(workspace, 1, MakeTinyAlikedFeatures());
+  WriteWorkspaceFeatureSet(workspace, 2, MakeTinyAlikedFeatures());
+
+  controllers::SequentialMatcherControllerOptions options;
+  options.workspace_path = workspace;
+  options.matching_strategy = MatchingStrategy::kExhaustive;
+  options.matcher_type = FeatureMatcherType::kAlikedBruteForce;
+  options.min_cosine_similarity = 0.9;
+  options.max_ratio = 1.0;
+  const auto summary = controllers::SequentialMatcherController(options).Run();
+
+  EXPECT_TRUE(summary.success);
+  EXPECT_EQ(summary.num_pairs, 1U);
+  MatchGraph graph;
+  ReadWorkspaceMatches(workspace, &graph);
+  const auto* matches = FindMatches(graph, 1, 2);
+  ASSERT_NE(matches, nullptr);
+  EXPECT_EQ(matches->size(), 2U);
+  std::filesystem::remove_all(workspace);
 }
 
 TEST(SfmCommandExeTest, PrintsHelpForStageCommands) {

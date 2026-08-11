@@ -42,6 +42,7 @@ std::vector<std::pair<std::string, std::string>> FeatureCacheEntries(
     const std::vector<std::filesystem::path>& image_paths) {
   std::vector<std::pair<std::string, std::string>> entries;
   entries.emplace_back("stage", "features");
+  entries.emplace_back("algorithm_version", "typed_feature_workspace_v2");
   entries.emplace_back("camera_prior_version", "camera_models_auto_exif_v4");
   entries.emplace_back("image_path", options.image_path.lexically_normal().string());
   entries.emplace_back("focal_length", ToConfigValue(options.focal_length));
@@ -58,9 +59,23 @@ std::vector<std::pair<std::string, std::string>> FeatureCacheEntries(
   entries.emplace_back("default_focal_length_factor",
                        ToConfigValue(options.default_focal_length_factor));
   entries.emplace_back("max_num_features", std::to_string(options.max_num_features));
+  entries.emplace_back("extractor_type",
+                       std::string(FeatureExtractorTypeName(options.extractor_type)));
   entries.emplace_back("backend", SiftBackendName(options.backend));
   entries.emplace_back("resolved_backend",
                        SiftBackendName(ResolveSiftBackend(options.backend)));
+  entries.emplace_back("aliked_min_score", ToConfigValue(options.aliked_min_score));
+  entries.emplace_back("aliked_model_path",
+                       options.aliked_model_path.lexically_normal().string());
+  if (!options.aliked_model_path.empty() &&
+      std::filesystem::exists(options.aliked_model_path)) {
+    entries.emplace_back("aliked_model_size",
+                         std::to_string(std::filesystem::file_size(
+                             options.aliked_model_path)));
+    entries.emplace_back("aliked_model_mtime",
+                         ToConfigValue(std::filesystem::last_write_time(
+                             options.aliked_model_path)));
+  }
   entries.emplace_back("num_images", std::to_string(image_paths.size()));
   for (std::size_t i = 0; i < image_paths.size(); ++i) {
     const std::filesystem::path& image_path = image_paths[i];
@@ -148,8 +163,11 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
     throw std::runtime_error("No input images found");
   }
   LOG(INFO) << "Feature extraction: images=" << image_paths.size()
+            << " type=" << FeatureExtractorTypeName(options_.extractor_type)
             << " backend="
-            << SiftBackendName(ResolveSiftBackend(options_.backend))
+            << (options_.extractor_type == FeatureExtractorType::kSift
+                    ? SiftBackendName(ResolveSiftBackend(options_.backend))
+                    : "onnx")
             << " max_features=" << options_.max_num_features
             << " requested_threads=" << options_.num_threads
             << " workspace=" << options_.workspace_path.string();
@@ -183,15 +201,23 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
 
   int num_threads = EffectiveFeatureExtractionThreads(options_.num_threads);
   const SiftBackend resolved_backend = ResolveSiftBackend(sift_options.backend);
+  AlikedExtractionOptions aliked_options;
+  aliked_options.extractor_type = options_.extractor_type;
+  aliked_options.model_path = options_.aliked_model_path;
+  aliked_options.max_num_features = options_.max_num_features;
+  aliked_options.min_score = options_.aliked_min_score;
+  aliked_options.num_threads = num_threads;
 #if defined(COLITE_ENABLE_SIFT_PARALLEL)
   // SIFT 内部固定线程池按连续图像区域切分；外层保持单图，避免两层并行争抢核心。
-  parallel::setNumThreads(resolved_backend == SiftBackend::kCudaSift ||
+  parallel::setNumThreads(options_.extractor_type != FeatureExtractorType::kSift ||
+                                  resolved_backend == SiftBackend::kCudaSift ||
                                   resolved_backend == SiftBackend::kCudaVlSift
                               ? 1
                               : num_threads);
   num_threads = 1;
 #else
-  if (resolved_backend == SiftBackend::kCudaSift ||
+  if (options_.extractor_type != FeatureExtractorType::kSift ||
+      resolved_backend == SiftBackend::kCudaSift ||
       resolved_backend == SiftBackend::kCudaVlSift) {
     num_threads = 1;
   }
@@ -214,7 +240,10 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
       }
       try {
         const FeatureSet features =
-            ExtractSiftFeaturesFromFile(image_paths[*job_idx], sift_options);
+            options_.extractor_type == FeatureExtractorType::kSift
+                ? ExtractSiftFeaturesFromFile(image_paths[*job_idx], sift_options)
+                : ExtractAlikedFeaturesFromFile(image_paths[*job_idx],
+                                                aliked_options);
         num_features.fetch_add(features.keypoints.size(),
                                std::memory_order_relaxed);
         VLOG(1) << "Extracted image " << (*job_idx + 1) << "/"

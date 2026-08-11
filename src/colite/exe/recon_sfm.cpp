@@ -43,7 +43,17 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --feature_extractor <auto|vlsift|cvsift|cuda_opencv|cuda_vlfeat>\n"
          "                            Default auto prefers CUDA OpenCV and "
          "falls back to CPU OpenCV.\n"
-      << "  --matcher <bf|flann|cuda> Descriptor matcher backend, default flann.\n"
+      << "  --feature_type <sift|aliked_n16rot|aliked_n32>\n"
+         "                            Feature family, default sift.\n"
+      << "  --aliked_model_path <file> Required for ALIKED extraction.\n"
+      << "  --aliked_min_score <v>    ALIKED score threshold, default 0.2.\n"
+      << "  --matcher <bf|flann|cuda|aliked_bf|sift_lightglue|aliked_lightglue>\n"
+         "                            Matcher, default flann.\n"
+      << "  --learned_matcher_model_path <file> Required for LightGlue.\n"
+      << "  --min_cosine_similarity <v> ALIKED BF threshold, default 0.85.\n"
+      << "  --lightglue_min_score <v> LightGlue threshold, default 0.1.\n"
+      << "  --learned_matcher_num_threads <n> ONNX threads, default 1.\n"
+      << "  --mapper <incremental|global> SfM mapper, default incremental.\n"
       << "  --nearby_match_window <n>\n"
          "                            Relax and re-match neighboring image pairs "
          "within this file-order window, default 0 disables it.\n"
@@ -57,6 +67,9 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --max_initialization_trials <n>\n"
          "                            Maximum initial image-pair candidates to "
          "try, default 3.\n"
+      << "  --structureless_registration <0|1>\n"
+         "                            Use verified multi-neighbor relative-pose "
+         "fallback after PnP failure, default 0.\n"
       << "  --input_model_path <dir> Continue from an existing COLMAP model.\n"
       << "  --input_format <auto|txt|bin>\n"
          "                            Input model format, default auto.\n"
@@ -198,6 +211,21 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--feature_extractor") {
       options.feature_backend =
           SiftBackendFromName(RequireValue(args, &i, arg));
+    } else if (arg == "--feature_type") {
+      const std::string value = RequireValue(args, &i, arg);
+      if (value == "sift") {
+        options.feature_extractor_type = FeatureExtractorType::kSift;
+      } else if (value == "aliked_n16rot") {
+        options.feature_extractor_type = FeatureExtractorType::kAlikedN16Rot;
+      } else if (value == "aliked_n32") {
+        options.feature_extractor_type = FeatureExtractorType::kAlikedN32;
+      } else {
+        throw std::invalid_argument("Unsupported feature type: " + value);
+      }
+    } else if (arg == "--aliked_model_path") {
+      options.aliked_model_path = RequireValue(args, &i, arg);
+    } else if (arg == "--aliked_min_score") {
+      options.aliked_min_score = std::stod(RequireValue(args, &i, arg));
     } else if (arg == "--nearby_match_window") {
       options.nearby_match_window =
           static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
@@ -211,6 +239,9 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--max_initialization_trials") {
       options.max_initialization_trials =
           static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
+    } else if (arg == "--structureless_registration") {
+      options.use_structureless_registration =
+          ParseBoolFlagValue(RequireValue(args, &i, arg), arg);
     } else if (arg == "--multiple_models") {
       options.multiple_models =
           ParseBoolFlagValue(RequireValue(args, &i, arg), arg);
@@ -256,12 +287,39 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
       const std::string matcher = RequireValue(args, &i, arg);
       if (matcher == "bf") {
         options.matcher_backend = DescriptorMatcherBackend::kBruteForce;
+        options.matcher_type = FeatureMatcherType::kSiftBruteForce;
       } else if (matcher == "flann") {
         options.matcher_backend = DescriptorMatcherBackend::kFlann;
+        options.matcher_type = FeatureMatcherType::kSiftBruteForce;
       } else if (matcher == "cuda") {
         options.matcher_backend = DescriptorMatcherBackend::kCudaBruteForce;
+        options.matcher_type = FeatureMatcherType::kSiftBruteForce;
+      } else if (matcher == "aliked_bf") {
+        options.matcher_type = FeatureMatcherType::kAlikedBruteForce;
+      } else if (matcher == "sift_lightglue") {
+        options.matcher_type = FeatureMatcherType::kSiftLightGlue;
+      } else if (matcher == "aliked_lightglue") {
+        options.matcher_type = FeatureMatcherType::kAlikedLightGlue;
       } else {
         throw std::invalid_argument("Unsupported matcher: " + matcher);
+      }
+    } else if (arg == "--learned_matcher_model_path") {
+      options.learned_matcher_model_path = RequireValue(args, &i, arg);
+    } else if (arg == "--min_cosine_similarity") {
+      options.min_cosine_similarity = std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--lightglue_min_score") {
+      options.lightglue_min_score = std::stod(RequireValue(args, &i, arg));
+    } else if (arg == "--learned_matcher_num_threads") {
+      options.learned_matcher_num_threads =
+          std::stoi(RequireValue(args, &i, arg));
+    } else if (arg == "--mapper") {
+      const std::string mapper = RequireValue(args, &i, arg);
+      if (mapper == "incremental") {
+        options.mapper_type = controllers::SfmMapperType::kIncremental;
+      } else if (mapper == "global") {
+        options.mapper_type = controllers::SfmMapperType::kGlobal;
+      } else {
+        throw std::invalid_argument("Unsupported mapper: " + mapper);
       }
     } else {
       throw std::invalid_argument("Unknown argument: " + arg);
@@ -278,6 +336,11 @@ void ValidateOptions(const ReconSfmCliOptions& options) {
   if (options.resume && options.force) {
     throw std::invalid_argument("--resume and --force are mutually exclusive");
   }
+  if (options.mapper_type == controllers::SfmMapperType::kGlobal &&
+      !options.input_model_path.empty()) {
+    throw std::invalid_argument(
+        "--mapper global does not support --input_model_path yet");
+  }
   if (options.image_path.empty()) {
     throw std::invalid_argument("Missing required argument --image_path");
   }
@@ -286,6 +349,32 @@ void ValidateOptions(const ReconSfmCliOptions& options) {
   }
   if (options.max_num_features <= 0) {
     throw std::invalid_argument("--max_num_features must be positive");
+  }
+  if (!IsFeatureMatcherCompatible(options.feature_extractor_type,
+                                  options.matcher_type)) {
+    throw std::invalid_argument(
+        "--feature_type is incompatible with --matcher");
+  }
+  if (IsAlikedFeature(options.feature_extractor_type) &&
+      options.aliked_model_path.empty()) {
+    throw std::invalid_argument(
+        "--aliked_model_path is required for ALIKED");
+  }
+  if ((options.matcher_type == FeatureMatcherType::kSiftLightGlue ||
+       options.matcher_type == FeatureMatcherType::kAlikedLightGlue) &&
+      options.learned_matcher_model_path.empty()) {
+    throw std::invalid_argument(
+        "--learned_matcher_model_path is required for LightGlue");
+  }
+  if (!std::isfinite(options.aliked_min_score) ||
+      options.aliked_min_score < 0.0 ||
+      !std::isfinite(options.min_cosine_similarity) ||
+      options.min_cosine_similarity < -1.0 ||
+      options.min_cosine_similarity > 1.0 ||
+      !std::isfinite(options.lightglue_min_score) ||
+      options.lightglue_min_score < 0.0 ||
+      options.learned_matcher_num_threads <= 0) {
+    throw std::invalid_argument("Invalid learned frontend configuration");
   }
   if (options.focal_length < 0.0) {
     throw std::invalid_argument("--focal_length must be non-negative");
@@ -359,8 +448,19 @@ controllers::ReconSfmControllerOptions ToControllerOptions(
       options.default_focal_length_factor;
   controller_options.max_num_features = options.max_num_features;
   controller_options.feature_num_threads = options.feature_num_threads;
+  controller_options.feature_extractor_type = options.feature_extractor_type;
   controller_options.feature_backend = options.feature_backend;
+  controller_options.aliked_model_path = options.aliked_model_path;
+  controller_options.aliked_min_score = options.aliked_min_score;
   controller_options.matcher_backend = options.matcher_backend;
+  controller_options.matcher_type = options.matcher_type;
+  controller_options.learned_matcher_model_path =
+      options.learned_matcher_model_path;
+  controller_options.min_cosine_similarity = options.min_cosine_similarity;
+  controller_options.lightglue_min_score = options.lightglue_min_score;
+  controller_options.learned_matcher_num_threads =
+      options.learned_matcher_num_threads;
+  controller_options.mapper_type = options.mapper_type;
   controller_options.nearby_match_window = options.nearby_match_window;
   controller_options.nearby_match_ratio = options.nearby_match_ratio;
   controller_options.guided_match_ratio = options.guided_match_ratio;
@@ -368,6 +468,8 @@ controllers::ReconSfmControllerOptions ToControllerOptions(
       options.max_registration_trials_per_image;
   controller_options.max_initialization_trials =
       options.max_initialization_trials;
+  controller_options.use_structureless_registration =
+      options.use_structureless_registration;
   controller_options.multiple_models = options.multiple_models;
   controller_options.merge_models = options.merge_models;
   controller_options.max_num_models = options.max_num_models;

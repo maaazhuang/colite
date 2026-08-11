@@ -34,6 +34,27 @@ using DistanceMatrix =
     Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 using FlannIndex = flann::Index<flann::L2<std::uint8_t>>;
 
+void ValidateSiftFeatureSet(const FeatureSet& features,
+                            const FeatureMatcherType matcher_type) {
+  if (!IsFeatureMatcherCompatible(features.extractor_type, matcher_type)) {
+    throw std::invalid_argument(
+        "Feature extractor type is incompatible with matcher type.");
+  }
+  if (matcher_type != FeatureMatcherType::kSiftBruteForce ||
+      features.extractor_type != FeatureExtractorType::kSift ||
+      features.descriptor_scalar_type != DescriptorScalarType::kFloat32 ||
+      features.descriptor_metric != DescriptorMetric::kSiftAngular) {
+    throw std::invalid_argument(
+        "The selected matcher is not implemented for this descriptor contract.");
+  }
+  if (!features.keypoints.empty() && features.descriptors.size() != 0 &&
+      features.descriptors.rows() !=
+          static_cast<Eigen::Index>(features.keypoints.size())) {
+    throw std::invalid_argument(
+        "Feature keypoint and descriptor row counts do not match.");
+  }
+}
+
 std::uint8_t ClampToByte(const float value) {
   if (!std::isfinite(value) || value <= 0.0F) {
     return 0;
@@ -540,11 +561,14 @@ std::vector<int> BestMatches(const DescriptorByteMatrix& query_descriptors,
 
 struct PreparedFeatureMatcher::Impl {
   explicit Impl(const FeatureSet& features,
-                const DescriptorMatcherBackend matcher_backend)
+                const DescriptorMatcherBackend matcher_backend,
+                const FeatureMatcherType matcher_type)
       : keypoints(features.keypoints),
         descriptors(QuantizeDescriptors(features.descriptors)),
         grid(BuildFeatureGrid(features)),
-        backend(matcher_backend) {
+        backend(matcher_backend),
+        matcher_type(matcher_type) {
+    ValidateSiftFeatureSet(features, matcher_type);
     if (backend == DescriptorMatcherBackend::kFlann &&
         descriptors.size() != 0) {
       flann::Matrix<std::uint8_t> matrix(
@@ -575,6 +599,7 @@ struct PreparedFeatureMatcher::Impl {
   DescriptorByteMatrix descriptors;
   FeatureGrid grid;
   DescriptorMatcherBackend backend;
+  FeatureMatcherType matcher_type;
   std::unique_ptr<FlannIndex> index;
   std::unique_ptr<cuda_matcher::DescriptorBuffer> cuda_buffer;
   mutable std::mutex index_mutex;
@@ -583,7 +608,8 @@ struct PreparedFeatureMatcher::Impl {
 PreparedFeatureMatcher::PreparedFeatureMatcher(
     const FeatureSet& features,
     const DescriptorMatcherBackend backend)
-    : impl_(std::make_unique<Impl>(features, backend)) {}
+    : impl_(std::make_unique<Impl>(features, backend,
+                                   FeatureMatcherType::kSiftBruteForce)) {}
 
 PreparedFeatureMatcher::~PreparedFeatureMatcher() = default;
 PreparedFeatureMatcher::PreparedFeatureMatcher(
@@ -599,6 +625,11 @@ std::vector<FeatureMatch> MatchPreparedFeatureSets(
       features2.impl_->backend != options.backend) {
     throw std::invalid_argument(
         "Prepared matcher backend does not match matching options.");
+  }
+  if (features1.impl_->matcher_type != options.matcher_type ||
+      features2.impl_->matcher_type != options.matcher_type) {
+    throw std::invalid_argument(
+        "Prepared matcher type does not match matching options.");
   }
   if (options.max_ratio <= 0.0 || options.max_distance <= 0.0) {
     throw std::invalid_argument("Matching thresholds must be positive.");
@@ -670,6 +701,11 @@ std::vector<FeatureMatch> MatchPreparedFeatureSetsGuidedFundamental(
   if (impl1.backend != options.backend || impl2.backend != options.backend) {
     throw std::invalid_argument(
         "Prepared matcher backend does not match guided matching options.");
+  }
+  if (impl1.matcher_type != options.matcher_type ||
+      impl2.matcher_type != options.matcher_type) {
+    throw std::invalid_argument(
+        "Prepared matcher type does not match guided matching options.");
   }
   if (impl1.descriptors.rows() !=
           static_cast<Eigen::Index>(impl1.keypoints.size()) ||
@@ -751,6 +787,11 @@ std::vector<FeatureMatch> MatchFeatureSets(
     const FeatureSet& features1,
     const FeatureSet& features2,
     const DescriptorMatchingOptions& options) {
+  ValidateSiftFeatureSet(features1, options.matcher_type);
+  ValidateSiftFeatureSet(features2, options.matcher_type);
+  if (features1.extractor_type != features2.extractor_type) {
+    throw std::invalid_argument("Feature extractor types do not match.");
+  }
   return MatchDescriptors(features1.descriptors, features2.descriptors, options);
 }
 

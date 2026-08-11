@@ -43,6 +43,9 @@ struct GeodeticCoordinate {
 ExifCameraMetadata ReadExifCameraMetadata(
     const std::filesystem::path& image_path);
 
+// EXIF Orientation value in [1, 8]. Missing or malformed values map to 1.
+int ReadExifOrientation(const std::filesystem::path& image_path);
+
 // Reads WGS84 latitude/longitude and optional altitude from JPEG GPS IFD.
 // Missing altitude is represented as zero; malformed coordinates return null.
 std::optional<GeodeticCoordinate> ReadExifGpsCoordinate(

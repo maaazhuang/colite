@@ -10,12 +10,18 @@
 #include "colite/core/match_graph.h"
 #include "colite/core/reconstruction.h"
 #include "colite/controllers/sfm_camera_setup.h"
+#include "colite/features/aliked_extractor.h"
 #include "colite/features/sift_extractor.h"
 #include "colite/io/sfm_workspace.h"
 #include "colite/matching/descriptor_matcher.h"
 #include "colite/sfm/incremental_mapper.h"
 
 namespace colite::controllers {
+
+enum class SfmMapperType {
+  kIncremental,
+  kGlobal,
+};
 
 struct ReconSfmControllerOptions {
   std::filesystem::path image_path;
@@ -33,8 +39,17 @@ struct ReconSfmControllerOptions {
   double default_focal_length_factor = 1.2;
   int max_num_features = 4096;
   int feature_num_threads = -1;
+  FeatureExtractorType feature_extractor_type = FeatureExtractorType::kSift;
   SiftBackend feature_backend = SiftBackend::kAuto;
+  std::filesystem::path aliked_model_path;
+  double aliked_min_score = 0.2;
   DescriptorMatcherBackend matcher_backend = DescriptorMatcherBackend::kFlann;
+  FeatureMatcherType matcher_type = FeatureMatcherType::kSiftBruteForce;
+  std::filesystem::path learned_matcher_model_path;
+  double min_cosine_similarity = 0.85;
+  double lightglue_min_score = 0.1;
+  int learned_matcher_num_threads = 1;
+  SfmMapperType mapper_type = SfmMapperType::kIncremental;
   // Match the standalone exhaustive matcher unless relaxation is explicitly
   // requested by the caller.
   std::size_t nearby_match_window = 0;
@@ -42,6 +57,7 @@ struct ReconSfmControllerOptions {
   double guided_match_ratio = 0.95;
   std::size_t max_registration_trials_per_image = 3;
   std::size_t max_initialization_trials = 3;
+  bool use_structureless_registration = false;
   bool multiple_models = true;
   bool merge_models = true;
   std::size_t max_num_models = 50;
@@ -71,6 +87,7 @@ struct ReconstructionQualityStats {
 };
 
 struct ReconSfmRunStats {
+  std::string mapper_type = "incremental";
   std::string feature_backend;
   std::string matcher_backend;
   bool cuda_sift_available = false;

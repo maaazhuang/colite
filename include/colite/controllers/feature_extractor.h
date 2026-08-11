@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "colite/controllers/sfm_camera_setup.h"
+#include "colite/features/aliked_extractor.h"
 #include "colite/features/sift_extractor.h"
 
 namespace colite::controllers {
@@ -19,7 +20,10 @@ struct FeatureExtractorControllerOptions {
   double default_focal_length_factor = 1.2;
   int max_num_features = 4096;
   int num_threads = -1;
+  FeatureExtractorType extractor_type = FeatureExtractorType::kSift;
   SiftBackend backend = SiftBackend::kAuto;
+  std::filesystem::path aliked_model_path;
+  float aliked_min_score = 0.2F;
 };
 
 struct FeatureExtractorControllerSummary {

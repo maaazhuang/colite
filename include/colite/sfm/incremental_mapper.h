@@ -14,6 +14,7 @@
 #include "colite/sfm/incremental_triangulator.h"
 #include "colite/sfm/local_bundle_adjuster.h"
 #include "colite/sfm/observation_filter.h"
+#include "colite/sfm/structureless_registrar.h"
 
 namespace colite {
 
@@ -25,6 +26,8 @@ struct IncrementalMapperOptions {
   LocalBundleAdjustmentOptions local_bundle_adjustment;
   ObservationFilterOptions local_retriangulation_filter;
   ObservationFilterOptions observation_filter;
+  StructurelessRegistrationOptions structureless_registration;
+  bool use_structureless_registration = false;
   bool run_local_bundle_adjustment = true;
   bool run_local_retriangulation_filter = true;
   bool run_observation_filter = true;
@@ -48,6 +51,8 @@ struct IncrementalMapperSummary {
   // 本次 PnP 注册实际使用的重投影误差阈值。失败重试时该值可能被动态放宽。
   double registration_max_reprojection_error_px = 0.0;
   ImageRegistrationSummary registration;
+  StructurelessRegistrationSummary structureless_registration;
+  bool used_structureless_registration = false;
   IncrementalTriangulatorSummary track_completion;
   IncrementalTriangulatorSummary triangulation;
   IncrementalTriangulatorSummary local_retriangulation;
