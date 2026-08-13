@@ -44,6 +44,9 @@ struct ReconSfmCliOptions {
   double min_cosine_similarity = 0.85;
   double lightglue_min_score = 0.1;
   int learned_matcher_num_threads = 1;
+  OnnxExecutionProvider learned_execution_provider =
+      OnnxExecutionProvider::kAuto;
+  int learned_gpu_index = 0;
   controllers::SfmMapperType mapper_type =
       controllers::SfmMapperType::kIncremental;
   std::size_t hierarchical_target_cluster_size = 100;

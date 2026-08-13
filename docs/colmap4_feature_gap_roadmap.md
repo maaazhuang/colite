@@ -7,14 +7,15 @@
 | 阶段 | 当前边界 | 后续闭环 |
 |---|---|---|
 | P0 | 已完成：类型化 feature/matcher/descriptor 契约、workspace feature v2、校验和与损坏检测、v1 兼容读取、缓存身份升级 | 兼容性维护 |
-| P1 | 核心链路已完成：可选 ONNX Runtime、ALIKED N16Rot/N32、ALIKED cosine BF、SIFT/ALIKED LightGlue、EXIF Orientation 1–8、独立命令及 `recon_sfm` 接入；官方模型清单、SHA-256 自动校验和四模型真实 CPU golden inference 已加入 | 四种组合端到端 SfM A/B；CUDA EP |
+| P1 | 核心链路已完成：可选 ONNX Runtime、ALIKED N16Rot/N32、ALIKED cosine BF、SIFT/ALIKED LightGlue、EXIF Orientation 1–8、独立命令及 `recon_sfm` 接入；官方模型清单、SHA-256 自动校验、CPU golden inference 和 CUDA EP 已加入 | 扩展弱纹理/宽基线数据集 A/B |
 | P2 | 首条全局流水线已接通：view-graph 筛选、旋转平均、全局相机中心、track 三角化/合并、全局 BA，并支持 `recon_sfm/recon_auto --sfm.mapper global` | 更鲁棒的 view-graph calibration、固定旋转的位置/结构优化、分阶段重三角化与大数据集 A/B |
 | P3 | `transitive_matcher`、重叠 view-graph 聚类器和 hierarchical mapper 已实现；局部增量重建、公共 verified track 的 Sim(3) 重试合并、最终 BA 已接通；structure-less 多邻居位姿回退已接入增量 mapper | generalized relative pose；局部任务并行/模型图联合优化；position prior absolute-pose refinement |
 
 官方 COLMAP 3.13.0 的 ALIKED N16Rot/N32、ALIKED-LightGlue 与 SIFT-LightGlue 已通过
-SHA-256 校验并完成真实 CPU golden inference；测试在缺少模型或 ONNX 构建时明确跳过，
-不把网络下载引入常规构建。当前 CUDA 与 ONNX 构建各发现 389 项测试，均为 0 失败；
-ONNX 构建中的四项官方模型 golden 全部实际执行并通过。四组合端到端 SfM A/B 仍待执行。
+SHA-256 校验并完成真实 CPU golden inference；ALIKED+LightGlue CUDA golden 也已用
+ONNX Runtime 1.27 CUDA 13 execution provider 实际执行。测试在缺少模型或 ONNX
+构建时明确跳过，不把网络下载引入常规构建。building-18 已完成等 2048 特征预算的
+CvSift、ALIKED+BF 和 ALIKED+LightGlue CPU/CUDA 端到端 A/B。
 
 ## 1. 结论
 

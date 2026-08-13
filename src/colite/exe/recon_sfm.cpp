@@ -53,6 +53,8 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --min_cosine_similarity <v> ALIKED BF threshold, default 0.85.\n"
       << "  --lightglue_min_score <v> LightGlue threshold, default 0.1.\n"
       << "  --learned_matcher_num_threads <n> ONNX threads, default 1.\n"
+      << "  --learned_device <auto|cpu|cuda> ONNX provider, default auto.\n"
+      << "  --learned_gpu_index <n> CUDA device for learned models, default 0.\n"
       << "  --mapper <incremental|global|hierarchical> SfM mapper, default incremental.\n"
       << "  --hierarchical_target_cluster_size <n> Core images per cluster, default 100.\n"
       << "  --hierarchical_max_cluster_size <n> Core plus overlap, default 150.\n"
@@ -315,6 +317,20 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--learned_matcher_num_threads") {
       options.learned_matcher_num_threads =
           std::stoi(RequireValue(args, &i, arg));
+    } else if (arg == "--learned_device") {
+      const std::string provider = RequireValue(args, &i, arg);
+      if (provider == "auto") {
+        options.learned_execution_provider = OnnxExecutionProvider::kAuto;
+      } else if (provider == "cpu") {
+        options.learned_execution_provider = OnnxExecutionProvider::kCpu;
+      } else if (provider == "cuda") {
+        options.learned_execution_provider = OnnxExecutionProvider::kCuda;
+      } else {
+        throw std::invalid_argument("Unsupported learned device: " + provider);
+      }
+    } else if (arg == "--learned_gpu_index") {
+      options.learned_gpu_index =
+          std::stoi(RequireValue(args, &i, arg));
     } else if (arg == "--mapper") {
       const std::string mapper = RequireValue(args, &i, arg);
       if (mapper == "incremental") {
@@ -394,6 +410,9 @@ void ValidateOptions(const ReconSfmCliOptions& options) {
       options.lightglue_min_score < 0.0 ||
       options.learned_matcher_num_threads <= 0) {
     throw std::invalid_argument("Invalid learned frontend configuration");
+  }
+  if (options.learned_gpu_index < 0) {
+    throw std::invalid_argument("--learned_gpu_index must be non-negative");
   }
   if (options.focal_length < 0.0) {
     throw std::invalid_argument("--focal_length must be non-negative");
@@ -479,6 +498,9 @@ controllers::ReconSfmControllerOptions ToControllerOptions(
   controller_options.lightglue_min_score = options.lightglue_min_score;
   controller_options.learned_matcher_num_threads =
       options.learned_matcher_num_threads;
+  controller_options.learned_execution_provider =
+      options.learned_execution_provider;
+  controller_options.learned_gpu_index = options.learned_gpu_index;
   controller_options.mapper_type = options.mapper_type;
   controller_options.hierarchical_target_cluster_size =
       options.hierarchical_target_cluster_size;

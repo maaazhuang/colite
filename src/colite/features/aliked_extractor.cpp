@@ -34,16 +34,23 @@ features::OnnxModel& CachedAlikedModel(const AlikedExtractionOptions& options) {
   struct Cache {
     std::filesystem::path path;
     int num_threads = 0;
+    OnnxExecutionProvider execution_provider = OnnxExecutionProvider::kAuto;
+    int gpu_index = -1;
     std::unique_ptr<features::OnnxModel> model;
   };
   thread_local Cache cache;
   if (cache.model == nullptr || cache.path != options.model_path ||
-      cache.num_threads != options.num_threads) {
+      cache.num_threads != options.num_threads ||
+      cache.execution_provider != options.execution_provider ||
+      cache.gpu_index != options.gpu_index) {
     ValidateLearnedModelResource(options.model_path);
     cache.path = options.model_path;
     cache.num_threads = options.num_threads;
+    cache.execution_provider = options.execution_provider;
+    cache.gpu_index = options.gpu_index;
     cache.model = std::make_unique<features::OnnxModel>(
-        options.model_path, options.num_threads);
+        options.model_path, options.num_threads, options.execution_provider,
+        options.gpu_index);
   }
   return *cache.model;
 }
@@ -54,6 +61,16 @@ features::OnnxModel& CachedAlikedModel(const AlikedExtractionOptions& options) {
 bool IsOnnxRuntimeAvailable() {
 #if defined(COLITE_ENABLE_ONNX)
   return true;
+#else
+  return false;
+#endif
+}
+
+bool IsOnnxCudaExecutionProviderAvailable() {
+#if defined(COLITE_ENABLE_ONNX)
+  const std::vector<std::string> providers = Ort::GetAvailableProviders();
+  return std::find(providers.begin(), providers.end(),
+                   "CUDAExecutionProvider") != providers.end();
 #else
   return false;
 #endif

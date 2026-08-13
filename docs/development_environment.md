@@ -27,6 +27,12 @@ wsl.exe -d Ubuntu-22.04 -u ma -- bash -lc 'export PATH=/usr/local/cuda-13.2/bin:
 
 Codex/任务调度启动的 WSL 非登录 shell 不一定继承用户登录环境；若 `nvcc` 显示找不到，应显式设置上述 `PATH` 和 `LD_LIBRARY_PATH`。GPU 验证结果为 RTX 4070 SUPER、驱动 610.74、12,282 MiB 显存。
 
+学习前端的 CUDA 路径另需带 CUDA execution provider 的 ONNX Runtime 和 cuDNN。
+当前已验证组合为 ONNX Runtime 1.27.0 CUDA 13 包、cuDNN 9.24.0.43 和
+CUDA Toolkit 13.2。运行时必须能从 `LD_LIBRARY_PATH` 找到 ONNX Runtime、
+cuDNN 和 CUDA 共享库；`recon_sfm --learned_device cuda --learned_gpu_index 0`
+会强制使用 CUDA，provider 不可用时直接报错，`auto` 才会回退 CPU。
+
 ## 系统依赖
 
 ```bash

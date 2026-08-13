@@ -50,6 +50,9 @@ struct ReconSfmControllerOptions {
   double min_cosine_similarity = 0.85;
   double lightglue_min_score = 0.1;
   int learned_matcher_num_threads = 1;
+  OnnxExecutionProvider learned_execution_provider =
+      OnnxExecutionProvider::kAuto;
+  int learned_gpu_index = 0;
   SfmMapperType mapper_type = SfmMapperType::kIncremental;
   std::size_t hierarchical_target_cluster_size = 100;
   std::size_t hierarchical_max_cluster_size = 150;
@@ -96,6 +99,8 @@ struct ReconSfmRunStats {
   std::string matcher_backend;
   bool cuda_sift_available = false;
   bool cuda_matcher_available = false;
+  bool onnx_cuda_available = false;
+  std::string learned_execution_provider = "cpu";
   double initial_focal_length = 0.0;
   std::string initial_focal_source;
   bool has_prior_focal_length = false;
