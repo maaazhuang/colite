@@ -84,16 +84,23 @@ features::OnnxModel& CachedLightGlueModel(
   struct Cache {
     std::filesystem::path path;
     int num_threads = 0;
+    OnnxExecutionProvider execution_provider = OnnxExecutionProvider::kAuto;
+    int gpu_index = -1;
     std::unique_ptr<features::OnnxModel> model;
   };
   thread_local Cache cache;
   if (cache.model == nullptr || cache.path != options.model_path ||
-      cache.num_threads != options.num_threads) {
+      cache.num_threads != options.num_threads ||
+      cache.execution_provider != options.execution_provider ||
+      cache.gpu_index != options.gpu_index) {
     ValidateLearnedModelResource(options.model_path);
     cache.path = options.model_path;
     cache.num_threads = options.num_threads;
+    cache.execution_provider = options.execution_provider;
+    cache.gpu_index = options.gpu_index;
     cache.model = std::make_unique<features::OnnxModel>(
-        options.model_path, options.num_threads);
+        options.model_path, options.num_threads, options.execution_provider,
+        options.gpu_index);
   }
   return *cache.model;
 }

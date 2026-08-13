@@ -112,6 +112,7 @@ TEST(OfficialOnnxGoldenTest, AlikedN16RotInference) {
   options.model_path = model;
   options.max_num_features = 256;
   options.min_score = 0.2F;
+  options.execution_provider = OnnxExecutionProvider::kCpu;
   const FeatureSet features = ExtractAlikedFeatures(MakeGoldenImage(), options);
   std::cerr << "N16 count=" << features.keypoints.size()
             << " dim=" << features.descriptors.cols()
@@ -132,6 +133,7 @@ TEST(OfficialOnnxGoldenTest, AlikedN32Inference) {
   options.model_path = model;
   options.max_num_features = 256;
   options.min_score = 0.2F;
+  options.execution_provider = OnnxExecutionProvider::kCpu;
   const FeatureSet features = ExtractAlikedFeatures(MakeGoldenImage(), options);
   std::cerr << "N32 count=" << features.keypoints.size()
             << " dim=" << features.descriptors.cols()
@@ -156,11 +158,13 @@ TEST(OfficialOnnxGoldenTest, AlikedLightGlueInference) {
   extraction.model_path = extractor_model;
   extraction.max_num_features = 128;
   extraction.min_score = 0.2F;
+  extraction.execution_provider = OnnxExecutionProvider::kCpu;
   const FeatureSet features = ExtractAlikedFeatures(MakeGoldenImage(), extraction);
   LightGlueMatchingOptions matching;
   matching.matcher_type = FeatureMatcherType::kAlikedLightGlue;
   matching.model_path = matcher_model;
   matching.min_score = 0.1F;
+  matching.execution_provider = OnnxExecutionProvider::kCpu;
   const std::vector<FeatureMatch> matches = MatchFeatureSetsLightGlue(
       features, 256, 192, features, 256, 192, matching);
   std::cerr << "ALIKED LightGlue count=" << matches.size()
@@ -183,12 +187,49 @@ TEST(OfficialOnnxGoldenTest, SiftLightGlueInference) {
   options.matcher_type = FeatureMatcherType::kSiftLightGlue;
   options.model_path = model;
   options.min_score = 0.1F;
+  options.execution_provider = OnnxExecutionProvider::kCpu;
   const std::vector<FeatureMatch> matches = MatchFeatureSetsLightGlue(
       features, 256, 192, features, 256, 192, options);
   std::cerr << "SIFT LightGlue count=" << matches.size()
             << " digest=" << MatchDigest(matches) << '\n';
   EXPECT_EQ(matches.size(), 64U);
   EXPECT_EQ(MatchDigest(matches), 15057192408810339971ULL);
+  for (std::size_t index = 0; index < matches.size(); ++index) {
+    EXPECT_EQ(matches[index].idx1, index);
+    EXPECT_EQ(matches[index].idx2, index);
+  }
+}
+
+TEST(OfficialOnnxCudaTest, RunsAlikedAndLightGlueOnCudaProvider) {
+  const std::filesystem::path extractor_model =
+      OfficialModelPath("aliked-n16rot.onnx");
+  const std::filesystem::path matcher_model =
+      OfficialModelPath("aliked-lightglue.onnx");
+  if (!IsOnnxCudaExecutionProviderAvailable() || extractor_model.empty() ||
+      matcher_model.empty()) {
+    GTEST_SKIP() << "ONNX CUDA provider or official ALIKED models unavailable";
+  }
+  AlikedExtractionOptions extraction;
+  extraction.extractor_type = FeatureExtractorType::kAlikedN16Rot;
+  extraction.model_path = extractor_model;
+  extraction.max_num_features = 128;
+  extraction.min_score = 0.2F;
+  extraction.execution_provider = OnnxExecutionProvider::kCuda;
+  extraction.gpu_index = 0;
+  const FeatureSet features =
+      ExtractAlikedFeatures(MakeGoldenImage(), extraction);
+  ASSERT_EQ(features.keypoints.size(), 128U);
+  ASSERT_EQ(features.descriptors.cols(), 128);
+
+  LightGlueMatchingOptions matching;
+  matching.matcher_type = FeatureMatcherType::kAlikedLightGlue;
+  matching.model_path = matcher_model;
+  matching.min_score = 0.1F;
+  matching.execution_provider = OnnxExecutionProvider::kCuda;
+  matching.gpu_index = 0;
+  const std::vector<FeatureMatch> matches = MatchFeatureSetsLightGlue(
+      features, 256, 192, features, 256, 192, matching);
+  ASSERT_EQ(matches.size(), 128U);
   for (std::size_t index = 0; index < matches.size(); ++index) {
     EXPECT_EQ(matches[index].idx1, index);
     EXPECT_EQ(matches[index].idx2, index);

@@ -217,6 +217,7 @@ diagnostics 和 summary。最大模型位于输出根目录，全部模型位于
 
 新增前端和 mapper 参数：`--feature_type sift|aliked_n16rot|aliked_n32`、
 `--aliked_model_path`、`--learned_matcher_model_path`、
+`--learned_device auto|cpu|cuda`、`--learned_gpu_index <n>`、
 `--mapper incremental|global|hierarchical`。全局模式从 verified view graph 完成旋转平均、
 相机中心估计、track 三角化和全局 BA；首版不接受 `--input_model_path`。
 层次模式通过 `--hierarchical_target_cluster_size`、

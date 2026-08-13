@@ -10,6 +10,8 @@
 #if defined(COLITE_ENABLE_ONNX)
 #include <onnxruntime_cxx_api.h>
 
+#include "colite/features/onnx_options.h"
+
 namespace colite::features {
 
 std::string FormatOnnxShape(const std::vector<std::int64_t>& shape);
@@ -20,7 +22,10 @@ void ValidateOnnxNode(std::string_view actual_name,
 
 class OnnxModel {
  public:
-  OnnxModel(const std::filesystem::path& model_path, int num_threads);
+  OnnxModel(const std::filesystem::path& model_path,
+            int num_threads,
+            OnnxExecutionProvider execution_provider,
+            int gpu_index);
 
   std::vector<Ort::Value> Run(
       const std::vector<Ort::Value>& input_tensors) const;
@@ -33,6 +38,9 @@ class OnnxModel {
   const std::vector<std::vector<std::int64_t>>& OutputShapes() const {
     return output_shapes_;
   }
+  OnnxExecutionProvider ExecutionProvider() const {
+    return execution_provider_;
+  }
 
  private:
   Ort::Env environment_;
@@ -42,6 +50,7 @@ class OnnxModel {
   std::vector<std::vector<std::int64_t>> input_shapes_;
   std::vector<std::string> output_names_;
   std::vector<std::vector<std::int64_t>> output_shapes_;
+  OnnxExecutionProvider execution_provider_ = OnnxExecutionProvider::kCpu;
 };
 
 }  // namespace colite::features

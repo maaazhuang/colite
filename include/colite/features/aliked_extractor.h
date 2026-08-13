@@ -6,6 +6,7 @@
 #include <opencv2/core.hpp>
 
 #include "colite/core/feature.h"
+#include "colite/features/onnx_options.h"
 
 namespace colite {
 
@@ -15,6 +16,8 @@ struct AlikedExtractionOptions {
   int max_num_features = 2048;
   float min_score = 0.2F;
   int num_threads = 1;
+  OnnxExecutionProvider execution_provider = OnnxExecutionProvider::kAuto;
+  int gpu_index = 0;
 };
 
 struct AlikedImageTensor {
@@ -27,6 +30,7 @@ struct AlikedImageTensor {
 };
 
 bool IsOnnxRuntimeAvailable();
+bool IsOnnxCudaExecutionProviderAvailable();
 AlikedImageTensor PrepareAlikedImageTensor(const cv::Mat& image);
 FeatureSet ExtractAlikedFeatures(const cv::Mat& image,
                                  const AlikedExtractionOptions& options);

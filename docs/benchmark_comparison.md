@@ -1121,3 +1121,23 @@ mean track 3.255880，低于 8192 上限基线的 3.300469，也低于 COLMAP �
 - `output/feature_cap_scan_house_20260809/`
 - `output/feature_cap10240_sfm_house_20260809/`
 - `output/feature_cap10240_guided08_sfm_house_20260809/`
+
+### Building-18 学习前端 CPU/CUDA A/B（2026-08-13）
+
+在每图严格 2048 特征、18/18 图注册的统一口径下，CvSift+FLANN 为 5,788 点、
+18,414 观测、0.617 px、22.78 s。CPU ALIKED+BF 为 3,618 点、16,195 观测、
+0.353 px、105.13 s；CPU ALIKED+LightGlue 为 5,371 点、23,790 观测、
+0.582 px、204.18 s。
+
+ONNX Runtime 1.27 CUDA 13 execution provider 在 RTX 4070 SUPER 上实际执行后，
+ALIKED+LightGlue 的匹配阶段从 89.47 s 降到 9.21 s（9.7 倍），最终为 5,375 点、
+23,779 观测、0.578 px。高分辨率 ALIKED 单 session 已使用约 11.69 GiB 显存，
+提取耗时 167.78–179.29 s，慢于 CPU 多 session 的 94.41–100.68 s；但主机峰值
+RSS 从约 27.9 GiB 降至约 2.3 GiB。完整 GPU 流水线 ALIKED+BF 和
+ALIKED+LightGlue 分别为 204.23 s 和 196.67 s。结果说明 CUDA 对 LightGlue
+收益明确，而 ALIKED 还需要输入缩放、I/O binding 和 memory arena 调优。
+
+完整日志、GPU 200 ms 采样和报告位于：
+
+- `output/sift_vs_learned_building18_20260813/`
+- `output/sift_vs_learned_gpu_building18_20260813/`

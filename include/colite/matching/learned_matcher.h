@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "colite/core/feature.h"
+#include "colite/features/onnx_options.h"
 
 namespace colite {
 
@@ -18,6 +19,8 @@ struct LightGlueMatchingOptions {
   std::filesystem::path model_path;
   float min_score = 0.1F;
   int num_threads = 1;
+  OnnxExecutionProvider execution_provider = OnnxExecutionProvider::kAuto;
+  int gpu_index = 0;
 };
 
 std::vector<FeatureMatch> MatchAlikedDescriptors(

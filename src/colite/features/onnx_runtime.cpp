@@ -7,6 +7,16 @@
 #if defined(COLITE_ENABLE_ONNX)
 namespace colite::features {
 
+namespace {
+
+bool HasCudaExecutionProvider() {
+  const std::vector<std::string> providers = Ort::GetAvailableProviders();
+  return std::find(providers.begin(), providers.end(),
+                   "CUDAExecutionProvider") != providers.end();
+}
+
+}  // namespace
+
 std::string FormatOnnxShape(const std::vector<std::int64_t>& shape) {
   std::ostringstream stream;
   stream << '[';
@@ -41,7 +51,9 @@ void ValidateOnnxNode(const std::string_view actual_name,
 }
 
 OnnxModel::OnnxModel(const std::filesystem::path& model_path,
-                     const int num_threads)
+                     const int num_threads,
+                     const OnnxExecutionProvider execution_provider,
+                     const int gpu_index)
     : environment_(ORT_LOGGING_LEVEL_WARNING, "colite") {
   if (model_path.empty() || !std::filesystem::is_regular_file(model_path)) {
     throw std::invalid_argument("ONNX model file does not exist: " +
@@ -53,6 +65,20 @@ OnnxModel::OnnxModel(const std::filesystem::path& model_path,
   session_options_.SetGraphOptimizationLevel(
       GraphOptimizationLevel::ORT_ENABLE_ALL);
   session_options_.SetLogSeverityLevel(ORT_LOGGING_LEVEL_ERROR);
+  const bool cuda_available = HasCudaExecutionProvider();
+  if (execution_provider == OnnxExecutionProvider::kCuda && !cuda_available) {
+    throw std::runtime_error(
+        "ONNX CUDA execution provider was requested but is unavailable");
+  }
+  if (gpu_index < 0) {
+    throw std::invalid_argument("ONNX CUDA GPU index must be non-negative");
+  }
+  if (cuda_available && execution_provider != OnnxExecutionProvider::kCpu) {
+    OrtCUDAProviderOptions cuda_options{};
+    cuda_options.device_id = gpu_index;
+    session_options_.AppendExecutionProvider_CUDA(cuda_options);
+    execution_provider_ = OnnxExecutionProvider::kCuda;
+  }
 #if defined(_WIN32)
   session_ = std::make_unique<Ort::Session>(
       environment_, model_path.wstring().c_str(), session_options_);

@@ -623,6 +623,10 @@ void WriteRunSummary(const std::filesystem::path& output_path,
                << (run_stats.cuda_sift_available ? 1 : 0) << "\n"
                << "cuda_matcher_available "
                << (run_stats.cuda_matcher_available ? 1 : 0) << "\n"
+               << "onnx_cuda_available "
+               << (run_stats.onnx_cuda_available ? 1 : 0) << "\n"
+               << "learned_execution_provider "
+               << run_stats.learned_execution_provider << "\n"
                << "initial_focal_length "
                << run_stats.initial_focal_length << "\n"
                << "initial_focal_source " << run_stats.initial_focal_source
@@ -1079,6 +1083,9 @@ void MatchAllImagePairsTyped(
             learned_options.min_score =
                 static_cast<float>(options.lightglue_min_score);
             learned_options.num_threads = options.learned_matcher_num_threads;
+            learned_options.execution_provider =
+                options.learned_execution_provider;
+            learned_options.gpu_index = options.learned_gpu_index;
             const Camera& camera1 = cameras_by_image.at(image_id1);
             const Camera& camera2 = cameras_by_image.at(image_id2);
             pair_matches[static_cast<std::size_t>(pair_idx)] =
@@ -1159,6 +1166,9 @@ std::vector<FeatureSet> ExtractFeaturesForImages(
           aliked_options.max_num_features = options.max_num_features;
           aliked_options.min_score = static_cast<float>(options.aliked_min_score);
           aliked_options.num_threads = inference_num_threads;
+          aliked_options.execution_provider =
+              options.learned_execution_provider;
+          aliked_options.gpu_index = options.learned_gpu_index;
           features[*job_idx] = ExtractAlikedFeaturesFromFile(
               image_paths[*job_idx], aliked_options);
         }
@@ -1198,6 +1208,9 @@ std::string ReconFeatureConfigHash(
       {"max_num_features", std::to_string(options.max_num_features)},
       {"aliked_model_path", options.aliked_model_path.generic_string()},
       {"aliked_min_score", std::to_string(options.aliked_min_score)},
+      {"learned_execution_provider",
+       std::to_string(static_cast<int>(options.learned_execution_provider))},
+      {"learned_gpu_index", std::to_string(options.learned_gpu_index)},
       {"camera_mode",
        std::string(CameraSharingModeName(options.camera_sharing_mode))},
       {"camera_model", std::to_string(static_cast<int>(options.camera_model_id))},
@@ -1239,6 +1252,9 @@ std::string ReconFrontendConfigHash(
        {"feature_hash", feature_hash},
        {"matcher_type", std::to_string(static_cast<int>(options.matcher_type))},
        {"matcher_backend", std::to_string(static_cast<int>(options.matcher_backend))},
+       {"learned_execution_provider",
+        std::to_string(static_cast<int>(options.learned_execution_provider))},
+       {"learned_gpu_index", std::to_string(options.learned_gpu_index)},
        {"learned_model_path", options.learned_matcher_model_path.generic_string()},
        {"min_cosine_similarity", std::to_string(options.min_cosine_similarity)},
        {"lightglue_min_score", std::to_string(options.lightglue_min_score)},
@@ -1494,6 +1510,12 @@ int ReconSfmController::Run(std::ostream& out) const {
                                         options.feature_extractor_type));
   run_stats.cuda_sift_available = IsCudaSiftAvailable();
   run_stats.cuda_matcher_available = IsCudaDescriptorMatcherAvailable();
+  run_stats.onnx_cuda_available = IsOnnxCudaExecutionProviderAvailable();
+  run_stats.learned_execution_provider =
+      options.learned_execution_provider == OnnxExecutionProvider::kCpu ||
+              !run_stats.onnx_cuda_available
+          ? "cpu"
+          : "cuda";
   const InitialFocalLengthEstimate& initial_focal =
       camera_setup.focal_estimates.front();
   if (camera_setup.cameras.size() == 1) {
