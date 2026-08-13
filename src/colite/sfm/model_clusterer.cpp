@@ -36,7 +36,10 @@ std::vector<ImageCluster> ClusterVerifiedViewGraph(
   while (!unassigned.empty()) {
     const ImageId seed = *std::max_element(
         unassigned.begin(), unassigned.end(), [&](ImageId lhs, ImageId rhs) {
-          return adjacency[lhs].size() < adjacency[rhs].size();
+          if (adjacency[lhs].size() != adjacency[rhs].size()) {
+            return adjacency[lhs].size() < adjacency[rhs].size();
+          }
+          return lhs > rhs;
         });
     ImageCluster cluster;
     std::queue<ImageId> queue;
@@ -54,7 +57,10 @@ std::vector<ImageCluster> ClusterVerifiedViewGraph(
                                      adjacency[current].end());
       std::sort(neighbors.begin(), neighbors.end(),
                 [&](ImageId lhs, ImageId rhs) {
-                  return adjacency[lhs].size() > adjacency[rhs].size();
+                  if (adjacency[lhs].size() != adjacency[rhs].size()) {
+                    return adjacency[lhs].size() > adjacency[rhs].size();
+                  }
+                  return lhs < rhs;
                 });
       for (const ImageId neighbor : neighbors) {
         if (unassigned.count(neighbor) > 0 && queued.insert(neighbor).second) {
