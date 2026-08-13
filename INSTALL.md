@@ -2,19 +2,20 @@
 
 ## Supported environment
 
-The validated development environment is Ubuntu 22.04, including Ubuntu 22.04
-under WSL2. GCC 11 or newer, CMake 3.20 or newer, and Ninja are recommended.
+The validated development environments are Ubuntu 22.04 (including WSL2) and
+Ubuntu 24.04 (GitHub Actions). GCC 11 or newer, CMake 3.20 or newer, and Ninja
+are recommended.
 Native Windows/MSVC is not yet a validated release target.
 
 CUDA is optional. CPU-only SfM and MVS remain available when no CUDA compiler
 is detected.
 
-## Ubuntu 22.04 dependencies
+## Ubuntu 22.04 / 24.04 dependencies
 
 ```bash
 sudo apt update
 sudo apt install -y \
-  build-essential cmake ninja-build pkg-config git \
+  build-essential python3 cmake ninja-build pkg-config git \
   libopencv-dev libeigen3-dev libceres-dev libgoogle-glog-dev \
   libflann-dev liblz4-dev libgtest-dev \
   libcgal-dev libboost-graph-dev libgmp-dev libmpfr-dev
