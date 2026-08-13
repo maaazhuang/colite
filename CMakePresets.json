@@ -11,7 +11,8 @@
         "COLITE_BUILD_TESTS": "ON",
         "COLITE_ENABLE_CUDA_SIFT": "OFF",
         "COLITE_ENABLE_CUDA_MATCHER": "OFF",
-        "COLITE_ENABLE_CUDA_MVS": "OFF"
+        "COLITE_ENABLE_CUDA_MVS": "OFF",
+        "COLITE_ENABLE_ONNX": "OFF"
       }
     },
     {

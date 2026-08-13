@@ -22,7 +22,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build pkg-config \
+            build-essential python3 cmake ninja-build pkg-config \
             libopencv-dev libeigen3-dev libceres-dev libgoogle-glog-dev \
             libflann-dev liblz4-dev libgtest-dev \
             libcgal-dev libboost-graph-dev libgmp-dev libmpfr-dev
