@@ -25,7 +25,8 @@ TEST(HierarchicalMapperTest, ReconstructsOverlappingClustersAndMergesThem) {
   for (int row = 0; row < 5; ++row) {
     for (int col = 0; col < 6; ++col) {
       points.emplace_back(-0.8 + 0.32 * col, -0.55 + 0.27 * row,
-                          5.0 + 0.04 * col + 0.06 * row);
+                          4.8 + 0.08 * ((row + 2 * col) % 5) +
+                              0.015 * row * col);
     }
   }
   constexpr std::size_t kNumImages = 8;
