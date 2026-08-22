@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
 #include <vector>
 
@@ -18,11 +19,19 @@ struct AlikedExtractionOptions {
   int num_threads = 1;
   OnnxExecutionProvider execution_provider = OnnxExecutionProvider::kAuto;
   int gpu_index = 0;
+  // Resize the longest image edge before inference. Zero preserves the input
+  // resolution. Detected keypoints are mapped back to source coordinates.
+  int max_image_size = 0;
+  // Limit the CUDA execution-provider arena. Zero uses the runtime default.
+  std::size_t cuda_memory_limit_mb = 0;
+  bool use_io_binding = true;
 };
 
 struct AlikedImageTensor {
   int original_width = 0;
   int original_height = 0;
+  int inference_width = 0;
+  int inference_height = 0;
   int padded_width = 0;
   int padded_height = 0;
   // Contiguous RGB tensor in CHW order, normalized to [0, 1].
@@ -31,7 +40,8 @@ struct AlikedImageTensor {
 
 bool IsOnnxRuntimeAvailable();
 bool IsOnnxCudaExecutionProviderAvailable();
-AlikedImageTensor PrepareAlikedImageTensor(const cv::Mat& image);
+AlikedImageTensor PrepareAlikedImageTensor(const cv::Mat& image,
+                                           int max_image_size = 0);
 FeatureSet ExtractAlikedFeatures(const cv::Mat& image,
                                  const AlikedExtractionOptions& options);
 FeatureSet ExtractAlikedFeaturesFromFile(

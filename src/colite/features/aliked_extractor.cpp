@@ -24,7 +24,8 @@ void ValidateAlikedOptions(const AlikedExtractionOptions& options) {
     throw std::invalid_argument("ALIKED extractor type must be N16Rot or N32");
   }
   if (options.max_num_features <= 0 || options.min_score < 0.0F ||
-      options.min_score > 1.0F || options.num_threads == 0) {
+      options.min_score > 1.0F || options.num_threads == 0 ||
+      options.max_image_size < 0) {
     throw std::invalid_argument("Invalid ALIKED extraction options");
   }
 }
@@ -36,21 +37,28 @@ features::OnnxModel& CachedAlikedModel(const AlikedExtractionOptions& options) {
     int num_threads = 0;
     OnnxExecutionProvider execution_provider = OnnxExecutionProvider::kAuto;
     int gpu_index = -1;
+    std::size_t cuda_memory_limit_mb = 0;
+    bool use_io_binding = true;
     std::unique_ptr<features::OnnxModel> model;
   };
   thread_local Cache cache;
   if (cache.model == nullptr || cache.path != options.model_path ||
       cache.num_threads != options.num_threads ||
       cache.execution_provider != options.execution_provider ||
-      cache.gpu_index != options.gpu_index) {
+      cache.gpu_index != options.gpu_index ||
+      cache.cuda_memory_limit_mb != options.cuda_memory_limit_mb ||
+      cache.use_io_binding != options.use_io_binding) {
     ValidateLearnedModelResource(options.model_path);
     cache.path = options.model_path;
     cache.num_threads = options.num_threads;
     cache.execution_provider = options.execution_provider;
     cache.gpu_index = options.gpu_index;
+    cache.cuda_memory_limit_mb = options.cuda_memory_limit_mb;
+    cache.use_io_binding = options.use_io_binding;
     cache.model = std::make_unique<features::OnnxModel>(
         options.model_path, options.num_threads, options.execution_provider,
-        options.gpu_index);
+        options.gpu_index, options.cuda_memory_limit_mb * 1024U * 1024U,
+        options.use_io_binding);
   }
   return *cache.model;
 }
@@ -76,7 +84,8 @@ bool IsOnnxCudaExecutionProviderAvailable() {
 #endif
 }
 
-AlikedImageTensor PrepareAlikedImageTensor(const cv::Mat& image) {
+AlikedImageTensor PrepareAlikedImageTensor(const cv::Mat& image,
+                                           const int max_image_size) {
   if (image.empty()) {
     throw std::invalid_argument("ALIKED input image is empty");
   }
@@ -97,21 +106,33 @@ AlikedImageTensor PrepareAlikedImageTensor(const cv::Mat& image) {
   AlikedImageTensor tensor;
   tensor.original_width = bgr.cols;
   tensor.original_height = bgr.rows;
+  cv::Mat inference_image = bgr;
+  const int longest_edge = std::max(bgr.cols, bgr.rows);
+  if (max_image_size > 0 && longest_edge > max_image_size) {
+    const double scale = static_cast<double>(max_image_size) /
+                         static_cast<double>(longest_edge);
+    cv::resize(bgr, inference_image, cv::Size(), scale, scale,
+               cv::INTER_AREA);
+  }
+  tensor.inference_width = inference_image.cols;
+  tensor.inference_height = inference_image.rows;
   tensor.padded_width =
-      ((bgr.cols + kAlikedInputDivisor - 1) / kAlikedInputDivisor) *
+      ((inference_image.cols + kAlikedInputDivisor - 1) /
+       kAlikedInputDivisor) *
       kAlikedInputDivisor;
   tensor.padded_height =
-      ((bgr.rows + kAlikedInputDivisor - 1) / kAlikedInputDivisor) *
+      ((inference_image.rows + kAlikedInputDivisor - 1) /
+       kAlikedInputDivisor) *
       kAlikedInputDivisor;
   const std::size_t plane = static_cast<std::size_t>(tensor.padded_width) *
                             static_cast<std::size_t>(tensor.padded_height);
   tensor.data.resize(3 * plane);
   constexpr float kInv255 = 1.0F / 255.0F;
   for (int y = 0; y < tensor.padded_height; ++y) {
-    const int source_y = std::min(y, bgr.rows - 1);
-    const cv::Vec3b* row = bgr.ptr<cv::Vec3b>(source_y);
+    const int source_y = std::min(y, inference_image.rows - 1);
+    const cv::Vec3b* row = inference_image.ptr<cv::Vec3b>(source_y);
     for (int x = 0; x < tensor.padded_width; ++x) {
-      const int source_x = std::min(x, bgr.cols - 1);
+      const int source_x = std::min(x, inference_image.cols - 1);
       const cv::Vec3b pixel = row[source_x];
       const std::size_t offset = static_cast<std::size_t>(y) *
                                      static_cast<std::size_t>(tensor.padded_width) +
@@ -145,7 +166,8 @@ FeatureSet ExtractAlikedFeatures(const cv::Mat& image,
   features::ValidateOnnxNode(model.OutputNames()[2], "scores",
                              model.OutputShapes()[2], {-1, -1});
 
-  AlikedImageTensor image_tensor = PrepareAlikedImageTensor(image);
+  AlikedImageTensor image_tensor =
+      PrepareAlikedImageTensor(image, options.max_image_size);
   std::vector<std::int64_t> image_shape = {
       1, 3, image_tensor.padded_height, image_tensor.padded_width};
   std::int64_t max_keypoints = options.max_num_features;
@@ -183,6 +205,10 @@ FeatureSet ExtractAlikedFeatures(const cv::Mat& image,
   const float* score_data = outputs[2].GetTensorData<float>();
   const float scale_x = 0.5F * (image_tensor.padded_width - 1);
   const float scale_y = 0.5F * (image_tensor.padded_height - 1);
+  const float source_scale_x = static_cast<float>(image_tensor.original_width) /
+                               image_tensor.inference_width;
+  const float source_scale_y = static_cast<float>(image_tensor.original_height) /
+                               image_tensor.inference_height;
 
   std::vector<int> valid_indices;
   valid_indices.reserve(num_keypoints);
@@ -193,9 +219,11 @@ FeatureSet ExtractAlikedFeatures(const cv::Mat& image,
   for (int idx = 0; idx < num_keypoints; ++idx) {
     const float x = (keypoint_data[2 * idx] + 1.0F) * scale_x + 0.5F;
     const float y = (keypoint_data[2 * idx + 1] + 1.0F) * scale_y + 0.5F;
-    if (x >= 0.0F && x < image_tensor.original_width && y >= 0.0F &&
-        y < image_tensor.original_height) {
-      result.keypoints.push_back({x, y, 1.0F, 0.0F, score_data[idx]});
+    if (x >= 0.0F && x < image_tensor.inference_width && y >= 0.0F &&
+        y < image_tensor.inference_height) {
+      result.keypoints.push_back({x * source_scale_x, y * source_scale_y,
+                                  std::max(source_scale_x, source_scale_y),
+                                  0.0F, score_data[idx]});
       valid_indices.push_back(idx);
     }
   }

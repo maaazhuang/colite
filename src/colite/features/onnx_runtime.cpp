@@ -53,8 +53,11 @@ void ValidateOnnxNode(const std::string_view actual_name,
 OnnxModel::OnnxModel(const std::filesystem::path& model_path,
                      const int num_threads,
                      const OnnxExecutionProvider execution_provider,
-                     const int gpu_index)
-    : environment_(ORT_LOGGING_LEVEL_WARNING, "colite") {
+                     const int gpu_index,
+                     const std::size_t cuda_memory_limit_bytes,
+                     const bool use_io_binding)
+    : environment_(ORT_LOGGING_LEVEL_WARNING, "colite"),
+      use_io_binding_(use_io_binding) {
   if (model_path.empty() || !std::filesystem::is_regular_file(model_path)) {
     throw std::invalid_argument("ONNX model file does not exist: " +
                                 model_path.string());
@@ -76,6 +79,11 @@ OnnxModel::OnnxModel(const std::filesystem::path& model_path,
   if (cuda_available && execution_provider != OnnxExecutionProvider::kCpu) {
     OrtCUDAProviderOptions cuda_options{};
     cuda_options.device_id = gpu_index;
+    cuda_options.arena_extend_strategy = 1;
+    if (cuda_memory_limit_bytes > 0) {
+      cuda_options.gpu_mem_limit = cuda_memory_limit_bytes;
+    }
+    cuda_options.do_copy_in_default_stream = 1;
     session_options_.AppendExecutionProvider_CUDA(cuda_options);
     execution_provider_ = OnnxExecutionProvider::kCuda;
   }
@@ -123,12 +131,23 @@ std::vector<Ort::Value> OnnxModel::Run(
   output_names.reserve(output_names_.size());
   for (const std::string& name : input_names_) input_names.push_back(name.c_str());
   for (const std::string& name : output_names_) output_names.push_back(name.c_str());
-  return session_->Run(Ort::RunOptions{nullptr},
-                       input_names.data(),
-                       input_tensors.data(),
-                       input_tensors.size(),
-                       output_names.data(),
-                       output_names.size());
+  if (execution_provider_ == OnnxExecutionProvider::kCuda && use_io_binding_) {
+    Ort::IoBinding binding(*session_);
+    for (std::size_t idx = 0; idx < input_tensors.size(); ++idx) {
+      binding.BindInput(input_names[idx], input_tensors[idx]);
+    }
+    const Ort::MemoryInfo cpu_memory = Ort::MemoryInfo::CreateCpu(
+        OrtAllocatorType::OrtDeviceAllocator, OrtMemType::OrtMemTypeCPU);
+    for (const char* output_name : output_names) {
+      binding.BindOutput(output_name, cpu_memory);
+    }
+    session_->Run(Ort::RunOptions{nullptr}, binding);
+    binding.SynchronizeOutputs();
+    return binding.GetOutputValues();
+  }
+  return session_->Run(Ort::RunOptions{nullptr}, input_names.data(),
+                       input_tensors.data(), input_tensors.size(),
+                       output_names.data(), output_names.size());
 }
 
 }  // namespace colite::features

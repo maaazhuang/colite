@@ -34,7 +34,9 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "                            Default auto prefers CUDA OpenCV and falls "
          "back to CPU OpenCV.\n"
       << "  --aliked_model_path <file> Required ONNX model for ALIKED.\n"
-      << "  --aliked_min_score <s>    ALIKED score threshold, default 0.2.\n";
+      << "  --aliked_min_score <s>    ALIKED score threshold, default 0.2.\n"
+      << "  --aliked_max_image_size <px> Longest inference edge; 0 disables resizing, default 1600.\n"
+      << "  --learned_cuda_memory_limit_mb <n> CUDA arena limit, default 8192.\n";
 }
 
 FeatureExtractorType ParseFeatureType(const std::string& value) {
@@ -112,6 +114,12 @@ int RunFeatureExtractor(const std::vector<std::string>& args,
       } else if (arg == "--aliked_min_score") {
         options.aliked_min_score =
             std::stof(RequireValue(args, &i, arg));
+      } else if (arg == "--aliked_max_image_size") {
+        options.aliked_max_image_size =
+            std::stoi(RequireValue(args, &i, arg));
+      } else if (arg == "--learned_cuda_memory_limit_mb") {
+        options.learned_cuda_memory_limit_mb = static_cast<std::size_t>(
+            std::stoull(RequireValue(args, &i, arg)));
       } else {
         throw std::invalid_argument("Unknown argument: " + arg);
       }

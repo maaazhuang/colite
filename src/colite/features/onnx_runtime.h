@@ -25,7 +25,9 @@ class OnnxModel {
   OnnxModel(const std::filesystem::path& model_path,
             int num_threads,
             OnnxExecutionProvider execution_provider,
-            int gpu_index);
+            int gpu_index,
+            std::size_t cuda_memory_limit_bytes = 0,
+            bool use_io_binding = true);
 
   std::vector<Ort::Value> Run(
       const std::vector<Ort::Value>& input_tensors) const;
@@ -51,6 +53,7 @@ class OnnxModel {
   std::vector<std::string> output_names_;
   std::vector<std::vector<std::int64_t>> output_shapes_;
   OnnxExecutionProvider execution_provider_ = OnnxExecutionProvider::kCpu;
+  bool use_io_binding_ = true;
 };
 
 }  // namespace colite::features

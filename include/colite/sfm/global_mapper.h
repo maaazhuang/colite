@@ -7,6 +7,7 @@
 #include "colite/core/reconstruction.h"
 #include "colite/sfm/global_bundle_adjuster.h"
 #include "colite/sfm/global_positioner.h"
+#include "colite/sfm/observation_filter.h"
 #include "colite/sfm/incremental_triangulator.h"
 #include "colite/sfm/rotation_averager.h"
 #include "colite/sfm/view_graph.h"
@@ -19,8 +20,13 @@ struct GlobalMappingOptions {
   GlobalPositioningOptions positioning;
   IncrementalTriangulatorOptions triangulation;
   GlobalBundleAdjustmentOptions bundle_adjustment;
+  GlobalBundleAdjustmentOptions fixed_rotation_bundle_adjustment;
+  ObservationFilterOptions observation_filter;
   std::size_t min_num_registered_images = 2;
   std::size_t min_num_points3d = 1;
+  bool run_fixed_rotation_bundle_adjustment = true;
+  bool run_retriangulation = true;
+  bool run_observation_filter = true;
   bool run_bundle_adjustment = true;
 };
 
@@ -35,6 +41,9 @@ struct GlobalMappingSummary {
   IncrementalTriangulatorSummary triangulation;
   GlobalBundleAdjustmentSummary bundle_adjustment;
   std::string message;
+  GlobalBundleAdjustmentSummary fixed_rotation_bundle_adjustment;
+  IncrementalTriangulatorSummary retriangulation;
+  ObservationFilterSummary observation_filter;
 };
 
 GlobalMappingSummary RunGlobalMapping(

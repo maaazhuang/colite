@@ -52,6 +52,7 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --learned_matcher_model_path <file> Required for LightGlue.\n"
       << "  --min_cosine_similarity <v> ALIKED BF threshold, default 0.85.\n"
       << "  --lightglue_min_score <v> LightGlue threshold, default 0.1.\n"
+      << "  --aliked_max_image_size <px> Longest inference edge; 0 disables resizing, default 1600.\n"
       << "  --learned_matcher_num_threads <n> ONNX threads, default 1.\n"
       << "  --learned_device <auto|cpu|cuda> ONNX provider, default auto.\n"
       << "  --learned_gpu_index <n> CUDA device for learned models, default 0.\n"
@@ -59,9 +60,11 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << "  --hierarchical_target_cluster_size <n> Core images per cluster, default 100.\n"
       << "  --hierarchical_max_cluster_size <n> Core plus overlap, default 150.\n"
       << "  --hierarchical_overlap <n> Boundary images per cluster, default 10.\n"
+      << "  --learned_cuda_memory_limit_mb <n> CUDA arena limit, default 8192.\n"
       << "  --nearby_match_window <n>\n"
          "                            Relax and re-match neighboring image pairs "
          "within this file-order window, default 0 disables it.\n"
+      << "  --hierarchical_num_workers <n> Local mapper workers; 0 auto, default 0.\n"
       << "  --nearby_match_ratio <r> Relaxed Lowe ratio for neighboring pairs, "
          "default 0.8.\n"
       << "  --guided_match_ratio <r> Lowe ratio for geometry-guided matching, "
@@ -247,6 +250,9 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--structureless_registration") {
       options.use_structureless_registration =
           ParseBoolFlagValue(RequireValue(args, &i, arg), arg);
+    } else if (arg == "--aliked_max_image_size") {
+      options.aliked_max_image_size =
+          std::stoi(RequireValue(args, &i, arg));
     } else if (arg == "--multiple_models") {
       options.multiple_models =
           ParseBoolFlagValue(RequireValue(args, &i, arg), arg);
@@ -331,6 +337,9 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
     } else if (arg == "--learned_gpu_index") {
       options.learned_gpu_index =
           std::stoi(RequireValue(args, &i, arg));
+    } else if (arg == "--learned_cuda_memory_limit_mb") {
+      options.learned_cuda_memory_limit_mb = static_cast<std::size_t>(
+          std::stoull(RequireValue(args, &i, arg)));
     } else if (arg == "--mapper") {
       const std::string mapper = RequireValue(args, &i, arg);
       if (mapper == "incremental") {
@@ -350,6 +359,9 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
           std::stoull(RequireValue(args, &i, arg)));
     } else if (arg == "--hierarchical_overlap") {
       options.hierarchical_overlap = static_cast<std::size_t>(
+          std::stoull(RequireValue(args, &i, arg)));
+    } else if (arg == "--hierarchical_num_workers") {
+      options.hierarchical_num_workers = static_cast<std::size_t>(
           std::stoull(RequireValue(args, &i, arg)));
     } else {
       throw std::invalid_argument("Unknown argument: " + arg);
@@ -419,6 +431,10 @@ void ValidateOptions(const ReconSfmCliOptions& options) {
   }
   if (!ExistsCameraModel(options.camera_model_id)) {
     throw std::invalid_argument("--camera_model is unsupported");
+  }
+  if (options.aliked_max_image_size < 0) {
+    throw std::invalid_argument(
+        "--aliked_max_image_size must be non-negative");
   }
   if (!std::isfinite(options.default_focal_length_factor) ||
       options.default_focal_length_factor <= 0.0) {
@@ -492,6 +508,9 @@ controllers::ReconSfmControllerOptions ToControllerOptions(
   controller_options.aliked_min_score = options.aliked_min_score;
   controller_options.matcher_backend = options.matcher_backend;
   controller_options.matcher_type = options.matcher_type;
+  controller_options.aliked_max_image_size = options.aliked_max_image_size;
+  controller_options.learned_cuda_memory_limit_mb =
+      options.learned_cuda_memory_limit_mb;
   controller_options.learned_matcher_model_path =
       options.learned_matcher_model_path;
   controller_options.min_cosine_similarity = options.min_cosine_similarity;
@@ -507,6 +526,8 @@ controllers::ReconSfmControllerOptions ToControllerOptions(
   controller_options.hierarchical_max_cluster_size =
       options.hierarchical_max_cluster_size;
   controller_options.hierarchical_overlap = options.hierarchical_overlap;
+  controller_options.hierarchical_num_workers =
+      options.hierarchical_num_workers;
   controller_options.nearby_match_window = options.nearby_match_window;
   controller_options.nearby_match_ratio = options.nearby_match_ratio;
   controller_options.guided_match_ratio = options.guided_match_ratio;

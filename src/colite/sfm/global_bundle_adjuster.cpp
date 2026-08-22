@@ -520,12 +520,17 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
   for (auto& [image_id, block] : pose_blocks) {
     ceres_compat::AddEigenQuaternionParameterBlock(&problem, block.q_xyzw);
     problem.AddParameterBlock(block.t, 3);
-    if (!options.refine_poses ||
+    const bool constant_pose =
+        !options.refine_poses ||
         constant_pose_image_ids.find(image_id) !=
-            constant_pose_image_ids.end()) {
+            constant_pose_image_ids.end();
+    if (constant_pose) {
       problem.SetParameterBlockConstant(block.q_xyzw);
       problem.SetParameterBlockConstant(block.t);
     } else {
+      if (options.constant_rotation_image_ids.count(image_id) > 0) {
+        problem.SetParameterBlockConstant(block.q_xyzw);
+      }
       ++summary.num_variable_images;
       const auto translation_it = constant_translation_idxs.find(image_id);
       if (translation_it != constant_translation_idxs.end() &&
