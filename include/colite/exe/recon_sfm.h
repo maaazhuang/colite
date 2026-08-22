@@ -40,6 +40,8 @@ struct ReconSfmCliOptions {
   double aliked_min_score = 0.2;
   DescriptorMatcherBackend matcher_backend = DescriptorMatcherBackend::kFlann;
   FeatureMatcherType matcher_type = FeatureMatcherType::kSiftBruteForce;
+  int aliked_max_image_size = 1600;
+  std::size_t learned_cuda_memory_limit_mb = 8192;
   std::string learned_matcher_model_path;
   double min_cosine_similarity = 0.85;
   double lightglue_min_score = 0.1;
@@ -53,6 +55,7 @@ struct ReconSfmCliOptions {
   std::size_t hierarchical_max_cluster_size = 150;
   std::size_t hierarchical_overlap = 10;
   std::size_t nearby_match_window = 0;
+  std::size_t hierarchical_num_workers = 0;
   double nearby_match_ratio = 0.8;
   double guided_match_ratio = 0.95;
   std::size_t max_registration_trials_per_image = 3;

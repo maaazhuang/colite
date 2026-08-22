@@ -46,6 +46,8 @@ struct ReconSfmControllerOptions {
   double aliked_min_score = 0.2;
   DescriptorMatcherBackend matcher_backend = DescriptorMatcherBackend::kFlann;
   FeatureMatcherType matcher_type = FeatureMatcherType::kSiftBruteForce;
+  int aliked_max_image_size = 1600;
+  std::size_t learned_cuda_memory_limit_mb = 8192;
   std::filesystem::path learned_matcher_model_path;
   double min_cosine_similarity = 0.85;
   double lightglue_min_score = 0.1;
@@ -59,6 +61,7 @@ struct ReconSfmControllerOptions {
   std::size_t hierarchical_overlap = 10;
   // Match the standalone exhaustive matcher unless relaxation is explicitly
   // requested by the caller.
+  std::size_t hierarchical_num_workers = 0;
   std::size_t nearby_match_window = 0;
   double nearby_match_ratio = 0.8;
   double guided_match_ratio = 0.95;

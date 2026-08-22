@@ -1166,6 +1166,9 @@ std::vector<FeatureSet> ExtractFeaturesForImages(
           aliked_options.max_num_features = options.max_num_features;
           aliked_options.min_score = static_cast<float>(options.aliked_min_score);
           aliked_options.num_threads = inference_num_threads;
+          aliked_options.max_image_size = options.aliked_max_image_size;
+          aliked_options.cuda_memory_limit_mb =
+              options.learned_cuda_memory_limit_mb;
           aliked_options.execution_provider =
               options.learned_execution_provider;
           aliked_options.gpu_index = options.learned_gpu_index;
@@ -1772,6 +1775,8 @@ int ReconSfmController::Run(std::ostream& out) const {
         options.hierarchical_max_cluster_size;
     hierarchical_options.clustering.overlap =
         options.hierarchical_overlap;
+    hierarchical_options.max_parallel_local_mappings =
+        options.hierarchical_num_workers;
     hierarchical_options.local_mapping = mapping_options;
     hierarchical_options.merging = multi_options.merging;
     hierarchical_options.final_bundle_adjustment =

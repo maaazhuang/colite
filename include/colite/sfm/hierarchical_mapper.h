@@ -19,6 +19,9 @@ struct HierarchicalMappingOptions {
   ModelMergeOptions merging;
   GlobalBundleAdjustmentOptions final_bundle_adjustment;
   std::size_t min_num_images_per_local_model = 2;
+  // Zero automatically uses at most two workers to bound the number of full
+  // reconstruction copies held in memory.
+  std::size_t max_parallel_local_mappings = 0;
   bool run_final_bundle_adjustment = true;
 };
 
@@ -31,6 +34,8 @@ struct HierarchicalMappingSummary {
   GlobalBundleAdjustmentSummary final_bundle_adjustment;
   std::size_t num_successful_local_models = 0;
   std::size_t num_merged_local_models = 0;
+  std::size_t num_parallel_local_mappings = 0;
+  std::size_t num_model_graph_edges = 0;
   std::size_t num_unmerged_local_models = 0;
   std::size_t num_registered_images = 0;
   std::size_t num_points3d = 0;

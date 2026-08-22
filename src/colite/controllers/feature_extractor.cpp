@@ -207,6 +207,8 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
   aliked_options.max_num_features = options_.max_num_features;
   aliked_options.min_score = options_.aliked_min_score;
   aliked_options.num_threads = num_threads;
+  aliked_options.max_image_size = options_.aliked_max_image_size;
+  aliked_options.cuda_memory_limit_mb = options_.learned_cuda_memory_limit_mb;
 #if defined(COLITE_ENABLE_SIFT_PARALLEL)
   // SIFT 内部固定线程池按连续图像区域切分；外层保持单图，避免两层并行争抢核心。
   parallel::setNumThreads(options_.extractor_type != FeatureExtractorType::kSift ||

@@ -5,6 +5,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "colite/sfm/incremental_mapper.h"
+
 namespace colite {
 namespace {
 
@@ -123,6 +125,49 @@ GlobalMappingSummary RunGlobalMapping(const MatchGraph& graph,
   if (summary.num_points3d < options.min_num_points3d) {
     summary.message = "Global mapping triangulated too few points";
     return summary;
+  }
+  if (options.run_fixed_rotation_bundle_adjustment) {
+    GlobalBundleAdjustmentOptions fixed_options =
+        options.fixed_rotation_bundle_adjustment;
+    fixed_options.refine_poses = true;
+    fixed_options.refine_points = true;
+    fixed_options.refine_camera_params = CameraParameterGroup::kNone;
+    fixed_options.refine_camera_param_names.clear();
+    fixed_options.constant_rotation_image_ids.insert(
+        registered_ids.begin(), registered_ids.end());
+    summary.fixed_rotation_bundle_adjustment =
+        AdjustGlobalBundle(fixed_options, reconstruction);
+    if (!summary.fixed_rotation_bundle_adjustment.success) {
+      summary.message = "Fixed-rotation global bundle adjustment failed: " +
+                        summary.fixed_rotation_bundle_adjustment.message;
+      return summary;
+    }
+  }
+
+  if (options.run_retriangulation) {
+    summary.retriangulation = RetriangulateAllRegisteredImages(
+        graph, options.triangulation, reconstruction, &cache);
+    const IncrementalTriangulatorSummary closure =
+        CompleteAndMergeAllTracks(graph, completion_options, reconstruction,
+                                  &cache);
+    AccumulateTriangulation(closure, &summary.retriangulation);
+    summary.retriangulation.message =
+        "Global retriangulation and track closure completed";
+  }
+
+  if (options.run_observation_filter) {
+    summary.observation_filter =
+        FilterObservationsAndPoints(options.observation_filter,
+                                    reconstruction);
+    if (!summary.observation_filter.success) {
+      summary.message = "Global observation filtering failed: " +
+                        summary.observation_filter.message;
+      return summary;
+    }
+    if (reconstruction->Points3D().size() < options.min_num_points3d) {
+      summary.message = "Global filtering retained too few points";
+      return summary;
+    }
   }
 
   if (options.run_bundle_adjustment) {

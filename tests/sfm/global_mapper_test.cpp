@@ -98,6 +98,9 @@ TEST(GlobalMapperTest, RunsViewGraphPositioningTriangulationPipeline) {
   ASSERT_TRUE(summary.success) << summary.message;
   EXPECT_EQ(summary.num_registered_images, 3U);
   EXPECT_GE(summary.num_points3d, points.size() / 2);
+  EXPECT_TRUE(summary.fixed_rotation_bundle_adjustment.success);
+  EXPECT_FALSE(summary.retriangulation.message.empty());
+  EXPECT_TRUE(summary.observation_filter.success);
   EXPECT_TRUE(summary.bundle_adjustment.success);
   EXPECT_EQ(reconstruction.RegisteredImageIds().size(), 3U);
   EXPECT_GT(reconstruction.GetImage(2).cam_from_world->CameraCenter().x(),

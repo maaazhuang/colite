@@ -14,6 +14,8 @@ TEST(AlikedExtractorTest, PreparesRgbChwAndReplicatePadding) {
   ASSERT_EQ(tensor.original_height, 1);
   ASSERT_EQ(tensor.padded_width, 32);
   ASSERT_EQ(tensor.padded_height, 32);
+  ASSERT_EQ(tensor.inference_width, 2);
+  ASSERT_EQ(tensor.inference_height, 1);
   const std::size_t plane = 32U * 32U;
   EXPECT_NEAR(tensor.data[0], 30.0F / 255.0F, 1e-7F);
   EXPECT_NEAR(tensor.data[1], 60.0F / 255.0F, 1e-7F);
@@ -23,6 +25,17 @@ TEST(AlikedExtractorTest, PreparesRgbChwAndReplicatePadding) {
   EXPECT_NEAR(tensor.data[31 * 32 + 31], 60.0F / 255.0F, 1e-7F);
 }
 
+
+TEST(AlikedExtractorTest, ResizesLongestEdgeAndPreservesSourceDimensions) {
+  cv::Mat image(60, 120, CV_8UC3, cv::Scalar(10, 20, 30));
+  const AlikedImageTensor tensor = PrepareAlikedImageTensor(image, 64);
+  EXPECT_EQ(tensor.original_width, 120);
+  EXPECT_EQ(tensor.original_height, 60);
+  EXPECT_EQ(tensor.inference_width, 64);
+  EXPECT_EQ(tensor.inference_height, 32);
+  EXPECT_EQ(tensor.padded_width, 64);
+  EXPECT_EQ(tensor.padded_height, 32);
+}
 TEST(AlikedExtractorTest, RejectsInvalidInputAndOptions) {
   EXPECT_THROW(PrepareAlikedImageTensor(cv::Mat()), std::invalid_argument);
   cv::Mat image(32, 32, CV_8UC3, cv::Scalar::all(0));

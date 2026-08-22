@@ -59,6 +59,10 @@ TEST(ReconSfmExeTest, PrintsHelp) {
   EXPECT_NE(out.str().find("Usage:"), std::string::npos);
   EXPECT_NE(out.str().find("--feature_extractor"), std::string::npos);
   EXPECT_NE(out.str().find("--feature_type"), std::string::npos);
+  EXPECT_NE(out.str().find("--aliked_max_image_size"), std::string::npos);
+  EXPECT_NE(out.str().find("--learned_cuda_memory_limit_mb"),
+            std::string::npos);
+  EXPECT_NE(out.str().find("--hierarchical_num_workers"), std::string::npos);
   EXPECT_NE(out.str().find("aliked_lightglue"), std::string::npos);
   EXPECT_NE(out.str().find("--learned_device"), std::string::npos);
   EXPECT_NE(out.str().find("--learned_gpu_index"), std::string::npos);

@@ -24,6 +24,8 @@ struct FeatureExtractorControllerOptions {
   SiftBackend backend = SiftBackend::kAuto;
   std::filesystem::path aliked_model_path;
   float aliked_min_score = 0.2F;
+  int aliked_max_image_size = 1600;
+  std::size_t learned_cuda_memory_limit_mb = 8192;
 };
 
 struct FeatureExtractorControllerSummary {

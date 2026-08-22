@@ -27,6 +27,9 @@ struct GlobalBundleAdjustmentOptions {
   CameraParameterGroup refine_camera_params = CameraParameterGroup::kNone;
   std::set<std::string> refine_camera_param_names;
   std::set<ImageId> constant_image_ids;
+  // Keep only the rotations of these images fixed while translations and
+  // structure remain variable. Used by staged global SfM.
+  std::set<ImageId> constant_rotation_image_ids;
   std::map<ImageId, std::vector<int>> constant_image_translation_idxs;
   BundleGaugeFixing gauge_fixing = BundleGaugeFixing::kFirstTwoImages;
   bool use_position_priors = false;

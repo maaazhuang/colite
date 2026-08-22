@@ -74,6 +74,7 @@ TEST(HierarchicalMapperTest, ReconstructsOverlappingClustersAndMergesThem) {
   options.clustering.max_cluster_size = 6;
   options.clustering.overlap = 2;
   options.local_mapping.mapper.triangulation.min_triangulation_angle_deg = 0.1;
+  options.max_parallel_local_mappings = 2;
   options.local_mapping.mapper.run_local_bundle_adjustment = false;
   options.local_mapping.mapper.run_local_retriangulation_filter = false;
   options.local_mapping.mapper.run_observation_filter = false;
@@ -90,6 +91,8 @@ TEST(HierarchicalMapperTest, ReconstructsOverlappingClustersAndMergesThem) {
   EXPECT_EQ(summary.num_merged_local_models, 1U);
   EXPECT_EQ(summary.num_unmerged_local_models, 0U);
   EXPECT_EQ(summary.num_registered_images, kNumImages);
+  EXPECT_EQ(summary.num_parallel_local_mappings, 2U);
+  EXPECT_EQ(summary.num_model_graph_edges, 1U);
   EXPECT_TRUE(summary.final_bundle_adjustment.success);
   EXPECT_GE(summary.num_points3d, points.size() / 2);
 }
