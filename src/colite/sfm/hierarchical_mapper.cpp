@@ -23,6 +23,19 @@ std::size_t CountSharedImages(const Reconstruction& lhs,
   return count;
 }
 
+Reconstruction BuildLocalSchema(const Reconstruction& schema,
+                                const std::vector<ImageId>& image_ids) {
+  Reconstruction local;
+  for (const ImageId image_id : image_ids) {
+    const Image& image = schema.GetImage(image_id);
+    if (!local.ExistsCamera(image.camera_id)) {
+      local.AddCamera(schema.GetCamera(image.camera_id));
+    }
+    local.AddImage(image);
+  }
+  return local;
+}
+
 }  // namespace
 
 HierarchicalMappingSummary RunHierarchicalMapping(
@@ -65,6 +78,10 @@ HierarchicalMappingSummary RunHierarchicalMapping(
       std::max<std::size_t>(1, requested_workers), summary.clusters.size());
   summary.num_parallel_local_mappings = worker_count;
   summary.local_mappings.resize(summary.clusters.size());
+  for (const ImageCluster& cluster : summary.clusters) {
+    summary.max_local_schema_num_images = std::max(
+        summary.max_local_schema_num_images, cluster.image_ids.size());
+  }
   using LocalResult = std::pair<IncrementalMappingSummary, Reconstruction>;
   for (std::size_t begin = 0; begin < summary.clusters.size();
        begin += worker_count) {
@@ -76,7 +93,7 @@ HierarchicalMappingSummary RunHierarchicalMapping(
       const ImageCluster cluster = summary.clusters[cluster_idx];
       futures.push_back(std::async(
           std::launch::async, [&graph, &options, &schema, cluster]() {
-            Reconstruction local = schema;
+            Reconstruction local = BuildLocalSchema(schema, cluster.image_ids);
             IncrementalMappingOptions local_options = options.local_mapping;
             local_options.allowed_image_ids = std::set<ImageId>(
                 cluster.image_ids.begin(), cluster.image_ids.end());
@@ -118,6 +135,18 @@ HierarchicalMappingSummary RunHierarchicalMapping(
   }
 
   Reconstruction merged = std::move(local_models.front());
+  // Local workers only clone their cluster schema. Expand the single merge
+  // target once so incoming models can register images outside the seed model.
+  for (const auto& [camera_id, camera] : schema.Cameras()) {
+    if (!merged.ExistsCamera(camera_id)) {
+      merged.AddCamera(camera);
+    }
+  }
+  for (const auto& [image_id, image] : schema.Images()) {
+    if (!merged.ExistsImage(image_id)) {
+      merged.AddImage(image);
+    }
+  }
   std::vector<std::size_t> pending_model_indices;
   std::vector<ModelMergeSummary> last_merge_attempt(local_models.size());
   for (std::size_t model_idx = 1; model_idx < local_models.size(); ++model_idx) {

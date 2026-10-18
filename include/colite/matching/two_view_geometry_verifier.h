@@ -13,7 +13,7 @@ struct TwoViewGeometryOptions {
   // RANSAC 内点阈值，单位为像素。用于 F/H；E 会换算到归一化平面。
   double max_error_px = 4.0;
 
-  // RANSAC 置信度。当前保留该参数用于接口兼容，后续 LORANSAC 会使用。
+  // RANSAC 置信度，用于自适应迭代次数。
   double confidence = 0.999;
 
   // 内部 RANSAC 最大迭代次数。

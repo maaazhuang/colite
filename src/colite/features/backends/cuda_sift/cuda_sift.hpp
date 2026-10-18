@@ -21,6 +21,7 @@ struct CudaSiftConfig {
     float peakThreshold = 3.4f;
     float edgeThreshold = 10.0f;
     int maxFeatures = 0; // Oriented features retained before descriptors; 0 disables the limit.
+    int maxOrientations = 4;
 };
 
 struct CudaSiftTiming {

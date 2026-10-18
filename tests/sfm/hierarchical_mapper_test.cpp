@@ -92,6 +92,7 @@ TEST(HierarchicalMapperTest, ReconstructsOverlappingClustersAndMergesThem) {
   EXPECT_EQ(summary.num_unmerged_local_models, 0U);
   EXPECT_EQ(summary.num_registered_images, kNumImages);
   EXPECT_EQ(summary.num_parallel_local_mappings, 2U);
+  EXPECT_EQ(summary.max_local_schema_num_images, 6U);
   EXPECT_EQ(summary.num_model_graph_edges, 1U);
   EXPECT_TRUE(summary.final_bundle_adjustment.success);
   EXPECT_GE(summary.num_points3d, points.size() / 2);

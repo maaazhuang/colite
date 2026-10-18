@@ -80,7 +80,7 @@ TEST(GeometryTest, ReprojectionErrorIsMeasuredInPixels) {
   EXPECT_NEAR(*error, 5.0, 1e-12);
 }
 
-TEST(GeometryTest, ComputesPointTrackRootMeanSquaredReprojectionError) {
+TEST(GeometryTest, ComputesColmapMeanPointTrackReprojectionError) {
   Reconstruction reconstruction;
   const Camera camera = MakePinholeCamera();
   reconstruction.AddCamera(camera);
@@ -106,7 +106,12 @@ TEST(GeometryTest, ComputesPointTrackRootMeanSquaredReprojectionError) {
   const auto error = Point3DTrackReprojectionError(reconstruction, point);
 
   ASSERT_TRUE(error.has_value());
-  EXPECT_NEAR(*error, std::sqrt(12.5), 1e-12);
+  // COLMAP averages the two pixel distances (5 and 0), rather than their squares.
+  EXPECT_NEAR(*error, 2.5, 1e-12);
+  point.reprojection_error = 99.0;
+  reconstruction.AddPoint3D(point);
+  UpdatePoint3DReprojectionErrors(&reconstruction);
+  EXPECT_NEAR(reconstruction.GetPoint3D(1).reprojection_error, 2.5, 1e-12);
 }
 
 TEST(GeometryTest, TriangulatesPointFromTwoViews) {

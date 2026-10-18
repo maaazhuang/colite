@@ -32,12 +32,16 @@ std::optional<double> ReprojectionError(
     const Eigen::Vector3d& point_world,
     const Eigen::Vector2d& observed_pixel);
 
-// COLMAP text models store the root mean squared reprojection error of all
+// COLMAP models store the mean Euclidean reprojection error of all
 // valid observations in a track. Returns nullopt when the track has no valid
 // posed observation.
 std::optional<double> Point3DTrackReprojectionError(
     const Reconstruction& reconstruction,
     const Point3D& point3d);
+
+// Refresh stored ERROR fields after geometry or tracks change. Serialization
+// itself preserves these fields, so format conversion does not alter a model.
+void UpdatePoint3DReprojectionErrors(Reconstruction* reconstruction);
 
 // 根据两张图像的位姿和像素观测进行线性三角化。
 // 输入位姿均采用 world -> camera 约定，输出点位于世界坐标系。

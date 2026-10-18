@@ -24,6 +24,9 @@ struct RotationAveragingSummary {
   std::size_t num_rejected_constraints = 0;
   double median_residual_deg = -1.0;
   double max_update_deg = -1.0;
+  // Indices into the input constraints, after rejection and anchor-component
+  // pruning. Downstream positioning must use this same set of edges.
+  std::vector<std::size_t> used_constraint_indices;
 };
 
 RotationAveragingSummary EstimateGlobalRotations(

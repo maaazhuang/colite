@@ -96,9 +96,9 @@ void ReadWorkspaceVerifiedGeometries(
 void WriteWorkspaceSparseReconstruction(
     const std::filesystem::path& workspace_path,
     const Reconstruction& reconstruction,
-    ColmapModelFormat format = ColmapModelFormat::kText);
+    ColmapModelFormat format = ColmapModelFormat::kTextAndBinary);
 
-// COLMAP text model I/O shared by SfM resume, multi-model output and MVS.
+// COLMAP TXT/BIN model I/O shared by SfM resume, multi-model output and MVS.
 Reconstruction ReadColmapTextReconstruction(
     const std::filesystem::path& model_path);
 Reconstruction ReadColmapBinaryReconstruction(
@@ -112,6 +112,8 @@ void WriteSparseReconstruction(
 void WriteColmapBinaryReconstruction(
     const std::filesystem::path& model_path,
     const Reconstruction& reconstruction);
+// Preserve stored ERROR fields and write a legacy three-file COLMAP model.
+// Remove obsolete opposite-format and rig/frame files from this output model.
 void WriteColmapReconstruction(
     const std::filesystem::path& model_path,
     const Reconstruction& reconstruction,

@@ -19,6 +19,10 @@ struct ViewGraphCalibrationOptions {
   std::size_t min_num_inliers = 15;
   double min_median_triangulation_angle_deg = 0.0;
   bool calibrated_only = false;
+  // Reject edges whose median triplet rotation closure exceeds this value.
+  // A non-positive value disables cycle filtering.
+  double max_rotation_cycle_error_deg = 10.0;
+  std::size_t min_rotation_cycle_support = 3;
 };
 
 struct ViewGraphCalibrationSummary {
@@ -27,6 +31,7 @@ struct ViewGraphCalibrationSummary {
   std::size_t num_rejected_degenerate = 0;
   std::size_t num_rejected_inliers = 0;
   std::size_t num_rejected_angle = 0;
+  std::size_t num_rejected_rotation_cycle = 0;
 };
 
 std::vector<RelativePoseConstraint> BuildRelativePoseConstraints(

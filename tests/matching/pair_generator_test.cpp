@@ -1,5 +1,6 @@
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -49,6 +50,7 @@ TEST(MatchingPairGeneratorTest, SequentialUsesForwardOverlapWindow) {
   MatchingPairGeneratorOptions options;
   options.strategy = MatchingStrategy::kSequential;
   options.sequential_overlap = 2;
+  options.sequential_quadratic_overlap = false;
 
   const std::vector<ImagePair> pairs =
       GenerateMatchingPairs(MakeImages(5), options);
@@ -56,6 +58,20 @@ TEST(MatchingPairGeneratorTest, SequentialUsesForwardOverlapWindow) {
   EXPECT_EQ(MakePairsTextFriendly(pairs),
             (std::vector<ImagePair>{{1, 2}, {1, 3}, {2, 3}, {2, 4},
                                     {3, 4}, {3, 5}, {4, 5}}));
+}
+
+TEST(MatchingPairGeneratorTest, SequentialQuadraticOffsetsMatchColmap) {
+  MatchingPairGeneratorOptions options;
+  options.strategy = MatchingStrategy::kSequential;
+  options.sequential_overlap = 3;
+  options.sequential_quadratic_overlap = true;
+  EXPECT_EQ(MakePairsTextFriendly(GenerateMatchingPairs(MakeImages(6), options)),
+            (std::vector<ImagePair>{{1, 2}, {1, 3}, {1, 5}, {2, 3}, {2, 4},
+                                    {2, 6}, {3, 4}, {3, 5}, {4, 5}, {4, 6}, {5, 6}}));
+  options.sequential_overlap = std::numeric_limits<std::size_t>::max();
+  EXPECT_EQ(GenerateMatchingPairs(MakeImages(6), options).size(), 11U);
+  options.sequential_quadratic_overlap = false;
+  EXPECT_EQ(GenerateMatchingPairs(MakeImages(6), options).size(), 15U);
 }
 
 TEST(MatchingPairGeneratorTest, SpatialConnectsNearestPriorsWithinDistance) {

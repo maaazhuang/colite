@@ -13,6 +13,7 @@ namespace colite {
 struct ImageRegistrarOptions {
   std::size_t min_num_correspondences = 15;
   std::size_t min_num_inliers = 12;
+  double min_inlier_ratio = 0.25;
   int min_num_iterations = 100;
   int max_num_iterations = 10000;
   double max_reprojection_error_px = 4.0;

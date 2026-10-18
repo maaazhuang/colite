@@ -86,21 +86,28 @@ features::OnnxModel& CachedLightGlueModel(
     int num_threads = 0;
     OnnxExecutionProvider execution_provider = OnnxExecutionProvider::kAuto;
     int gpu_index = -1;
+    std::size_t cuda_memory_limit_mb = 0;
+    bool use_io_binding = true;
     std::unique_ptr<features::OnnxModel> model;
   };
   thread_local Cache cache;
   if (cache.model == nullptr || cache.path != options.model_path ||
       cache.num_threads != options.num_threads ||
       cache.execution_provider != options.execution_provider ||
-      cache.gpu_index != options.gpu_index) {
+      cache.gpu_index != options.gpu_index ||
+      cache.cuda_memory_limit_mb != options.cuda_memory_limit_mb ||
+      cache.use_io_binding != options.use_io_binding) {
     ValidateLearnedModelResource(options.model_path);
     cache.path = options.model_path;
     cache.num_threads = options.num_threads;
     cache.execution_provider = options.execution_provider;
     cache.gpu_index = options.gpu_index;
+    cache.cuda_memory_limit_mb = options.cuda_memory_limit_mb;
+    cache.use_io_binding = options.use_io_binding;
     cache.model = std::make_unique<features::OnnxModel>(
         options.model_path, options.num_threads, options.execution_provider,
-        options.gpu_index);
+        options.gpu_index, options.cuda_memory_limit_mb * 1024U * 1024U,
+        options.use_io_binding);
   }
   return *cache.model;
 }

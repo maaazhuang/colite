@@ -12,8 +12,11 @@ Colite 是一个实验性的 C++17 运动恢复结构（SfM）与多视图立体
 - 12 种兼容 COLMAP 的相机模型，支持 EXIF 焦距初始化、可选 GPS 位置先验，以及 auto/single/per-folder/per-image 内参共享策略。
 - CPU 与 CUDA SIFT、CUDA 精确暴力描述子匹配、guided matching 和多种图像对选择策略。
 - CPU/CUDA PatchMatch、几何一致性、输出 RGB/法线的 Stereo Fusion、Poisson 与 Delaunay 网格、QEM 简化和纹理图集。
-- COLMAP 文本与二进制稀疏模型读写，以及可断点恢复的阶段清单。
+- COLMAP 文本与二进制稀疏模型读写，默认同时保存两种格式；支持 `model_converter` 转换和 `compare_colmap` 跨格式对比，以及可断点恢复的阶段清单。
+- SfM 已删除同义旧参数与别名，使用 COLMAP 4.0 的 `ImageReader.*`、`FeatureExtraction.*`、`SiftMatching.*`、`AlikedMatching.*`、`TwoViewGeometry.*`、`Mapper.*` 名称；特有控制使用 `Colite.*`。尚未对齐的默认值和功能见[命令行参考](docs/cli_reference.md)，真实参考集选择见[评估约定](docs/sfm_reference_datasets.md)。
 - 独立的模型分析、对齐、变换、裁剪、拆分、束调整、三角化和注册命令。
+
+当前 SfM 参数和前端优化进展见 [2026-10-18 记录](docs/sfm_alignment_20261018.md)：统一 GPU/线程/图像尺寸控制，修正 CUDA SIFT 的尺度与多方向预算，并优化任意特征数的整数 GPU 匹配。数据库适配暂缓。
 
 ## 构建
 
@@ -46,8 +49,8 @@ COLITE=./build-wsl-colite-cuda/src/colite/exe/colite
 $COLITE recon_auto \
   --image_path /path/to/images \
   --output_path output/my_reconstruction \
-  --sfm.max_num_features 8192 \
-  --sfm.feature_num_threads 8 \
+  --sfm.SiftExtraction.max_num_features 8192 \
+  --sfm.FeatureExtraction.num_threads 8 \
   --mvs.patch_match_backend cuda \
   --mesher poisson \
   --simplify 1 \
@@ -84,7 +87,7 @@ OUTPUT/
 
 ## 当前限制
 
-- Mapper 已支持增量式和多模型，但尚未实现 hierarchical/global mapping。
+- Mapper 支持增量式、多模型、global 和 hierarchical；后两者仍需更广泛的大规模与退化场景验证。
 - CUDA 性能和显存占用会随图像尺寸、源视图数量、GPU 架构与缓存配置明显变化。
 - 纹理接缝、可见性召回率、退化几何上的 Delaunay 行为和超大数据集仍需更广泛验证。
 - 兼容 COLMAP 格式并不表示所有数据集上的数值结果或重建精度完全一致。

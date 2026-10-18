@@ -59,119 +59,33 @@ struct PairKey {
   }
 };
 
-std::string TrimLeadingSpaces(std::string text) {
-  const std::size_t first = text.find_first_not_of(" \t");
-  if (first == std::string::npos) {
-    return "";
-  }
-  return text.substr(first);
-}
-
-bool IsCommentLine(const std::string& line) {
-  return !line.empty() && line.front() == '#';
-}
-
-std::vector<std::string> ReadDataLines(const std::filesystem::path& path) {
-  std::ifstream file(path);
-  if (!file) {
-    throw std::runtime_error("Missing COLMAP text file: " + path.string());
-  }
-  std::vector<std::string> lines;
-  std::string line;
-  while (std::getline(file, line)) {
-    if (line.empty() || IsCommentLine(line)) {
-      continue;
-    }
-    lines.push_back(line);
-  }
-  return lines;
-}
-
-std::map<std::size_t, ColmapImage> ReadColmapImages(
-    const std::filesystem::path& images_path) {
-  std::ifstream file(images_path);
-  if (!file) {
-    throw std::runtime_error("Missing COLMAP images file: " +
-                             images_path.string());
-  }
-
-  std::map<std::size_t, ColmapImage> images;
-  std::string header_line;
-  while (std::getline(file, header_line)) {
-    if (header_line.empty() || IsCommentLine(header_line)) {
-      continue;
-    }
-
-    ColmapImage image;
-    std::istringstream header(header_line);
-    double qw = 1.0;
-    double qx = 0.0;
-    double qy = 0.0;
-    double qz = 0.0;
-    header >> image.image_id >> qw >> qx >> qy >> qz >> image.t_cw.x() >>
-        image.t_cw.y() >> image.t_cw.z() >> image.camera_id;
-    if (!header) {
-      throw std::runtime_error("Invalid COLMAP image entry: " + header_line);
-    }
-    std::string name;
-    std::getline(header, name);
-    image.name = TrimLeadingSpaces(name);
-    image.q_cw = Eigen::Quaterniond(qw, qx, qy, qz).normalized();
-    if (image.name.empty()) {
-      throw std::runtime_error("Missing COLMAP image name: " + header_line);
-    }
-
-    std::string points_line;
-    if (!std::getline(file, points_line)) {
-      points_line.clear();
-    }
-    std::istringstream points(points_line);
-    double x = 0.0;
-    double y = 0.0;
-    long long point3d_id = -1;
-    while (points >> x >> y >> point3d_id) {
-      (void)x;
-      (void)y;
-      if (point3d_id >= 0) {
-        ++image.num_observations;
-      }
-    }
-
-    images.emplace(image.image_id, std::move(image));
-  }
-  return images;
-}
-
-std::map<std::size_t, ColmapPoint3D> ReadColmapPoints3D(
-    const std::filesystem::path& points_path) {
-  std::map<std::size_t, ColmapPoint3D> points3d;
-  for (const std::string& line : ReadDataLines(points_path)) {
-    ColmapPoint3D point;
-    int red = 0;
-    int green = 0;
-    int blue = 0;
-    std::istringstream stream(line);
-    stream >> point.point3d_id >> point.xyz.x() >> point.xyz.y() >>
-        point.xyz.z() >> red >> green >> blue >> point.error;
-    if (!stream) {
-      throw std::runtime_error("Invalid COLMAP point3D entry: " + line);
-    }
-    std::size_t image_id = 0;
-    std::size_t point2d_idx = 0;
-    while (stream >> image_id >> point2d_idx) {
-      point.track.emplace_back(image_id, point2d_idx);
-    }
-    points3d.emplace(point.point3d_id, std::move(point));
-  }
-  return points3d;
-}
-
-ColmapModel ReadColmapModel(const std::filesystem::path& path) {
+ColmapModel ReadColmapModel(const std::filesystem::path& path,
+                           ColmapModelFormat format) {
+  const Reconstruction reconstruction = ReadColmapReconstruction(path, format);
   ColmapModel model;
-  model.images_by_id = ReadColmapImages(path / "images.txt");
-  model.points3d = ReadColmapPoints3D(path / "points3D.txt");
-  for (const auto& [image_id, image] : model.images_by_id) {
-    model.image_ids_by_name.emplace(image.name, image_id);
+  for (const ImageId id : reconstruction.RegisteredImageIds()) {
+    const Image& source = reconstruction.GetImage(id);
+    ColmapImage image;
+    image.image_id = id;
+    image.q_cw = source.cam_from_world->q_cw.normalized();
+    image.t_cw = source.cam_from_world->t_cw;
+    image.camera_id = source.camera_id;
+    image.name = source.name;
+    image.num_observations = std::count_if(
+        source.points2d.begin(), source.points2d.end(),
+        [](const Point2D& point) { return point.HasPoint3D(); });
+    model.image_ids_by_name.emplace(image.name, id);
+    model.images_by_id.emplace(id, std::move(image));
+  }
+  for (const auto& [id, source] : reconstruction.Points3D()) {
+    ColmapPoint3D point;
+    point.point3d_id = id;
+    point.xyz = source.xyz;
+    point.error = source.reprojection_error;
+    for (const TrackElement& element : source.track.elements) {
+      point.track.emplace_back(element.image_id, element.point2d_idx);
+    }
+    model.points3d.emplace(id, std::move(point));
   }
   return model;
 }
@@ -630,8 +544,8 @@ ColmapCompareControllerSummary ColmapCompareController::Run() const {
         "reference_path, candidate_path, and output_path are required");
   }
 
-  const ColmapModel reference = ReadColmapModel(options_.reference_path);
-  const ColmapModel candidate = ReadColmapModel(options_.candidate_path);
+  const ColmapModel reference = ReadColmapModel(options_.reference_path, options_.reference_format);
+  const ColmapModel candidate = ReadColmapModel(options_.candidate_path, options_.candidate_format);
   const std::map<PairKey, std::size_t> reference_pairs =
       ComputeSharedPointPairs(reference);
   const std::map<PairKey, std::size_t> candidate_pairs =

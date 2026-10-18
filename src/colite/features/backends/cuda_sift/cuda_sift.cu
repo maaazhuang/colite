@@ -216,7 +216,7 @@ CudaSiftResult RunPipeline(const CudaSiftConfig& config,
                 oriented.reset(AssignOrientationsDevice<Traits>(
                     current.gaussian, current.width, current.height,
                     current.gaussianLayers, refined.get(), refinedCount, octave,
-                    orientedCount, orientationBytes));
+                    orientedCount, orientationBytes, config.maxOrientations));
             }
             result.timing.peakDeviceBytes = std::max(
                 result.timing.peakDeviceBytes,

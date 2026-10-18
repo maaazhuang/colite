@@ -448,6 +448,12 @@ ImageRegistrationSummary RegisterImageWithExistingPoints(
   ImageRegistrationSummary summary;
   summary.image_id = image_id;
 
+  if (!std::isfinite(options.min_inlier_ratio) || options.min_inlier_ratio < 0.0 ||
+      options.min_inlier_ratio > 1.0) {
+    summary.message = "Invalid PnP minimum inlier ratio";
+    return summary;
+  }
+
   if (reconstruction == nullptr || !reconstruction->ExistsImage(image_id)) {
     summary.message = "Image is missing in reconstruction";
     return summary;
@@ -471,7 +477,9 @@ ImageRegistrationSummary RegisterImageWithExistingPoints(
       EstimatePoseRansac(camera, correspondences, options);
   summary.num_ransac_inliers = result.num_inliers_before_final_refinement;
   summary.num_inliers = result.inlier_indices.size();
-  if (summary.num_inliers < options.min_num_inliers) {
+  if (summary.num_inliers < options.min_num_inliers ||
+      static_cast<double>(summary.num_inliers) <
+          options.min_inlier_ratio * correspondences.size()) {
     summary.message = "PnP RANSAC failed or found too few inliers";
     return summary;
   }

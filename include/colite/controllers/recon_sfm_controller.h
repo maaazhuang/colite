@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <iosfwd>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -10,10 +11,12 @@
 #include "colite/core/match_graph.h"
 #include "colite/core/reconstruction.h"
 #include "colite/controllers/sfm_camera_setup.h"
+#include "colite/controllers/sfm_frontend_options.h"
 #include "colite/features/aliked_extractor.h"
 #include "colite/features/sift_extractor.h"
 #include "colite/io/sfm_workspace.h"
 #include "colite/matching/descriptor_matcher.h"
+#include "colite/matching/two_view_geometry_verifier.h"
 #include "colite/sfm/incremental_mapper.h"
 
 namespace colite::controllers {
@@ -25,6 +28,8 @@ enum class SfmMapperType {
 };
 
 struct ReconSfmControllerOptions {
+  SfmFeatureExecutionOptions feature_execution;
+  SfmMatchingExecutionOptions matching_execution;
   std::filesystem::path image_path;
   std::filesystem::path output_path;
   std::filesystem::path input_model_path;
@@ -38,13 +43,18 @@ struct ReconSfmControllerOptions {
   CameraModelId camera_model_id = CameraModelId::kSimpleRadial;
   std::vector<double> camera_params;
   double default_focal_length_factor = 1.2;
-  int max_num_features = 4096;
+  int max_num_features = 8192;
   int feature_num_threads = -1;
   FeatureExtractorType feature_extractor_type = FeatureExtractorType::kSift;
   SiftBackend feature_backend = SiftBackend::kAuto;
   std::filesystem::path aliked_model_path;
   double aliked_min_score = 0.2;
-  DescriptorMatcherBackend matcher_backend = DescriptorMatcherBackend::kFlann;
+  DescriptorMatcherBackend matcher_backend = DescriptorMatcherBackend::kBruteForce;
+  double max_ratio = 0.8;
+  double max_distance = 0.7;
+  bool mutual_check = true;
+  bool guided_matching = false;
+  TwoViewGeometryOptions two_view_geometry;
   FeatureMatcherType matcher_type = FeatureMatcherType::kSiftBruteForce;
   int aliked_max_image_size = 1600;
   std::size_t learned_cuda_memory_limit_mb = 8192;
@@ -64,18 +74,20 @@ struct ReconSfmControllerOptions {
   std::size_t hierarchical_num_workers = 0;
   std::size_t nearby_match_window = 0;
   double nearby_match_ratio = 0.8;
-  double guided_match_ratio = 0.95;
+  double guided_match_ratio = 0.8;
   std::size_t max_registration_trials_per_image = 3;
-  std::size_t max_initialization_trials = 3;
-  bool use_structureless_registration = false;
+  std::size_t max_initialization_trials = 200;
+  bool use_structureless_registration = true;
   bool multiple_models = true;
   bool merge_models = true;
   std::size_t max_num_models = 50;
-  std::size_t min_num_images_per_model = 2;
-  double registration_retry_reprojection_error_multiplier = 1.5;
-  double registration_retry_max_reprojection_error_px = 8.0;
-  CameraParameterGroup ba_refine_camera_params = CameraParameterGroup::kNone;
+  std::size_t min_num_images_per_model = 10;
+  double registration_retry_reprojection_error_multiplier = 1.0;
+  double registration_retry_max_reprojection_error_px = 12.0;
+  CameraParameterGroup ba_refine_camera_params =
+      CameraParameterGroup::kFocalLength | CameraParameterGroup::kDistortion;
   std::set<std::string> ba_refine_camera_param_names;
+  std::map<std::string, std::string> mapper_options;
   bool use_position_priors = false;
   double position_prior_stddev = 5.0;
   double position_prior_loss_scale = 2.0;
@@ -89,6 +101,18 @@ struct NearbyPairMatchingOptions {
   // 近邻匹配使用更宽松的 ratio，但仍保留 mutual check。
   double max_ratio = 0.9;
 };
+
+struct ReconSfmCacheIdentity {
+  std::string features;
+  std::string frontend;
+  std::string sparse;
+};
+
+// Each downstream identity includes the upstream identity so changing feature
+// preprocessing invalidates geometry and reconstruction together.
+ReconSfmCacheIdentity BuildReconSfmCacheIdentity(
+    const ReconSfmControllerOptions& options,
+    const std::vector<std::filesystem::path>& image_paths);
 
 struct ReconstructionQualityStats {
   std::size_t num_observations = 0;

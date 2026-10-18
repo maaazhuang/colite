@@ -145,3 +145,15 @@ set_tests_properties(
   PROPERTIES
     ENVIRONMENT "COLITE_SOURCE_DIR=${PROJECT_SOURCE_DIR}"
 )
+
+add_test(
+  NAME ColmapDatabaseImportTest
+  COMMAND ${Python3_EXECUTABLE}
+          ${PROJECT_SOURCE_DIR}/tests/scripts/colmap_database_import_test.py
+)
+set_tests_properties(
+  ColmapDatabaseImportTest
+  PROPERTIES
+    ENVIRONMENT "COLITE_EXE=$<TARGET_FILE:colite>;PYTHONDONTWRITEBYTECODE=1"
+    SKIP_RETURN_CODE 77
+)

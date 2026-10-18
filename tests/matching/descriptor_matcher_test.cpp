@@ -4,6 +4,7 @@
 #include <initializer_list>
 #include <stdexcept>
 #include <vector>
+#include <random>
 
 #include <gtest/gtest.h>
 
@@ -119,8 +120,8 @@ TEST(DescriptorMatcherTest, CudaMatchesCpuBruteForceExactly) {
   if (!IsCudaDescriptorMatcherAvailable()) {
     GTEST_SKIP() << "CUDA descriptor matcher is unavailable";
   }
-  DescriptorMatrix descriptors1(40, 128);
-  DescriptorMatrix descriptors2(44, 128);
+  DescriptorMatrix descriptors1(41, 128);
+  DescriptorMatrix descriptors2(47, 128);
   for (Eigen::Index row = 0; row < descriptors1.rows(); ++row) {
     for (Eigen::Index col = 0; col < descriptors1.cols(); ++col) {
       descriptors1(row, col) = static_cast<float>(
@@ -170,6 +171,57 @@ TEST(DescriptorMatcherTest, RejectsAmbiguousMatchByRatio) {
   options.mutual_check = false;
 
   EXPECT_TRUE(MatchDescriptors(descriptors1, descriptors2, options).empty());
+}
+
+TEST(DescriptorMatcherTest, CudaRowReductionHandlesTiesAcrossWarpLanes) {
+  if (!IsCudaDescriptorMatcherAvailable()) GTEST_SKIP();
+  DescriptorMatrix descriptors1 = MakeUnitSiftDescriptors({0, 1});
+  DescriptorMatrix descriptors2(65, 128);
+  for (Eigen::Index row = 0; row < descriptors2.rows(); ++row) {
+    descriptors2.row(row) = MakeUnitSiftDescriptors({2}).row(0);
+  }
+  descriptors2.row(1) = descriptors1.row(0);
+  descriptors2.row(32) = descriptors1.row(0);
+  descriptors2.row(64) = descriptors1.row(1);
+  DescriptorMatchingOptions cpu;
+  cpu.backend = DescriptorMatcherBackend::kBruteForce;
+  cpu.max_ratio = 1.0;
+  DescriptorMatchingOptions gpu = cpu;
+  gpu.backend = DescriptorMatcherBackend::kCudaBruteForce;
+  EXPECT_EQ(ToPairs(MatchDescriptors(descriptors1, descriptors2, gpu)),
+            ToPairs(MatchDescriptors(descriptors1, descriptors2, cpu)));
+  EXPECT_EQ(ToPairs(MatchDescriptors(descriptors1.bottomRows(1), descriptors2.bottomRows(1), gpu)),
+            ToPairs(MatchDescriptors(descriptors1.bottomRows(1), descriptors2.bottomRows(1), cpu)));
+}
+
+TEST(DescriptorMatcherTest, CudaHandlesOddRowsAndTiesAcrossColumnTiles) {
+  if (!IsCudaDescriptorMatcherAvailable()) GTEST_SKIP();
+  FeatureSet first, second;
+  first.descriptors.resize(259, 128);
+  second.descriptors.resize(263, 128);
+  std::mt19937 random(19);
+  std::uniform_real_distribution<float> sample(0, 1);
+  for (int i = 0; i < 259; ++i) {
+    for (int j = 0; j < 128; ++j) first.descriptors(i, j) = sample(random);
+    first.descriptors.row(i).normalize();
+    first.keypoints.push_back({static_cast<float>(i), static_cast<float>(i % 3), 1, 0});
+  }
+  first.descriptors.row(257) = first.descriptors.row(0);
+  for (int i = 0; i < 263; ++i) {
+    const int source = i < 259 ? i : 0;
+    second.descriptors.row(i) = first.descriptors.row(source);
+    second.keypoints.push_back(first.keypoints[source]);
+  }
+  DescriptorMatchingOptions cpu, gpu;
+  gpu.backend = DescriptorMatcherBackend::kCudaBruteForce;
+  const auto expected = MatchFeatureSets(first, second, cpu);
+  ASSERT_GT(expected.size(), 250U);
+  EXPECT_EQ(ToPairs(MatchFeatureSets(first, second, gpu)), ToPairs(expected));
+  Eigen::Matrix3d fundamental = Eigen::Matrix3d::Zero();
+  fundamental(1, 2) = -1;
+  fundamental(2, 1) = 1;
+  EXPECT_EQ(ToPairs(MatchFeatureSetsGuidedFundamental(first, second, fundamental, 0.5, gpu)),
+            ToPairs(MatchFeatureSetsGuidedFundamental(first, second, fundamental, 0.5, cpu)));
 }
 
 TEST(DescriptorMatcherTest, RejectsMatchBeyondColmapMaxDistance) {

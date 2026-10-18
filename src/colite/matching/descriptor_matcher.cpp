@@ -659,8 +659,7 @@ std::vector<FeatureMatch> MatchPreparedFeatureSets(
   std::vector<int> forward;
   std::vector<int> backward;
   if (options.backend == DescriptorMatcherBackend::kCudaBruteForce &&
-      options.mutual_check && descriptors1.rows() % 4 == 0 &&
-      descriptors2.rows() % 4 == 0) {
+      options.mutual_check) {
     const cuda_matcher::MutualBestMatches candidates =
         cuda_matcher::FindBestMatchesMutual(*features1.impl_->cuda_buffer,
                                             *features2.impl_->cuda_buffer);
@@ -782,6 +781,14 @@ std::vector<FeatureMatch> MatchPreparedFeatureSetsGuidedFundamental(
 }
 
 bool IsCudaDescriptorMatcherAvailable() { return cuda_matcher::IsAvailable(); }
+void SetCudaDescriptorMatcherDevice(int device) {
+#if defined(COLITE_ENABLE_CUDA_MATCHER)
+  cuda_matcher::SetDevice(device);
+#else
+  (void)device;
+  throw std::runtime_error("CUDA matching is not enabled in this build");
+#endif
+}
 
 std::vector<FeatureMatch> MatchFeatureSets(
     const FeatureSet& features1,

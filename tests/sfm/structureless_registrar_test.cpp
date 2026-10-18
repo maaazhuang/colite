@@ -36,7 +36,7 @@ TwoViewGeometry RelativeGeometry(const double translation_x) {
   return geometry;
 }
 
-TEST(StructurelessRegistrarTest, CombinesRegisteredNeighborRelativePoses) {
+TEST(StructurelessRegistrarTest, RejectsCollinearNeighborRays) {
   Reconstruction reconstruction;
   Camera camera;
   camera.id = 1;
@@ -57,10 +57,7 @@ TEST(StructurelessRegistrarTest, CombinesRegisteredNeighborRelativePoses) {
   const StructurelessRegistrationSummary summary =
       EstimateStructurelessPose(graph, 3, reconstruction);
 
-  ASSERT_TRUE(summary.success);
-  EXPECT_EQ(summary.num_consistent_hypotheses, 2U);
-  EXPECT_NEAR(summary.pose.CameraCenter().x(), 1.0, 1e-10);
-  EXPECT_NEAR(summary.median_center_disagreement, 0.0, 1e-10);
+  EXPECT_FALSE(summary.success);
 }
 
 TEST(StructurelessRegistrarTest, RejectsSingleNeighborHypothesis) {
@@ -106,7 +103,8 @@ TEST(StructurelessRegistrarTest, IncrementalMapperUsesExplicitFallback) {
     image.id = static_cast<ImageId>(image_idx + 1);
     image.camera_id = 1;
     FeatureSet features;
-    const Pose3 pose = CameraAt(centers[image_idx]);
+    Pose3 pose = CameraAt(centers[image_idx]);
+    if (image_idx == 2) pose.t_cw.y() = -0.6;
     for (const Eigen::Vector3d& point : points) {
       const auto pixel = ProjectWorldPoint(camera, pose, point);
       ASSERT_TRUE(pixel.has_value());
@@ -130,6 +128,8 @@ TEST(StructurelessRegistrarTest, IncrementalMapperUsesExplicitFallback) {
   }
   TwoViewGeometry geometry13 = RelativeGeometry(-1.0);
   TwoViewGeometry geometry23 = RelativeGeometry(1.0);
+  geometry13.cam2_from_cam1.t_cw = Eigen::Vector3d(-1, -0.6, 0).normalized();
+  geometry23.cam2_from_cam1.t_cw = Eigen::Vector3d(1, -0.6, 0).normalized();
   geometry13.inlier_matches.clear();
   geometry23.inlier_matches.clear();
   for (std::size_t idx = 0; idx < points.size(); ++idx) {
@@ -148,6 +148,16 @@ TEST(StructurelessRegistrarTest, IncrementalMapperUsesExplicitFallback) {
   options.run_local_bundle_adjustment = false;
   options.run_local_retriangulation_filter = false;
   options.run_observation_filter = false;
+  const Reconstruction schema = reconstruction;
+  MatchGraph invalid_graph = graph;
+  for (auto& keypoint : invalid_graph.features.at(3).keypoints) keypoint.y += 150.0F;
+  const auto invalid = RegisterNextImage(invalid_graph, 3, options, &reconstruction);
+  EXPECT_FALSE(invalid.success);
+  EXPECT_TRUE(invalid.structureless_registration.success);
+  EXPECT_FALSE(reconstruction.IsImageRegistered(3));
+  EXPECT_FALSE(reconstruction.GetImage(3).cam_from_world.has_value());
+  EXPECT_TRUE(reconstruction.Points3D().empty());
+  reconstruction = schema;
   const IncrementalMapperSummary summary =
       RegisterNextImage(graph, 3, options, &reconstruction);
 
@@ -155,6 +165,40 @@ TEST(StructurelessRegistrarTest, IncrementalMapperUsesExplicitFallback) {
   EXPECT_TRUE(summary.used_structureless_registration);
   EXPECT_TRUE(reconstruction.IsImageRegistered(3));
   EXPECT_GT(reconstruction.Points3D().size(), 0U);
+  EXPECT_EQ(summary.registration.num_inliers, points.size());
+}
+
+TEST(StructurelessRegistrarTest, IntersectsRaysIndependentlyOfWorldScale) {
+  for (const double scale : {0.001, 1.0, 10.0, 1000.0}) {
+    SCOPED_TRACE(scale);
+    Reconstruction reconstruction;
+    Camera camera;
+    camera.id = 1;
+    camera.model_id = CameraModelId::kPinhole;
+    camera.width = 640;
+    camera.height = 480;
+    camera.params = {500, 500, 320, 240};
+    reconstruction.AddCamera(camera);
+    reconstruction.AddImage(MakeImage(1, 0.0, true));
+    reconstruction.AddImage(MakeImage(4, 2.0 * scale, true));
+    reconstruction.AddImage(MakeImage(3, 0.0, false));
+    reconstruction.RegisterImage(1);
+    reconstruction.RegisterImage(4);
+    MatchGraph graph;
+    auto edge13 = RelativeGeometry(-1);
+    auto edge23 = RelativeGeometry(1);
+    edge13.cam2_from_cam1.t_cw = Eigen::Vector3d(-1, -0.6, 0).normalized();
+    edge23.cam2_from_cam1.t_cw = Eigen::Vector3d(1, -0.6, 0).normalized();
+    SetVerifiedGeometry(&graph, 1, 3, edge13);
+    // The target is the first image of the ordered second pair, exercising
+    // inverse relative-pose composition without violating the graph contract.
+    edge23.cam2_from_cam1 = edge23.cam2_from_cam1.Inverse();
+    SetVerifiedGeometry(&graph, 3, 4, edge23);
+    const auto summary = EstimateStructurelessPose(graph, 3, reconstruction);
+    ASSERT_TRUE(summary.success) << summary.message;
+    EXPECT_EQ(summary.num_consistent_hypotheses, 2U);
+    EXPECT_LT((summary.pose.CameraCenter() / scale - Eigen::Vector3d(1, 0.6, 0)).norm(), 1e-9);
+  }
 }
 
 }  // namespace

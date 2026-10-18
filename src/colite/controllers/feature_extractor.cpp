@@ -42,7 +42,8 @@ std::vector<std::pair<std::string, std::string>> FeatureCacheEntries(
     const std::vector<std::filesystem::path>& image_paths) {
   std::vector<std::pair<std::string, std::string>> entries;
   entries.emplace_back("stage", "features");
-  entries.emplace_back("algorithm_version", "typed_feature_workspace_v2");
+  entries.emplace_back("execution", SfmFeatureExecutionKey(options.execution));
+  entries.emplace_back("algorithm_version", "colmap_sift_oriented_levels_v5");
   entries.emplace_back("camera_prior_version", "camera_models_auto_exif_v4");
   entries.emplace_back("image_path", options.image_path.lexically_normal().string());
   entries.emplace_back("focal_length", ToConfigValue(options.focal_length));
@@ -153,7 +154,11 @@ class ImageJobQueue {
 
 FeatureExtractorController::FeatureExtractorController(
     FeatureExtractorControllerOptions options)
-    : options_(std::move(options)) {}
+    : options_(std::move(options)) {
+  if (options_.extractor_type == FeatureExtractorType::kSift)
+    options_.backend = ResolveSfmSiftOptions(options_.execution, options_.backend, options_.max_num_features).backend;
+  options_.aliked_max_image_size = EffectiveSfmImageSize(options_.execution, options_.extractor_type);
+}
 
 FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
   FeatureExtractorControllerSummary summary;
@@ -195,9 +200,9 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
   WriteWorkspaceCameras(options_.workspace_path, camera_setup.cameras);
   WriteWorkspaceImages(options_.workspace_path, camera_setup.images);
 
-  SiftExtractionOptions sift_options;
-  sift_options.backend = options_.backend;
-  sift_options.max_num_features = options_.max_num_features;
+  SiftExtractionOptions sift_options = options_.extractor_type == FeatureExtractorType::kSift
+      ? ResolveSfmSiftOptions(options_.execution, options_.backend, options_.max_num_features)
+      : SiftExtractionOptions{};
 
   int num_threads = EffectiveFeatureExtractionThreads(options_.num_threads);
   const SiftBackend resolved_backend = ResolveSiftBackend(sift_options.backend);
@@ -209,6 +214,9 @@ FeatureExtractorControllerSummary FeatureExtractorController::Run() const {
   aliked_options.num_threads = num_threads;
   aliked_options.max_image_size = options_.aliked_max_image_size;
   aliked_options.cuda_memory_limit_mb = options_.learned_cuda_memory_limit_mb;
+  if (options_.execution.use_gpu.has_value()) aliked_options.execution_provider =
+      *options_.execution.use_gpu ? OnnxExecutionProvider::kCuda : OnnxExecutionProvider::kCpu;
+  aliked_options.gpu_index = std::max(0, options_.execution.gpu_index);
 #if defined(COLITE_ENABLE_SIFT_PARALLEL)
   // SIFT 内部固定线程池按连续图像区域切分；外层保持单图，避免两层并行争抢核心。
   parallel::setNumThreads(options_.extractor_type != FeatureExtractorType::kSift ||

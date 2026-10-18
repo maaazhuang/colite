@@ -1,6 +1,7 @@
 #include "colite/controllers/sequential_matcher.h"
 
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <map>
@@ -16,6 +17,7 @@
 
 #include "colite/core/parallel.h"
 #include "colite/io/sfm_workspace.h"
+#include "colite/controllers/sfm_options.h"
 #include "colite/matching/two_view_geometry_batch.h"
 #include "colite/matching/match_graph_consistency.h"
 #include "colite/matching/weak_pair_rematcher.h"
@@ -104,6 +106,7 @@ std::vector<std::pair<std::string, std::string>> RawMatchCacheEntries(
           {"num_images", std::to_string(images.size())},
           {"matching_strategy", MatchingStrategyName(options.matching_strategy)},
           {"overlap", std::to_string(options.overlap)},
+          {"quadratic_overlap", options.quadratic_overlap ? "1" : "0"},
           {"spatial_max_num_neighbors",
            std::to_string(options.spatial_max_num_neighbors)},
           {"spatial_max_distance", ToConfigValue(options.spatial_max_distance)},
@@ -130,7 +133,15 @@ std::vector<std::pair<std::string, std::string>> RawMatchCacheEntries(
            options.learned_matcher_model_path.lexically_normal().string()},
           {"min_cosine_similarity", ToConfigValue(options.min_cosine_similarity)},
           {"lightglue_min_score", ToConfigValue(options.lightglue_min_score)},
+          {"learned_execution_provider",
+           std::to_string(static_cast<int>(options.learned_execution_provider))},
+          {"learned_gpu_index", std::to_string(options.learned_gpu_index)},
+          {"learned_cuda_memory_limit_mb",
+           std::to_string(options.learned_cuda_memory_limit_mb)},
+          {"learned_use_io_binding",
+           options.learned_use_io_binding ? "1" : "0"},
           {"max_ratio", ToConfigValue(options.max_ratio)},
+          {"max_distance", ToConfigValue(options.max_distance)},
           {"mutual_check", options.mutual_check ? "1" : "0"}};
 }
 
@@ -139,6 +150,7 @@ std::vector<std::pair<std::string, std::string>> GeometryCacheEntries(
     const std::string& raw_match_hash) {
   return {{"stage", "geometry"},
           {"raw_match_hash", raw_match_hash},
+          {"two_view_geometry", SfmGeometryKey(options.two_view_geometry)},
           {"guided_matching", options.guided_matching ? "1" : "0"},
           {"guided_match_ratio", ToConfigValue(options.guided_match_ratio)},
           {"guided_min_inlier_gain",
@@ -146,9 +158,9 @@ std::vector<std::pair<std::string, std::string>> GeometryCacheEntries(
           {"keep_degenerate", "1"},
           {"algorithm_version",
            "five_point_adaptive_lo_ransac_consistent_tracks_v4"},
-          {"min_num_iterations", "100"},
-          {"max_num_iterations", "10000"},
-          {"confidence", "0.999"}};
+          {"min_num_iterations", std::to_string(options.two_view_geometry.min_num_iterations)},
+          {"max_num_iterations", std::to_string(options.two_view_geometry.max_num_iterations)},
+          {"confidence", SfmNumberKey(options.two_view_geometry.confidence)}};
 }
 
 std::optional<std::size_t> ReadCacheSizeValue(
@@ -172,9 +184,22 @@ std::optional<std::size_t> ReadCacheSizeValue(
 
 SequentialMatcherController::SequentialMatcherController(
     SequentialMatcherControllerOptions options)
-    : options_(std::move(options)) {}
+    : options_(std::move(options)) {
+  if (options_.matcher_type == FeatureMatcherType::kSiftBruteForce && options_.execution.use_gpu.has_value())
+    options_.matcher_backend = ResolveSfmMatchingBackend(options_.execution);
+  if (options_.matcher_type == FeatureMatcherType::kAlikedBruteForce && options_.execution.use_gpu.value_or(false))
+    throw std::invalid_argument("ALIKED_BRUTEFORCE currently supports FeatureMatching.use_gpu=0 only");
+  if (options_.execution.use_gpu.has_value()) options_.learned_execution_provider =
+      *options_.execution.use_gpu ? OnnxExecutionProvider::kCuda : OnnxExecutionProvider::kCpu;
+  options_.learned_gpu_index = std::max(0, options_.execution.gpu_index);
+}
 
 SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
+  struct ThreadScope {
+    int previous = parallel::getNumThreads();
+    explicit ThreadScope(int requested) { parallel::setNumThreads(requested); }
+    ~ThreadScope() { parallel::setNumThreads(previous); }
+  } threads(options_.execution.num_threads);
   SequentialMatcherControllerSummary summary;
   const std::vector<Camera> cameras =
       ReadWorkspaceCameras(options_.workspace_path);
@@ -195,7 +220,11 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
             << " guided_ratio=" << options_.guided_match_ratio;
 
   MatchGraph graph;
+  using Clock = std::chrono::steady_clock;
+  auto elapsed = [](Clock::time_point start) { return std::chrono::duration<double>(Clock::now() - start).count(); };
+  const auto load_start = Clock::now();
   ReadWorkspaceFeatureSets(options_.workspace_path, &graph);
+  summary.feature_loading_seconds = elapsed(load_start);
   if (options_.matching_strategy == MatchingStrategy::kTransitive) {
     ReadWorkspaceMatches(options_.workspace_path, &graph);
     ReadWorkspaceVerifiedGeometries(options_.workspace_path, &graph);
@@ -205,6 +234,7 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
   matching_options.backend = options_.matcher_backend;
   matching_options.matcher_type = options_.matcher_type;
   matching_options.max_ratio = options_.max_ratio;
+  matching_options.max_distance = options_.max_distance;
   matching_options.mutual_check = options_.mutual_check;
 
   const std::string feature_hash =
@@ -228,6 +258,7 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
   MatchingPairGeneratorOptions pair_options;
   pair_options.strategy = options_.matching_strategy;
   pair_options.sequential_overlap = options_.overlap;
+  pair_options.sequential_quadratic_overlap = options_.quadratic_overlap;
   pair_options.spatial_max_num_neighbors = options_.spatial_max_num_neighbors;
   pair_options.spatial_max_distance = options_.spatial_max_distance;
   pair_options.vocab_tree_num_images = options_.vocab_tree_num_images;
@@ -281,6 +312,7 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
         GenerateMatchingPairs(images, graph, pair_options,
                               &summary.pair_generation);
 
+    const auto prepare_start = Clock::now();
     std::map<ImageId, std::size_t> prepared_indices;
     std::vector<std::unique_ptr<PreparedFeatureMatcher>> prepared(images.size());
     for (std::size_t image_idx = 0; image_idx < images.size(); ++image_idx) {
@@ -303,6 +335,8 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
           });
     }
 
+    summary.descriptor_preparation_seconds = elapsed(prepare_start);
+    const auto match_start = Clock::now();
     std::vector<std::vector<FeatureMatch>> pair_matches(pairs.size());
     parallel::parallel_for_(
         parallel::Range(0, static_cast<int>(pairs.size())),
@@ -342,6 +376,13 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
                     static_cast<float>(options_.lightglue_min_score);
                 learned_options.num_threads =
                     options_.learned_matcher_num_threads;
+                learned_options.execution_provider =
+                    options_.learned_execution_provider;
+                learned_options.gpu_index = options_.learned_gpu_index;
+                learned_options.cuda_memory_limit_mb =
+                    options_.learned_cuda_memory_limit_mb;
+                learned_options.use_io_binding =
+                    options_.learned_use_io_binding;
                 const Camera& camera1 = cameras_by_image.at(pair.image_id1);
                 const Camera& camera2 = cameras_by_image.at(pair.image_id2);
                 pair_matches[static_cast<std::size_t>(pair_idx)] =
@@ -359,8 +400,11 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
       SetMatches(&graph, pair.image_id1, pair.image_id2,
                  pair_matches[pair_idx]);
     }
+    summary.descriptor_matching_seconds = elapsed(match_start);
     summary.num_pairs = pairs.size();
+    const auto raw_write_start = Clock::now();
     WriteWorkspaceMatches(options_.workspace_path, graph);
+    summary.workspace_write_seconds += elapsed(raw_write_start);
     WriteWorkspaceCacheMetadata(options_.workspace_path, "matches",
                                 raw_match_hash,
                                 {{"pairs", std::to_string(summary.num_pairs)},
@@ -377,6 +421,7 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
 
   TwoViewGeometryBatchOptions geometry_options;
   geometry_options.keep_degenerate = true;
+  geometry_options.geometry_options = options_.two_view_geometry;
   if (WorkspaceCacheIsValid(options_.workspace_path, "geometry",
                             geometry_hash)) {
     ReadWorkspaceVerifiedGeometries(options_.workspace_path, &graph);
@@ -400,22 +445,30 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
         read_guided_size("guided_improved_pairs");
     summary.geometry_cache_hit = true;
   } else {
+    const auto verify_start = Clock::now();
     VerifyMatchGraphGeometries(cameras_by_image, &graph, geometry_options);
+    summary.geometry_verification_seconds = elapsed(verify_start);
     if (options_.guided_matching) {
       WeakPairRematchingOptions guided_options;
       guided_options.nearby_image_window = 0;
       guided_options.min_inlier_gain = options_.guided_min_inlier_gain;
       guided_options.relaxed_matching = matching_options;
       guided_options.relaxed_matching.max_ratio = options_.guided_match_ratio;
-      guided_options.relaxed_matching.mutual_check = true;
+      guided_options.relaxed_matching.mutual_check = matching_options.mutual_check;
       guided_options.guided_matching.max_sampson_error_px =
           geometry_options.geometry_options.max_error_px;
       guided_options.verification = geometry_options.geometry_options;
+      const auto guided_start = Clock::now();
       summary.guided_matching =
           RematchWeakImagePairs(cameras_by_image, guided_options, &graph);
+      summary.guided_matching_seconds = elapsed(guided_start);
     }
+    const auto consistency_start = Clock::now();
     EnforceVerifiedMatchGraphConsistency(&graph);
+    summary.graph_consistency_seconds = elapsed(consistency_start);
+    const auto geometry_write_start = Clock::now();
     WriteWorkspaceVerifiedGeometries(options_.workspace_path, graph);
+    summary.workspace_write_seconds += elapsed(geometry_write_start);
 
     for (const auto& [pair, geometry] : graph.verified_geometries) {
       (void)pair;
@@ -443,6 +496,13 @@ SequentialMatcherControllerSummary SequentialMatcherController::Run() const {
       WorkspaceMatchesPath(options_.workspace_path));
   std::ofstream summary_file(WorkspaceMatchesPath(options_.workspace_path) /
                              "summary.txt");
+  summary_file << "feature_loading_seconds " << summary.feature_loading_seconds
+      << "\ndescriptor_preparation_seconds " << summary.descriptor_preparation_seconds
+      << "\ndescriptor_matching_seconds " << summary.descriptor_matching_seconds
+      << "\ngeometry_verification_seconds " << summary.geometry_verification_seconds
+      << "\nguided_matching_seconds " << summary.guided_matching_seconds
+      << "\ngraph_consistency_seconds " << summary.graph_consistency_seconds
+      << "\nworkspace_write_seconds " << summary.workspace_write_seconds << "\n";
   summary_file << "pairs " << summary.num_pairs << "\n"
                << "verified_pairs " << summary.num_verified_pairs << "\n"
                << "verified_inliers " << summary.num_verified_inliers

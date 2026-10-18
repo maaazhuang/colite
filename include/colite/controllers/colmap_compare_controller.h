@@ -3,12 +3,16 @@
 #include <cstddef>
 #include <filesystem>
 
+#include "colite/io/sfm_workspace.h"
+
 namespace colite::controllers {
 
 struct ColmapCompareControllerOptions {
   std::filesystem::path reference_path;
   std::filesystem::path candidate_path;
   std::filesystem::path output_path;
+  ColmapModelFormat reference_format = ColmapModelFormat::kAuto;
+  ColmapModelFormat candidate_format = ColmapModelFormat::kAuto;
 };
 
 struct ColmapCompareControllerSummary {

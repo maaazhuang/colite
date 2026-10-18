@@ -6,6 +6,8 @@
 
 namespace colite::exe {
 
+int RunModelConverter(const std::vector<std::string>&, std::ostream&, std::ostream&);
+
 int RunModelAnalyzer(const std::vector<std::string>&, std::ostream&, std::ostream&);
 int RunModelTransformer(const std::vector<std::string>&, std::ostream&, std::ostream&);
 int RunModelAligner(const std::vector<std::string>&, std::ostream&, std::ostream&);

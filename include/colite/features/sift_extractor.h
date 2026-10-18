@@ -26,18 +26,23 @@ enum class SiftBackend {
 
 const char* SiftBackendName(SiftBackend backend);
 SiftBackend SiftBackendFromName(std::string_view name);
-// 将 auto 解析为当前主机实际使用的后端；有可用 CUDA 设备时优先 CUDA OpenCV。
+// 将 auto 解析为当前主机实际使用的后端；有可用 CUDA 设备时优先 CUDA VLFeat。
 SiftBackend ResolveSiftBackend(SiftBackend requested);
 
 // SIFT 特征提取配置。
 struct SiftExtractionOptions {
   SiftBackend backend = SiftBackend::kAuto;
-  // 最终输出的特征数量上限。CudaSift 内部会使用更大的候选池，再按响应裁剪。
+  // 目标预算。VLFeat 模式保留完整尺度层和方向，最终数量可以超过预算；
+  // OpenCV 模式仍按响应保留固定数量。
   int max_num_features = 8192;
   int num_octave_layers = 3;
   double contrast_threshold = 0.04;
   double edge_threshold = 10.0;
   double sigma = 1.6;
+  // A negative value preserves backend-specific defaults for low-level callers.
+  double peak_threshold = -1.0;
+  // Non-positive preserves the input; CLI resolves COLMAP's automatic size.
+  int max_image_size = 0;
 
   // VLFeat/COLMAP CPU SIFT 专用参数。COLMAP 普通 CPU SIFT 默认固定 4 个
   // octave，并且每个 keypoint 最多保留 2 个方向。

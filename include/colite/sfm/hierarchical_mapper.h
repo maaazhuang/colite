@@ -35,6 +35,7 @@ struct HierarchicalMappingSummary {
   std::size_t num_successful_local_models = 0;
   std::size_t num_merged_local_models = 0;
   std::size_t num_parallel_local_mappings = 0;
+  std::size_t max_local_schema_num_images = 0;
   std::size_t num_model_graph_edges = 0;
   std::size_t num_unmerged_local_models = 0;
   std::size_t num_registered_images = 0;

@@ -181,6 +181,42 @@ TEST(IncrementalMapperTest,
   EXPECT_GT(reconstruction.Points3D().size(), num_points_before);
 }
 
+TEST(IncrementalMapperTest, FiltersSavedSeedEvenWithBundleAdjustmentDisabled) {
+  Reconstruction reconstruction;
+  const Camera camera = MakeCamera(1);
+  reconstruction.AddCamera(camera);
+  const auto points = MakeScenePoints();
+  for (ImageId id = 1; id <= 2; ++id) {
+    Image image = MakeImage(id, camera.id);
+    image.cam_from_world = CameraAt(Eigen::Vector3d(id - 1, 0, 0));
+    image.registered = true;
+    for (std::size_t idx = 0; idx < points.size(); ++idx) {
+      Point2D observation;
+      observation.xy = *ProjectWorldPoint(camera, *image.cam_from_world, points[idx]);
+      if (id == 2 && idx == 0) observation.xy.x() += 10.0;
+      image.points2d.push_back(observation);
+    }
+    reconstruction.AddImage(std::move(image));
+  }
+  for (std::size_t idx = 0; idx < points.size(); ++idx) {
+    Point3D point;
+    point.id = idx + 1;
+    point.xyz = points[idx];
+    point.track.elements = {{1, static_cast<Point2DIdx>(idx)},
+                            {2, static_cast<Point2DIdx>(idx)}};
+    reconstruction.AddPoint3D(std::move(point));
+  }
+  IncrementalMappingOptions options;
+  options.run_global_bundle_adjustment = false;
+  options.run_global_track_completion = false;
+  options.run_pose_guided_track_completion = false;
+  const auto summary = RunIncrementalMapping({}, options, &reconstruction);
+  ASSERT_TRUE(summary.success);
+  EXPECT_FALSE(reconstruction.ExistsPoint3D(1));
+  EXPECT_EQ(reconstruction.Points3D().size(), points.size() - 1);
+  EXPECT_GT(summary.global_observation_filter.num_removed_observations, 0U);
+}
+
 TEST(IncrementalMapperTest, RunsCompleteIncrementalMappingLoop) {
   const Camera camera = MakeCamera(1);
   const std::vector<Eigen::Vector3d> points = MakeScenePoints();

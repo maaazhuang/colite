@@ -20,6 +20,8 @@ enum class DescriptorMatcherBackend {
 };
 
 bool IsCudaDescriptorMatcherAvailable();
+// Select one GPU for subsequent batches in this process.
+void SetCudaDescriptorMatcherDevice(int device);
 
 struct DescriptorMatchingOptions {
   DescriptorMatcherBackend backend = DescriptorMatcherBackend::kBruteForce;

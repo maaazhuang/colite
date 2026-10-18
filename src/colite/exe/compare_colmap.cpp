@@ -20,8 +20,10 @@ void PrintHelp(const std::string_view executable, std::ostream& out) {
       << "  " << executable
       << " --reference_path <dir> --candidate_path <dir> --output_path <dir>\n\n"
       << "Options:\n"
-      << "  --reference_path <dir>  Reference COLMAP text model directory.\n"
-      << "  --candidate_path <dir>  Candidate COLMAP text model directory.\n"
+      << "  --reference_path <dir>  Reference COLMAP TXT/BIN model directory.\n"
+      << "  --candidate_path <dir>  Candidate COLMAP TXT/BIN model directory.\n"
+      << "  --reference_format auto|txt|bin  Reference format (default: auto).\n"
+      << "  --candidate_format auto|txt|bin  Candidate format (default: auto).\n"
       << "  --output_path <dir>     Directory for fixed TSV difference reports.\n";
 }
 
@@ -59,6 +61,10 @@ int RunCompareColmap(const std::vector<std::string>& args,
         options.candidate_path = RequireValue(args, &i, arg);
       } else if (arg == "--output_path") {
         options.output_path = RequireValue(args, &i, arg);
+      } else if (arg == "--reference_format") {
+        options.reference_format = ColmapModelFormatFromString(RequireValue(args, &i, arg));
+      } else if (arg == "--candidate_format") {
+        options.candidate_format = ColmapModelFormatFromString(RequireValue(args, &i, arg));
       } else {
         throw std::invalid_argument("Unknown argument: " + arg);
       }

@@ -627,9 +627,14 @@ GlobalBundleAdjustmentSummary AdjustGlobalBundle(
 
   ceres::Solver::Options solver_options;
   solver_options.max_num_iterations = options.max_num_iterations;
-  solver_options.linear_solver_type = ceres::SPARSE_SCHUR;
+  // COLMAP uses dense Schur for small camera systems. Sparse factorization
+  // overhead dominates here; retain sparse Schur for larger reconstructions.
+  solver_options.linear_solver_type = pose_blocks.size() <= 50
+                                         ? ceres::DENSE_SCHUR
+                                         : ceres::SPARSE_SCHUR;
   solver_options.minimizer_progress_to_stdout = false;
-  solver_options.num_threads = parallel::getNumThreads();
+  solver_options.num_threads = problem.NumResiduals() < 50000
+                                   ? 1 : parallel::getNumThreads();
 
   ceres::Solver::Summary solver_summary;
   ceres::Solve(solver_options, &problem, &solver_summary);
