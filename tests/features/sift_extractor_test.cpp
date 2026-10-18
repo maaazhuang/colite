@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <limits>
 #include <tuple>
+#include <map>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -170,7 +171,7 @@ TEST(SiftExtractorTest, CudaSiftBackendReportsAvailability) {
 
   if (IsCudaSiftAvailable()) {
     EXPECT_EQ(ResolveSiftBackend(SiftBackend::kAuto),
-              SiftBackend::kCudaSift);
+              SiftBackend::kCudaVlSift);
     for (const SiftBackend backend :
          {SiftBackend::kCudaSift, SiftBackend::kCudaVlSift}) {
       options.backend = backend;
@@ -184,7 +185,7 @@ TEST(SiftExtractorTest, CudaSiftBackendReportsAvailability) {
     }
   } else {
     options.backend = SiftBackend::kCudaSift;
-    EXPECT_EQ(ResolveSiftBackend(SiftBackend::kAuto), SiftBackend::kCvSift);
+    EXPECT_EQ(ResolveSiftBackend(SiftBackend::kAuto), SiftBackend::kVlSift);
     EXPECT_THROW(
         {
           try {
@@ -257,6 +258,50 @@ TEST(SiftExtractorTest, CudaSiftLimitsFeaturesByResponseRanking) {
     EXPECT_GE(keypoint.response, min_expected_response - 1e-5F);
     previous_response = keypoint.response;
   }
+}
+
+TEST(SiftExtractorTest, CudaVlFeatBudgetKeepsAllOrientationsOfSelectedBases) {
+  if (!IsCudaSiftAvailable()) GTEST_SKIP();
+  SiftExtractionOptions options;
+  options.backend = SiftBackend::kCudaVlSift;
+  options.max_num_features = 0;
+  options.max_num_orientations = 2;
+  const auto image = MakeDenseSyntheticImage();
+  const auto broad = ExtractSiftFeatures(image, options);
+  options.max_num_features = 16;
+  const auto limited = ExtractSiftFeatures(image, options);
+  using Base = std::tuple<float, float, float>;
+  std::map<Base, std::size_t> broad_counts, limited_counts;
+  for (const auto& point : broad.keypoints) ++broad_counts[{point.x, point.y, point.scale}];
+  for (const auto& point : limited.keypoints) ++limited_counts[{point.x, point.y, point.scale}];
+  EXPECT_GT(limited.keypoints.size(), 16U);
+  EXPECT_LT(limited.keypoints.size(), broad.keypoints.size());
+  for (const auto& entry : limited_counts) EXPECT_EQ(entry.second, broad_counts.at(entry.first));
+  options.max_num_features = 0;
+  options.max_num_orientations = 1;
+  const auto single_counts = ExtractSiftFeatures(image, options);
+  EXPECT_EQ(single_counts.keypoints.size(), broad_counts.size());
+}
+
+TEST(SiftExtractorTest, ResizePreservesOriginalPixelCoordinatesAndL2Norm) {
+  const auto image = MakeDenseSyntheticImage();
+  cv::Mat small;
+  cv::resize(image, small, cv::Size(image.cols / 2, image.rows / 2), 0, 0, cv::INTER_AREA);
+  SiftExtractionOptions options;
+  options.backend = SiftBackend::kVlSift;
+  options.use_root_sift = false;
+  const auto expected = ExtractSiftFeatures(small, options);
+  options.max_image_size = image.cols / 2;
+  const auto actual = ExtractSiftFeatures(image, options);
+  ASSERT_FALSE(actual.keypoints.empty());
+  ASSERT_EQ(actual.keypoints.size(), expected.keypoints.size());
+  for (std::size_t i = 0; i < actual.keypoints.size(); ++i) {
+    EXPECT_NEAR(actual.keypoints[i].x, expected.keypoints[i].x * 2, 1e-4);
+    EXPECT_NEAR(actual.keypoints[i].y, expected.keypoints[i].y * 2, 1e-4);
+    EXPECT_NEAR(actual.keypoints[i].scale, expected.keypoints[i].scale * 2, 1e-4);
+    EXPECT_NEAR(actual.descriptors.row(i).norm(), 1.0, 1e-5);
+  }
+  EXPECT_EQ(actual.descriptor_normalization, DescriptorNormalization::kL2);
 }
 
 }  // namespace

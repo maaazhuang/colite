@@ -27,14 +27,13 @@ struct ImageMetadata {
 
 ImageMetadata ReadImageMetadata(const std::filesystem::path& image_path,
                                 const SfmCameraSetupOptions& options) {
-  const cv::Mat image = ReadImageWithExifOrientation(image_path,
-                                                      cv::IMREAD_COLOR);
-  if (image.empty()) {
+  const cv::Size image_size = ReadImageSizeWithExifOrientation(image_path);
+  if (image_size.empty()) {
     throw std::runtime_error("Failed to read image: " + image_path.string());
   }
   ImageMetadata metadata;
-  metadata.width = static_cast<std::uint32_t>(image.cols);
-  metadata.height = static_cast<std::uint32_t>(image.rows);
+  metadata.width = static_cast<std::uint32_t>(image_size.width);
+  metadata.height = static_cast<std::uint32_t>(image_size.height);
   metadata.focal = EstimateInitialFocalLengthPriorFromImage(
       image_path, options.focal_length, options.default_focal_length_factor);
   metadata.exif = ReadExifCameraMetadata(image_path);

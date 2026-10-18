@@ -25,6 +25,7 @@ class DescriptorBuffer {
 };
 
 bool IsAvailable();
+void SetDevice(int device);
 std::unique_ptr<DescriptorBuffer> CreateBuffer(const std::uint8_t* descriptors,
                                                int rows,
                                                int columns,

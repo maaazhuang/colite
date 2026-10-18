@@ -51,6 +51,8 @@ class OnnxModel {
   std::vector<std::string> input_names_;
   std::vector<std::vector<std::int64_t>> input_shapes_;
   std::vector<std::string> output_names_;
+  std::vector<const char*> input_name_ptrs_;
+  std::vector<const char*> output_name_ptrs_;
   std::vector<std::vector<std::int64_t>> output_shapes_;
   OnnxExecutionProvider execution_provider_ = OnnxExecutionProvider::kCpu;
   bool use_io_binding_ = true;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
 #include <vector>
 
@@ -21,6 +22,8 @@ struct LightGlueMatchingOptions {
   int num_threads = 1;
   OnnxExecutionProvider execution_provider = OnnxExecutionProvider::kAuto;
   int gpu_index = 0;
+  std::size_t cuda_memory_limit_mb = 0;
+  bool use_io_binding = true;
 };
 
 std::vector<FeatureMatch> MatchAlikedDescriptors(

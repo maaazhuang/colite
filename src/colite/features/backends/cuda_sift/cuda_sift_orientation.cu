@@ -445,6 +445,11 @@ std::vector<OrientedKeypointSnapshot> AssignOrientations(
 
 }
 
+__global__ void LimitOrientationCountsKernel(int* counts, int count, int maximum) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) counts[index] = min(counts[index], maximum);
+}
+
 template <typename Traits>
 PipelineOrientedKeypoint* AssignOrientationsDevice(
     const float* deviceGaussian,
@@ -455,7 +460,7 @@ PipelineOrientedKeypoint* AssignOrientationsDevice(
     int keypointCount,
     int octave,
     int& outputCount,
-    size_t& temporaryBytes)
+    size_t& temporaryBytes, int maxOrientations)
 {
     outputCount = 0;
     temporaryBytes = 0;
@@ -497,6 +502,8 @@ PipelineOrientedKeypoint* AssignOrientationsDevice(
             deviceGaussian, inputs, sets, counts, keypointCount,
             width, height, gaussianLayers, octave);
         CheckCuda(cudaGetLastError(), "pipeline orientation histogram launch");
+        LimitOrientationCountsKernel<<<(keypointCount + 255) / 256, 256>>>(counts, keypointCount, maxOrientations);
+        CheckCuda(cudaGetLastError(), "pipeline orientation count limit");
         ExclusiveScan(counts, offsets, keypointCount);
         outputCount = ReadOutputCount(counts, offsets, keypointCount);
         if (outputCount > 0) {
@@ -522,9 +529,9 @@ PipelineOrientedKeypoint* AssignOrientationsDevice(
 }
 
 template PipelineOrientedKeypoint* AssignOrientationsDevice<OpenCvModeTraits>(
-    const float*, int, int, int, const PipelineRefinedKeypoint*, int, int, int&, size_t&);
+    const float*, int, int, int, const PipelineRefinedKeypoint*, int, int, int&, size_t&, int);
 template PipelineOrientedKeypoint* AssignOrientationsDevice<VlFeatModeTraits>(
-    const float*, int, int, int, const PipelineRefinedKeypoint*, int, int, int&, size_t&);
+    const float*, int, int, int, const PipelineRefinedKeypoint*, int, int, int&, size_t&, int);
 
 std::vector<OrientedKeypointSnapshot> AssignOrientationsForTest(
     CudaSiftMode mode,

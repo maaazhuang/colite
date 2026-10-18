@@ -12,7 +12,9 @@
 #include <glog/logging.h>
 
 #include "colite/controllers/recon_sfm_controller.h"
+#include "colite/core/geometry.h"
 #include "colite/io/sfm_workspace.h"
+#include "colite/controllers/sfm_options.h"
 #include "colite/sfm/incremental_mapper.h"
 #include "colite/sfm/reconstruction_manager.h"
 #include "colite/sfm/similarity_transform.h"
@@ -32,10 +34,10 @@ std::string CurrentStageHash(const std::filesystem::path& workspace_path,
 }
 
 std::string MapperConfigHash(const MapperControllerOptions& options) {
-  return StableConfigHash(
+  std::vector<std::pair<std::string, std::string>> entries =
       {{"stage", "sparse"},
        {"geometry_hash", CurrentStageHash(options.workspace_path, "geometry")},
-       {"algorithm_version", "multimodel_resume_sim3_v22_dense_adjacency"},
+       {"algorithm_version", "multimodel_colmap4_defaults_v29"},
        {"output_model_format",
         ColmapModelFormatToString(options.output_model_format)},
        {"multiple_models", options.multiple_models ? "1" : "0"},
@@ -58,14 +60,17 @@ std::string MapperConfigHash(const MapperControllerOptions& options) {
                CameraParameterGroup::kDistortion)
             ? "1"
             : "0"},
-       {"min_pair_median_triangulation_angle_deg", "1"},
-       {"local_retriangulation_min_angle_deg", "1"},
+       {"min_pair_median_triangulation_angle_deg", "0"},
+       {"local_retriangulation_min_angle_deg", "1.5"},
        {"use_position_priors", options.use_position_priors ? "1" : "0"},
-       {"position_prior_stddev", std::to_string(options.position_prior_stddev)},
+       {"position_prior_stddev", SfmNumberKey(options.position_prior_stddev)},
        {"position_prior_loss_scale",
-        std::to_string(options.position_prior_loss_scale)},
+        SfmNumberKey(options.position_prior_loss_scale)},
        {"position_prior_alignment_max_error",
-        std::to_string(options.position_prior_alignment_max_error)}});
+        SfmNumberKey(options.position_prior_alignment_max_error)}};
+  for (const auto& [name, value] : options.mapper_options) entries.emplace_back(name, value);
+  for (const auto& name : options.ba_refine_camera_param_names) entries.emplace_back("ba_param_" + name, "1");
+  return StableConfigHash(entries);
 }
 
 std::optional<MapperControllerSummary> ReadCachedMapperSummary(
@@ -170,11 +175,11 @@ MapperControllerSummary MapperController::Run() const {
                                       options_.input_model_format);
   }
 
-  IncrementalMappingOptions mapping_options;
+  IncrementalMappingOptions mapping_options = ColmapSfmMappingDefaults();
   mapping_options.mapper.triangulation.min_pair_median_triangulation_angle_deg =
-      1.0;
+      0.0;
   mapping_options.mapper.local_retriangulation_filter
-      .min_triangulation_angle_deg = 1.0;
+      .min_triangulation_angle_deg = 1.5;
   mapping_options.mapper.local_bundle_adjustment.refine_camera_params =
       options_.ba_refine_camera_params;
   mapping_options.mapper.local_bundle_adjustment.refine_camera_param_names =
@@ -183,12 +188,13 @@ MapperControllerSummary MapperController::Run() const {
       options_.ba_refine_camera_params;
   mapping_options.global_bundle_adjustment.refine_camera_param_names =
       options_.ba_refine_camera_param_names;
+  ApplySfmMapperOptions(options_.mapper_options, &mapping_options);
   MultiModelMappingOptions multi_options;
   multi_options.mapping = mapping_options;
   multi_options.max_num_models =
       options_.multiple_models ? options_.max_num_models : 1;
   multi_options.min_num_images_per_model =
-      options_.min_num_images_per_model;
+      std::min(options_.min_num_images_per_model, images.size());
   multi_options.merge_models = options_.merge_models;
   MultiModelMappingResult result = RunIncrementalMappingMultiple(
       graph, multi_options, std::move(reconstruction));
@@ -232,6 +238,7 @@ MapperControllerSummary MapperController::Run() const {
   }
   for (Reconstruction& model : result.models) {
     ExtractPointColors(&model);
+    UpdatePoint3DReprojectionErrors(&model);
   }
   Reconstruction& primary = result.models[order.front()];
   const IncrementalMappingSummary& mapping_summary =

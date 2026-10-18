@@ -57,37 +57,93 @@ TEST(ReconSfmExeTest, PrintsHelp) {
 
   EXPECT_EQ(exit_code, 0);
   EXPECT_NE(out.str().find("Usage:"), std::string::npos);
-  EXPECT_NE(out.str().find("--feature_extractor"), std::string::npos);
-  EXPECT_NE(out.str().find("--feature_type"), std::string::npos);
-  EXPECT_NE(out.str().find("--aliked_max_image_size"), std::string::npos);
-  EXPECT_NE(out.str().find("--learned_cuda_memory_limit_mb"),
+  EXPECT_NE(out.str().find("--Colite.feature_extractor"), std::string::npos);
+  EXPECT_NE(out.str().find("--FeatureExtraction.type"), std::string::npos);
+  EXPECT_NE(out.str().find("--FeatureExtraction.max_image_size"), std::string::npos);
+  EXPECT_NE(out.str().find("--Colite.learned_cuda_memory_limit_mb"),
             std::string::npos);
-  EXPECT_NE(out.str().find("--hierarchical_num_workers"), std::string::npos);
-  EXPECT_NE(out.str().find("aliked_lightglue"), std::string::npos);
-  EXPECT_NE(out.str().find("--learned_device"), std::string::npos);
-  EXPECT_NE(out.str().find("--learned_gpu_index"), std::string::npos);
-  EXPECT_NE(out.str().find("--mapper"), std::string::npos);
+  EXPECT_NE(out.str().find("--Colite.hierarchical_num_workers"), std::string::npos);
+  EXPECT_NE(out.str().find("ALIKED_LIGHTGLUE"), std::string::npos);
+  EXPECT_NE(out.str().find("--FeatureMatching.use_gpu"), std::string::npos);
+  EXPECT_NE(out.str().find("--FeatureMatching.gpu_index"), std::string::npos);
+  EXPECT_NE(out.str().find("--Colite.mapper"), std::string::npos);
   EXPECT_NE(out.str().find("hierarchical"), std::string::npos);
-  EXPECT_NE(out.str().find("--feature_num_threads"), std::string::npos);
-  EXPECT_NE(out.str().find("--camera_mode"), std::string::npos);
-  EXPECT_NE(out.str().find("--camera_model"), std::string::npos);
-  EXPECT_NE(out.str().find("--camera_params"), std::string::npos);
-  EXPECT_NE(out.str().find("--default_focal_length_factor"),
+  EXPECT_NE(out.str().find("--FeatureExtraction.num_threads"), std::string::npos);
+  EXPECT_NE(out.str().find("--ImageReader.single_camera"), std::string::npos);
+  EXPECT_NE(out.str().find("--ImageReader.camera_model"), std::string::npos);
+  EXPECT_NE(out.str().find("--ImageReader.camera_params"), std::string::npos);
+  EXPECT_NE(out.str().find("--ImageReader.default_focal_length_factor"),
             std::string::npos);
-  EXPECT_NE(out.str().find("--ba_refine_focal_length"), std::string::npos);
-  EXPECT_NE(out.str().find("--ba_refine_principal_point"), std::string::npos);
-  EXPECT_NE(out.str().find("--ba_refine_extra_params"), std::string::npos);
-  EXPECT_NE(out.str().find("--ba_refine_params"), std::string::npos);
-  EXPECT_NE(out.str().find("--max_registration_trials_per_image"),
+  EXPECT_NE(out.str().find("--Mapper.ba_refine_focal_length"), std::string::npos);
+  EXPECT_NE(out.str().find("--Mapper.ba_refine_principal_point"), std::string::npos);
+  EXPECT_NE(out.str().find("--Mapper.ba_refine_extra_params"), std::string::npos);
+  EXPECT_EQ(out.str().find("--ba_refine_params"), std::string::npos);
+  EXPECT_NE(out.str().find("--Mapper.max_reg_trials"),
             std::string::npos);
-  EXPECT_NE(out.str().find("--max_initialization_trials"), std::string::npos);
-  EXPECT_NE(out.str().find("--registration_retry_error_multiplier"),
+  EXPECT_NE(out.str().find("--Mapper.init_num_trials"), std::string::npos);
+  EXPECT_NE(out.str().find("--Colite.registration_retry_error_multiplier"),
             std::string::npos);
-  EXPECT_NE(out.str().find("--registration_retry_max_error"),
+  EXPECT_NE(out.str().find("--Colite.registration_retry_max_error"),
             std::string::npos);
   EXPECT_NE(out.str().find("cuda_opencv"), std::string::npos);
   EXPECT_NE(out.str().find("cuda_vlfeat"), std::string::npos);
   EXPECT_TRUE(err.str().empty());
+}
+
+TEST(ReconSfmExeTest, CacheInvalidationFollowsStageDependencies) {
+  controllers::ReconSfmControllerOptions options;
+  const auto baseline = controllers::BuildReconSfmCacheIdentity(options, {});
+  options.aliked_max_image_size = 800;
+  const auto resized = controllers::BuildReconSfmCacheIdentity(options, {});
+  EXPECT_NE(resized.features, baseline.features);
+  EXPECT_NE(resized.frontend, baseline.frontend);
+  EXPECT_NE(resized.sparse, baseline.sparse);
+
+  options = {};
+  options.ba_refine_camera_param_names = {"f"};
+  const auto refined = controllers::BuildReconSfmCacheIdentity(options, {});
+  EXPECT_EQ(refined.features, baseline.features);
+  EXPECT_EQ(refined.frontend, baseline.frontend);
+  EXPECT_NE(refined.sparse, baseline.sparse);
+
+  options = {};
+  options.registration_retry_reprojection_error_multiplier = 2.0;
+  const auto retry = controllers::BuildReconSfmCacheIdentity(options, {});
+  EXPECT_EQ(retry.frontend, baseline.frontend);
+  EXPECT_NE(retry.sparse, baseline.sparse);
+  options = {};
+  options.registration_retry_max_reprojection_error_px = 6.0;
+  EXPECT_NE(controllers::BuildReconSfmCacheIdentity(options, {}).sparse, baseline.sparse);
+
+  options = {};
+  options.guided_match_ratio += 1e-8;
+  const auto fine_tuning = controllers::BuildReconSfmCacheIdentity(options, {});
+  EXPECT_EQ(fine_tuning.features, baseline.features);
+  EXPECT_NE(fine_tuning.frontend, baseline.frontend);
+  EXPECT_NE(fine_tuning.sparse, baseline.sparse);
+
+  options = {};
+  options.resume = true;
+  options.output_path = "another_output";
+  options.feature_num_threads = 2;
+  EXPECT_EQ(controllers::BuildReconSfmCacheIdentity(options, {}).sparse, baseline.sparse);
+  options = {};
+  options.two_view_geometry.max_error_px += 1e-8;
+  const auto geometry = controllers::BuildReconSfmCacheIdentity(options, {});
+  EXPECT_EQ(geometry.features, baseline.features);
+  EXPECT_NE(geometry.frontend, baseline.frontend);
+  EXPECT_NE(geometry.sparse, baseline.sparse);
+  options = {};
+  options.max_distance += 1e-8;
+  EXPECT_NE(controllers::BuildReconSfmCacheIdentity(options, {}).frontend, baseline.frontend);
+  options = {};
+  options.guided_matching = true;
+  EXPECT_NE(controllers::BuildReconSfmCacheIdentity(options, {}).frontend, baseline.frontend);
+  options = {};
+  options.mapper_options["--Mapper.tri_min_angle"] = "2.0";
+  const auto triangulation = controllers::BuildReconSfmCacheIdentity(options, {});
+  EXPECT_EQ(triangulation.frontend, baseline.frontend);
+  EXPECT_NE(triangulation.sparse, baseline.sparse);
 }
 
 TEST(ReconSfmExeTest, PrintsHelpThroughExeLayer) {
@@ -133,11 +189,11 @@ TEST(ReconSfmExeTest, RejectsInvalidRegistrationTrialLimit) {
 
   const int exit_code = exe::RunReconSfm(
       {"recon_sfm", "--image_path", "images", "--output_path", "out",
-       "--max_registration_trials_per_image", "0"},
+       "--Mapper.max_reg_trials", "0"},
       out, err);
 
   EXPECT_NE(exit_code, 0);
-  EXPECT_NE(err.str().find("--max_registration_trials_per_image"),
+  EXPECT_NE(err.str().find("--Mapper.max_reg_trials"),
             std::string::npos);
 }
 
@@ -146,8 +202,8 @@ TEST(ReconSfmExeTest, RejectsIncompatibleLearnedFrontendTypes) {
   std::ostringstream err;
   const int exit_code = exe::RunReconSfm(
       {"recon_sfm", "--image_path", "images", "--output_path", "out",
-       "--feature_type", "aliked_n16rot", "--aliked_model_path", "a.onnx",
-       "--matcher", "sift_lightglue", "--learned_matcher_model_path",
+       "--FeatureExtraction.type", "aliked_n16rot", "--AlikedExtraction.n16rot_model_path", "a.onnx",
+       "--FeatureMatching.type", "SIFT_LIGHTGLUE", "--SiftMatching.lightglue_model_path",
        "lightglue.onnx"},
       out, err);
   EXPECT_NE(exit_code, 0);
@@ -159,19 +215,19 @@ TEST(ReconSfmExeTest, RejectsInvalidLearnedDeviceOptions) {
   std::ostringstream err;
   int exit_code = exe::RunReconSfm(
       {"recon_sfm", "--image_path", "images", "--output_path", "out",
-       "--learned_device", "tensor_core"},
+       "--FeatureMatching.use_gpu", "tensor_core"},
       out, err);
   EXPECT_NE(exit_code, 0);
-  EXPECT_NE(err.str().find("Unsupported learned device"), std::string::npos);
+  EXPECT_NE(err.str().find("Expected 0/1"), std::string::npos);
 
   out.str("");
   err.str("");
   exit_code = exe::RunReconSfm(
       {"recon_sfm", "--image_path", "images", "--output_path", "out",
-       "--learned_gpu_index", "-1"},
+       "--FeatureMatching.gpu_index", "-2"},
       out, err);
   EXPECT_NE(exit_code, 0);
-  EXPECT_NE(err.str().find("--learned_gpu_index"), std::string::npos);
+  EXPECT_NE(err.str().find("--FeatureMatching.gpu_index"), std::string::npos);
 }
 
 TEST(ReconSfmExeTest, RejectsUnknownMapperType) {
@@ -179,7 +235,7 @@ TEST(ReconSfmExeTest, RejectsUnknownMapperType) {
   std::ostringstream err;
   const int exit_code = exe::RunReconSfm(
       {"recon_sfm", "--image_path", "images", "--output_path", "out",
-       "--mapper", "unknown"},
+       "--Colite.mapper", "unknown"},
       out, err);
   EXPECT_NE(exit_code, 0);
   EXPECT_NE(err.str().find("Unsupported mapper"), std::string::npos);
@@ -190,8 +246,8 @@ TEST(ReconSfmExeTest, RejectsInvalidHierarchicalClusterLimits) {
   std::ostringstream err;
   const int exit_code = exe::RunReconSfm(
       {"recon_sfm", "--image_path", "images", "--output_path", "out",
-       "--mapper", "hierarchical", "--hierarchical_target_cluster_size",
-       "10", "--hierarchical_max_cluster_size", "5"},
+       "--Colite.mapper", "hierarchical", "--Colite.hierarchical_target_cluster_size",
+       "10", "--Colite.hierarchical_max_cluster_size", "5"},
       out, err);
   EXPECT_NE(exit_code, 0);
   EXPECT_NE(err.str().find("cluster size"), std::string::npos);
@@ -203,11 +259,11 @@ TEST(ReconSfmExeTest, RejectsInvalidRegistrationRetryOptions) {
 
   const int exit_code = exe::RunReconSfm(
       {"recon_sfm", "--image_path", "images", "--output_path", "out",
-       "--registration_retry_error_multiplier", "0.5"},
+       "--Colite.registration_retry_error_multiplier", "0.5"},
       out, err);
 
   EXPECT_NE(exit_code, 0);
-  EXPECT_NE(err.str().find("--registration_retry_error_multiplier"),
+  EXPECT_NE(err.str().find("--Colite.registration_retry_error_multiplier"),
             std::string::npos);
 }
 

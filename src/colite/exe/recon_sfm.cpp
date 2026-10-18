@@ -11,6 +11,7 @@
 
 #include "colite/controllers/recon_sfm_controller.h"
 #include "colite/core/version.h"
+#include "colite/exe/sfm_options.h"
 #include "colite/features/sift_extractor.h"
 
 namespace colite::exe {
@@ -26,96 +27,86 @@ void PrintHelp(std::string_view executable, std::ostream& out) {
       << " --image_path <dir> --output_path <dir> [options]\n"
       << "\n"
       << "Options:\n"
-      << "  --focal_length <px>       Initial focal length. If omitted, use "
-         "JPEG EXIF 35mm/focal-plane prior when available, otherwise "
-         "1.2 * max(width, height); EXIF values are marked as priors.\n"
-      << "  --camera_model <name>     Camera model, default SIMPLE_RADIAL.\n"
-      << "  --camera_params <csv>     Explicit parameters in model order.\n"
-      << "  --camera_mode <auto|single|per_folder|per_image>\n"
-         "                            Default auto groups complete EXIF camera "
-         "identities; shared/individual are compatibility aliases.\n"
-      << "  --default_focal_length_factor <f>\n"
+      << "  --ImageReader.camera_model <name>     Camera model, default SIMPLE_RADIAL.\n"
+      << "  --ImageReader.camera_params <csv>     Explicit parameters in model order.\n"
+      << "  --ImageReader.default_focal_length_factor <f>\n"
          "                            Missing-EXIF focal factor, default 1.2.\n"
-      << "  --max_num_features <n>   SIFT feature limit, default 4096.\n"
-      << "  --feature_num_threads <n>\n"
+      << "  --SiftExtraction.max_num_features <n>   SIFT feature limit, default 8192.\n"
+      << "  --FeatureExtraction.num_threads <n>\n"
          "                            CPU feature extraction threads, default -1 "
          "uses hardware concurrency.\n"
-      << "  --feature_extractor <auto|vlsift|cvsift|cuda_opencv|cuda_vlfeat>\n"
-         "                            Default auto prefers CUDA OpenCV and "
-         "falls back to CPU OpenCV.\n"
-      << "  --feature_type <sift|aliked_n16rot|aliked_n32>\n"
+      << "  --Colite.feature_extractor <auto|vlsift|cvsift|cuda_opencv|cuda_vlfeat>\n"
+         "                            Default auto prefers CUDA VLFeat and "
+         "falls back to CPU VLFeat.\n"
+      << "  --FeatureExtraction.type <sift|aliked_n16rot|aliked_n32>\n"
          "                            Feature family, default sift.\n"
-      << "  --aliked_model_path <file> Required for ALIKED extraction.\n"
-      << "  --aliked_min_score <v>    ALIKED score threshold, default 0.2.\n"
-      << "  --matcher <bf|flann|cuda|aliked_bf|sift_lightglue|aliked_lightglue>\n"
-         "                            Matcher, default flann.\n"
-      << "  --learned_matcher_model_path <file> Required for LightGlue.\n"
-      << "  --min_cosine_similarity <v> ALIKED BF threshold, default 0.85.\n"
-      << "  --lightglue_min_score <v> LightGlue threshold, default 0.1.\n"
-      << "  --aliked_max_image_size <px> Longest inference edge; 0 disables resizing, default 1600.\n"
-      << "  --learned_matcher_num_threads <n> ONNX threads, default 1.\n"
-      << "  --learned_device <auto|cpu|cuda> ONNX provider, default auto.\n"
-      << "  --learned_gpu_index <n> CUDA device for learned models, default 0.\n"
-      << "  --mapper <incremental|global|hierarchical> SfM mapper, default incremental.\n"
-      << "  --hierarchical_target_cluster_size <n> Core images per cluster, default 100.\n"
-      << "  --hierarchical_max_cluster_size <n> Core plus overlap, default 150.\n"
-      << "  --hierarchical_overlap <n> Boundary images per cluster, default 10.\n"
-      << "  --learned_cuda_memory_limit_mb <n> CUDA arena limit, default 8192.\n"
-      << "  --nearby_match_window <n>\n"
+      << "  --AlikedExtraction.n16rot_model_path <file> Required for ALIKED extraction.\n"
+      << "  --AlikedExtraction.min_score <v>    ALIKED score threshold, default 0.2.\n"
+      << "  --SiftMatching.lightglue_model_path <file> Required for LightGlue.\n"
+      << "  --AlikedMatching.brute_force_min_cossim <v> ALIKED BF threshold, default 0.85.\n"
+      << "  --SiftMatching.lightglue_min_score <v> LightGlue threshold, default 0.1.\n"
+      << "  --Colite.mapper <incremental|global|hierarchical> SfM mapper, default incremental.\n"
+      << "  --Colite.hierarchical_target_cluster_size <n> Core images per cluster, default 100.\n"
+      << "  --Colite.hierarchical_max_cluster_size <n> Core plus overlap, default 150.\n"
+      << "  --Colite.hierarchical_overlap <n> Boundary images per cluster, default 10.\n"
+      << "  --Colite.learned_cuda_memory_limit_mb <n> CUDA arena limit, default 8192.\n"
+      << "  --Colite.nearby_match_window <n>\n"
          "                            Relax and re-match neighboring image pairs "
          "within this file-order window, default 0 disables it.\n"
-      << "  --hierarchical_num_workers <n> Local mapper workers; 0 auto, default 0.\n"
-      << "  --nearby_match_ratio <r> Relaxed Lowe ratio for neighboring pairs, "
+      << "  --Colite.hierarchical_num_workers <n> Local mapper workers; 0 auto, default 0.\n"
+      << "  --Colite.nearby_match_ratio <r> Relaxed Lowe ratio for neighboring pairs, "
          "default 0.8.\n"
-      << "  --guided_match_ratio <r> Lowe ratio for geometry-guided matching, "
-         "default 0.95; use 0.8 for COLMAP High same-descriptor studies.\n"
-      << "  --max_registration_trials_per_image <n>\n"
+      << "  --Colite.guided_match_ratio <r> Lowe ratio for geometry-guided matching, "
+         "default 0.8; use 0.8 for COLMAP High same-descriptor studies.\n"
+      << "  --SiftMatching.max_ratio <r> Initial Lowe ratio, default 0.8.\n"
+      << "  --SiftMatching.max_distance <d> Descriptor distance, default 0.7.\n"
+      << "  --SiftMatching.cross_check <0|1> Mutual descriptor check, default 1.\n"
+      << "  --FeatureMatching.guided_matching <0|1> Guided re-search, default 0.\n"
+      << "  --Mapper.max_reg_trials <n>\n"
          "                            Maximum registration attempts per image, "
          "default 3.\n"
-      << "  --max_initialization_trials <n>\n"
+      << "  --Mapper.init_num_trials <n>\n"
          "                            Maximum initial image-pair candidates to "
          "try, default 3.\n"
-      << "  --structureless_registration <0|1>\n"
+      << "  --Mapper.structure_less_registration_fallback <0|1>\n"
          "                            Use verified multi-neighbor relative-pose "
          "fallback after PnP failure, default 0.\n"
-      << "  --input_model_path <dir> Continue from an existing COLMAP model.\n"
-      << "  --input_format <auto|txt|bin>\n"
+      << "  --input_path <dir> Continue from an existing COLMAP model.\n"
+      << "  --Colite.input_format <auto|txt|bin>\n"
          "                            Input model format, default auto.\n"
-      << "  --output_format <txt|bin|both>\n"
+      << "  --Colite.output_format <txt|bin|both>\n"
          "                            Sparse model format, default both.\n"
       << "  --resume                  Reuse valid feature/frontend/sparse stages.\n"
       << "  --force                   Recompute all SfM stages.\n"
-      << "  --multiple_models <0|1>  Reconstruct remaining components, default 1.\n"
-      << "  --merge_models <0|1>     Merge Sim(3)-alignable models, default 1.\n"
-      << "  --max_num_models <n>     Maximum sparse models, default 50.\n"
-      << "  --min_model_size <n>     Minimum registered images per model, default 2.\n"
-      << "  --registration_retry_error_multiplier <r>\n"
+      << "  --Mapper.multiple_models <0|1>  Reconstruct remaining components, default 1.\n"
+      << "  --Colite.merge_models <0|1>     Merge Sim(3)-alignable models, default 1.\n"
+      << "  --Mapper.max_num_models <n>     Maximum sparse models, default 50.\n"
+      << "  --Mapper.min_model_size <n>     Minimum registered images per model, default 2.\n"
+      << "  --Colite.registration_retry_error_multiplier <r>\n"
          "                            PnP reprojection threshold multiplier per "
          "failed retry, default 1.5.\n"
-      << "  --registration_retry_max_error <px>\n"
+      << "  --Colite.registration_retry_max_error <px>\n"
          "                            Maximum relaxed PnP reprojection "
          "threshold, default 8.\n"
-      << "  --ba_refine_focal_length <0|1>\n"
+      << "  --Mapper.ba_refine_focal_length <0|1>\n"
          "                            Refine focal length in local/global BA, "
          "default 1.\n"
-      << "  --ba_refine_principal_point <0|1>\n"
+      << "  --Mapper.ba_refine_principal_point <0|1>\n"
          "                            Refine principal point in local/global BA, "
          "default 0.\n"
-      << "  --ba_refine_extra_params <0|1>\n"
+      << "  --Mapper.ba_refine_extra_params <0|1>\n"
          "                            Refine distortion/extra camera params in "
          "local/global BA, default 1.\n"
-      << "  --ba_refine_params <names>\n"
-         "                            Comma-separated camera params to refine, "
-         "e.g. fx,fy,k1,p2.\n"
-      << "  --use_position_priors <0|1>\n"
+      << "  --Colite.use_position_priors <0|1>\n"
          "                            Read EXIF GPS, align the model and add "
          "position residuals to final BA; default 0.\n"
-      << "  --position_prior_stddev <m>\n"
+      << "  --Colite.position_prior_stddev <m>\n"
          "                            Position prior standard deviation, default 5.\n"
-      << "  --position_prior_loss_scale <m>\n"
+      << "  --Colite.position_prior_loss_scale <m>\n"
          "                            Huber loss scale, default 2.\n"
-      << "  --position_prior_alignment_max_error <m>\n"
+      << "  --Colite.position_prior_alignment_max_error <m>\n"
          "                            Alignment inlier threshold, default 20.\n";
+  PrintSfmOptionsHelp(out, SfmOptionScope::kPipeline);
 }
 
 std::string RequireValue(const std::vector<std::string>& args,
@@ -138,29 +129,10 @@ bool ParseBoolFlagValue(const std::string& value, std::string_view flag) {
   throw std::invalid_argument("Expected 0/1 for " + std::string(flag));
 }
 
-std::set<std::string> ParseCommaSeparatedNames(const std::string& value,
-                                               std::string_view flag) {
-  std::set<std::string> names;
-  std::size_t start = 0;
-  while (start <= value.size()) {
-    const std::size_t comma = value.find(',', start);
-    const std::size_t end =
-        comma == std::string::npos ? value.size() : comma;
-    const std::string name = value.substr(start, end - start);
-    if (name.empty()) {
-      throw std::invalid_argument("Empty name in " + std::string(flag));
-    }
-    names.insert(name);
-    if (comma == std::string::npos) {
-      break;
-    }
-    start = comma + 1;
-  }
-  return names;
-}
-
-ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
+ReconSfmCliOptions ParseOptions(const std::vector<std::string>& raw_args) {
+  const auto args = NormalizeSfmArguments(raw_args, SfmOptionScope::kPipeline);
   ReconSfmCliOptions options;
+  bool max_num_features_supplied = false;
   if (args.size() <= 1) {
     options.show_help = true;
     return options;
@@ -168,7 +140,11 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
 
   for (std::size_t i = 1; i < args.size(); ++i) {
     const std::string& arg = args[i];
-    if (arg == "--help" || arg == "-h") {
+    if (arg.rfind("--", 0) == 0 && i + 1 < args.size() &&
+        (ApplySfmFeatureExecutionOption(arg, args[i + 1], &options.feature_execution) ||
+         ApplySfmMatchingExecutionOption(arg, args[i + 1], &options.matching_execution))) {
+      ++i;
+    } else if (arg == "--help" || arg == "-h") {
       options.show_help = true;
     } else if (arg == "--version") {
       options.show_version = true;
@@ -180,46 +156,45 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
       options.image_path = RequireValue(args, &i, arg);
     } else if (arg == "--output_path") {
       options.output_path = RequireValue(args, &i, arg);
-    } else if (arg == "--input_model_path") {
+    } else if (arg == "--input_path") {
       options.input_model_path = RequireValue(args, &i, arg);
-    } else if (arg == "--input_format") {
+    } else if (arg == "--Colite.input_format") {
       options.input_model_format =
           ColmapModelFormatFromString(RequireValue(args, &i, arg));
       if (options.input_model_format == ColmapModelFormat::kTextAndBinary) {
-        throw std::invalid_argument("--input_format does not accept both");
+        throw std::invalid_argument("--Colite.input_format does not accept both");
       }
-    } else if (arg == "--output_format") {
+    } else if (arg == "--Colite.output_format") {
       options.output_model_format =
           ColmapModelFormatFromString(RequireValue(args, &i, arg));
       if (options.output_model_format == ColmapModelFormat::kAuto) {
-        throw std::invalid_argument("--output_format does not accept auto");
+        throw std::invalid_argument("--Colite.output_format does not accept auto");
       }
-    } else if (arg == "--focal_length") {
-      options.focal_length = std::stod(RequireValue(args, &i, arg));
-    } else if (arg == "--camera_model") {
+    } else if (arg == "--ImageReader.camera_model") {
       options.camera_model_id =
           CameraModelNameToId(RequireValue(args, &i, arg));
       if (!ExistsCameraModel(options.camera_model_id)) {
         throw std::invalid_argument("Unsupported camera model");
       }
-    } else if (arg == "--camera_params") {
+    } else if (arg == "--ImageReader.camera_params") {
       options.camera_params =
           controllers::ParseCameraParams(RequireValue(args, &i, arg));
-    } else if (arg == "--camera_mode") {
-      options.camera_sharing_mode =
-          controllers::CameraSharingModeFromName(
-              RequireValue(args, &i, arg));
-    } else if (arg == "--default_focal_length_factor") {
+    } else if (arg == "--ImageReader.single_camera" ||
+                 arg == "--ImageReader.single_camera_per_folder" ||
+                 arg == "--ImageReader.single_camera_per_image") {
+      ApplySfmCameraSharingFlag(arg, RequireValue(args, &i, arg), &options.camera_sharing_mode);
+    } else if (arg == "--ImageReader.default_focal_length_factor") {
       options.default_focal_length_factor =
-          std::stod(RequireValue(args, &i, arg));
-    } else if (arg == "--max_num_features") {
-      options.max_num_features = std::stoi(RequireValue(args, &i, arg));
-    } else if (arg == "--feature_num_threads") {
-      options.feature_num_threads = std::stoi(RequireValue(args, &i, arg));
-    } else if (arg == "--feature_extractor") {
+          controllers::SfmDouble(RequireValue(args, &i, arg));
+    } else if (arg == "--SiftExtraction.max_num_features" || arg == "--AlikedExtraction.max_num_features") {
+      options.max_num_features = controllers::SfmInt(RequireValue(args, &i, arg));
+      max_num_features_supplied = true;
+    } else if (arg == "--FeatureExtraction.num_threads") {
+      options.feature_num_threads = controllers::SfmInt(RequireValue(args, &i, arg));
+    } else if (arg == "--Colite.feature_extractor") {
       options.feature_backend =
           SiftBackendFromName(RequireValue(args, &i, arg));
-    } else if (arg == "--feature_type") {
+    } else if (arg == "--FeatureExtraction.type") {
       const std::string value = RequireValue(args, &i, arg);
       if (value == "sift") {
         options.feature_extractor_type = FeatureExtractorType::kSift;
@@ -230,117 +205,74 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
       } else {
         throw std::invalid_argument("Unsupported feature type: " + value);
       }
-    } else if (arg == "--aliked_model_path") {
+    } else if (arg == "--AlikedExtraction.n16rot_model_path" || arg == "--AlikedExtraction.n32_model_path") {
       options.aliked_model_path = RequireValue(args, &i, arg);
-    } else if (arg == "--aliked_min_score") {
-      options.aliked_min_score = std::stod(RequireValue(args, &i, arg));
-    } else if (arg == "--nearby_match_window") {
+    } else if (arg == "--AlikedExtraction.min_score") {
+      options.aliked_min_score = controllers::SfmDouble(RequireValue(args, &i, arg));
+    } else if (arg == "--Colite.nearby_match_window") {
       options.nearby_match_window =
-          static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
-    } else if (arg == "--nearby_match_ratio") {
-      options.nearby_match_ratio = std::stod(RequireValue(args, &i, arg));
-    } else if (arg == "--guided_match_ratio") {
-      options.guided_match_ratio = std::stod(RequireValue(args, &i, arg));
-    } else if (arg == "--max_registration_trials_per_image") {
+          static_cast<std::size_t>(controllers::SfmCount(RequireValue(args, &i, arg)));
+    } else if (arg == "--Colite.nearby_match_ratio") {
+      options.nearby_match_ratio = controllers::SfmDouble(RequireValue(args, &i, arg));
+    } else if (arg == "--Colite.guided_match_ratio") {
+      options.guided_match_ratio = controllers::SfmDouble(RequireValue(args, &i, arg));
+    } else if (arg == "--Mapper.max_reg_trials") {
       options.max_registration_trials_per_image =
-          static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
-    } else if (arg == "--max_initialization_trials") {
+          static_cast<std::size_t>(controllers::SfmCount(RequireValue(args, &i, arg)));
+    } else if (arg == "--Mapper.init_num_trials") {
       options.max_initialization_trials =
-          static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
-    } else if (arg == "--structureless_registration") {
+          static_cast<std::size_t>(controllers::SfmCount(RequireValue(args, &i, arg)));
+    } else if (arg == "--Mapper.structure_less_registration_fallback") {
       options.use_structureless_registration =
           ParseBoolFlagValue(RequireValue(args, &i, arg), arg);
-    } else if (arg == "--aliked_max_image_size") {
-      options.aliked_max_image_size =
-          std::stoi(RequireValue(args, &i, arg));
-    } else if (arg == "--multiple_models") {
+    } else if (arg == "--Mapper.multiple_models") {
       options.multiple_models =
           ParseBoolFlagValue(RequireValue(args, &i, arg), arg);
-    } else if (arg == "--merge_models") {
+    } else if (arg == "--Colite.merge_models") {
       options.merge_models =
           ParseBoolFlagValue(RequireValue(args, &i, arg), arg);
-    } else if (arg == "--max_num_models") {
+    } else if (arg == "--Mapper.max_num_models") {
       options.max_num_models =
-          static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
-    } else if (arg == "--min_model_size") {
+          static_cast<std::size_t>(controllers::SfmCount(RequireValue(args, &i, arg)));
+    } else if (arg == "--Mapper.min_model_size") {
       options.min_num_images_per_model =
-          static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
-    } else if (arg == "--registration_retry_error_multiplier") {
+          static_cast<std::size_t>(controllers::SfmCount(RequireValue(args, &i, arg)));
+    } else if (arg == "--Colite.registration_retry_error_multiplier") {
       options.registration_retry_reprojection_error_multiplier =
-          std::stod(RequireValue(args, &i, arg));
-    } else if (arg == "--registration_retry_max_error") {
+          controllers::SfmDouble(RequireValue(args, &i, arg));
+    } else if (arg == "--Colite.registration_retry_max_error") {
       options.registration_retry_max_reprojection_error_px =
-          std::stod(RequireValue(args, &i, arg));
-    } else if (arg == "--ba_refine_focal_length") {
+          controllers::SfmDouble(RequireValue(args, &i, arg));
+    } else if (arg == "--Mapper.ba_refine_focal_length") {
       options.ba_refine_focal_length =
           ParseBoolFlagValue(RequireValue(args, &i, arg), arg);
-    } else if (arg == "--ba_refine_principal_point") {
+    } else if (arg == "--Mapper.ba_refine_principal_point") {
       options.ba_refine_principal_point =
           ParseBoolFlagValue(RequireValue(args, &i, arg), arg);
-    } else if (arg == "--ba_refine_extra_params") {
+    } else if (arg == "--Mapper.ba_refine_extra_params") {
       options.ba_refine_extra_params =
           ParseBoolFlagValue(RequireValue(args, &i, arg), arg);
-    } else if (arg == "--ba_refine_params") {
-      options.ba_refine_params =
-          ParseCommaSeparatedNames(RequireValue(args, &i, arg), arg);
-    } else if (arg == "--use_position_priors") {
+    } else if (arg == "--Colite.use_position_priors") {
       options.use_position_priors =
           ParseBoolFlagValue(RequireValue(args, &i, arg), arg);
-    } else if (arg == "--position_prior_stddev") {
-      options.position_prior_stddev = std::stod(RequireValue(args, &i, arg));
-    } else if (arg == "--position_prior_loss_scale") {
+    } else if (arg == "--Colite.position_prior_stddev") {
+      options.position_prior_stddev = controllers::SfmDouble(RequireValue(args, &i, arg));
+    } else if (arg == "--Colite.position_prior_loss_scale") {
       options.position_prior_loss_scale =
-          std::stod(RequireValue(args, &i, arg));
-    } else if (arg == "--position_prior_alignment_max_error") {
+          controllers::SfmDouble(RequireValue(args, &i, arg));
+    } else if (arg == "--Colite.position_prior_alignment_max_error") {
       options.position_prior_alignment_max_error =
-          std::stod(RequireValue(args, &i, arg));
-    } else if (arg == "--matcher") {
-      const std::string matcher = RequireValue(args, &i, arg);
-      if (matcher == "bf") {
-        options.matcher_backend = DescriptorMatcherBackend::kBruteForce;
-        options.matcher_type = FeatureMatcherType::kSiftBruteForce;
-      } else if (matcher == "flann") {
-        options.matcher_backend = DescriptorMatcherBackend::kFlann;
-        options.matcher_type = FeatureMatcherType::kSiftBruteForce;
-      } else if (matcher == "cuda") {
-        options.matcher_backend = DescriptorMatcherBackend::kCudaBruteForce;
-        options.matcher_type = FeatureMatcherType::kSiftBruteForce;
-      } else if (matcher == "aliked_bf") {
-        options.matcher_type = FeatureMatcherType::kAlikedBruteForce;
-      } else if (matcher == "sift_lightglue") {
-        options.matcher_type = FeatureMatcherType::kSiftLightGlue;
-      } else if (matcher == "aliked_lightglue") {
-        options.matcher_type = FeatureMatcherType::kAlikedLightGlue;
-      } else {
-        throw std::invalid_argument("Unsupported matcher: " + matcher);
-      }
-    } else if (arg == "--learned_matcher_model_path") {
+          controllers::SfmDouble(RequireValue(args, &i, arg));
+    } else if (arg == "--SiftMatching.lightglue_model_path" || arg == "--AlikedMatching.lightglue_model_path") {
       options.learned_matcher_model_path = RequireValue(args, &i, arg);
-    } else if (arg == "--min_cosine_similarity") {
-      options.min_cosine_similarity = std::stod(RequireValue(args, &i, arg));
-    } else if (arg == "--lightglue_min_score") {
-      options.lightglue_min_score = std::stod(RequireValue(args, &i, arg));
-    } else if (arg == "--learned_matcher_num_threads") {
-      options.learned_matcher_num_threads =
-          std::stoi(RequireValue(args, &i, arg));
-    } else if (arg == "--learned_device") {
-      const std::string provider = RequireValue(args, &i, arg);
-      if (provider == "auto") {
-        options.learned_execution_provider = OnnxExecutionProvider::kAuto;
-      } else if (provider == "cpu") {
-        options.learned_execution_provider = OnnxExecutionProvider::kCpu;
-      } else if (provider == "cuda") {
-        options.learned_execution_provider = OnnxExecutionProvider::kCuda;
-      } else {
-        throw std::invalid_argument("Unsupported learned device: " + provider);
-      }
-    } else if (arg == "--learned_gpu_index") {
-      options.learned_gpu_index =
-          std::stoi(RequireValue(args, &i, arg));
-    } else if (arg == "--learned_cuda_memory_limit_mb") {
+    } else if (arg == "--AlikedMatching.brute_force_min_cossim") {
+      options.min_cosine_similarity = controllers::SfmDouble(RequireValue(args, &i, arg));
+    } else if (arg == "--SiftMatching.lightglue_min_score" || arg == "--AlikedMatching.lightglue_min_score") {
+      options.lightglue_min_score = controllers::SfmDouble(RequireValue(args, &i, arg));
+    } else if (arg == "--Colite.learned_cuda_memory_limit_mb") {
       options.learned_cuda_memory_limit_mb = static_cast<std::size_t>(
-          std::stoull(RequireValue(args, &i, arg)));
-    } else if (arg == "--mapper") {
+          controllers::SfmCount(RequireValue(args, &i, arg)));
+    } else if (arg == "--Colite.mapper") {
       const std::string mapper = RequireValue(args, &i, arg);
       if (mapper == "incremental") {
         options.mapper_type = controllers::SfmMapperType::kIncremental;
@@ -351,23 +283,51 @@ ReconSfmCliOptions ParseOptions(const std::vector<std::string>& args) {
       } else {
         throw std::invalid_argument("Unsupported mapper: " + mapper);
       }
-    } else if (arg == "--hierarchical_target_cluster_size") {
+    } else if (arg == "--Colite.hierarchical_target_cluster_size") {
       options.hierarchical_target_cluster_size = static_cast<std::size_t>(
-          std::stoull(RequireValue(args, &i, arg)));
-    } else if (arg == "--hierarchical_max_cluster_size") {
+          controllers::SfmCount(RequireValue(args, &i, arg)));
+    } else if (arg == "--Colite.hierarchical_max_cluster_size") {
       options.hierarchical_max_cluster_size = static_cast<std::size_t>(
-          std::stoull(RequireValue(args, &i, arg)));
-    } else if (arg == "--hierarchical_overlap") {
+          controllers::SfmCount(RequireValue(args, &i, arg)));
+    } else if (arg == "--Colite.hierarchical_overlap") {
       options.hierarchical_overlap = static_cast<std::size_t>(
-          std::stoull(RequireValue(args, &i, arg)));
-    } else if (arg == "--hierarchical_num_workers") {
+          controllers::SfmCount(RequireValue(args, &i, arg)));
+    } else if (arg == "--Colite.hierarchical_num_workers") {
       options.hierarchical_num_workers = static_cast<std::size_t>(
-          std::stoull(RequireValue(args, &i, arg)));
+          controllers::SfmCount(RequireValue(args, &i, arg)));
+    } else if (arg == "--FeatureMatching.type") {
+      options.matcher_type = ParseSfmMatcherType(RequireValue(args, &i, arg));
+    } else if (arg == "--SiftMatching.max_ratio" || arg == "--AlikedMatching.brute_force_max_ratio") {
+      options.max_ratio = controllers::SfmDouble(RequireValue(args, &i, arg));
+    } else if (arg == "--FeatureMatching.guided_matching") {
+      options.guided_matching = controllers::SfmBool(RequireValue(args, &i, arg));
+    } else if (arg == "--SiftMatching.max_distance") {
+      options.max_distance = controllers::SfmDouble(RequireValue(args, &i, arg));
+    } else if (arg == "--SiftMatching.cross_check" || arg == "--AlikedMatching.brute_force_cross_check") {
+      options.mutual_check = controllers::SfmBool(RequireValue(args, &i, arg));
     } else {
+      const std::string value = RequireValue(args, &i, arg);
+      if (controllers::ApplySfmGeometryOption(arg, value, &options.two_view_geometry)) continue;
+      IncrementalMappingOptions parsed;
+      if (controllers::ApplySfmMapperOption(arg, value, &parsed)) {
+        options.mapper_options.emplace(arg, value);
+        continue;
+      }
       throw std::invalid_argument("Unknown argument: " + arg);
     }
   }
 
+  if (options.matcher_type == FeatureMatcherType::kAlikedBruteForce &&
+      std::find(args.begin(), args.end(), "--AlikedMatching.brute_force_max_ratio") == args.end()) {
+    options.max_ratio = 1.0;
+  }
+  if (!max_num_features_supplied && IsAlikedFeature(options.feature_extractor_type)) {
+    options.max_num_features = 2048;
+  }
+  if (std::find(args.begin(), args.end(), "--Colite.guided_match_ratio") == args.end())
+    options.guided_match_ratio = options.max_ratio;
+  if (options.matcher_type == FeatureMatcherType::kSiftBruteForce && !options.matching_execution.use_gpu.has_value())
+    options.matching_execution.use_gpu = IsCudaDescriptorMatcherAvailable();
   return options;
 }
 
@@ -381,7 +341,7 @@ void ValidateOptions(const ReconSfmCliOptions& options) {
   if (options.mapper_type != controllers::SfmMapperType::kIncremental &&
       !options.input_model_path.empty()) {
     throw std::invalid_argument(
-        "global/hierarchical mapper does not support --input_model_path yet");
+        "global/hierarchical mapper does not support --input_path yet");
   }
   if (options.hierarchical_target_cluster_size == 0 ||
       options.hierarchical_max_cluster_size <
@@ -394,24 +354,36 @@ void ValidateOptions(const ReconSfmCliOptions& options) {
   if (options.output_path.empty()) {
     throw std::invalid_argument("Missing required argument --output_path");
   }
+  if (!std::isfinite(options.max_ratio) || options.max_ratio <= 0 || options.max_ratio > 1 ||
+      !std::isfinite(options.max_distance) || options.max_distance <= 0) {
+    throw std::invalid_argument("Invalid SIFT matching thresholds");
+  }
+  if (options.mapper_type == controllers::SfmMapperType::kGlobal) {
+    for (const auto& [name, value] : options.mapper_options) {
+      (void)value;
+      if (name.rfind("--Mapper.tri_", 0) != 0 && name != "--Mapper.ba_global_max_num_iterations") {
+        throw std::invalid_argument(name + " is not implemented for the global mapper");
+      }
+    }
+  }
   if (options.max_num_features <= 0) {
-    throw std::invalid_argument("--max_num_features must be positive");
+    throw std::invalid_argument("--SiftExtraction.max_num_features must be positive");
   }
   if (!IsFeatureMatcherCompatible(options.feature_extractor_type,
                                   options.matcher_type)) {
     throw std::invalid_argument(
-        "--feature_type is incompatible with --matcher");
+        "--FeatureExtraction.type is incompatible with --FeatureMatching.type");
   }
   if (IsAlikedFeature(options.feature_extractor_type) &&
       options.aliked_model_path.empty()) {
     throw std::invalid_argument(
-        "--aliked_model_path is required for ALIKED");
+        "--AlikedExtraction.n16rot_model_path is required for ALIKED");
   }
   if ((options.matcher_type == FeatureMatcherType::kSiftLightGlue ||
        options.matcher_type == FeatureMatcherType::kAlikedLightGlue) &&
       options.learned_matcher_model_path.empty()) {
     throw std::invalid_argument(
-        "--learned_matcher_model_path is required for LightGlue");
+        "--SiftMatching.lightglue_model_path is required for LightGlue");
   }
   if (!std::isfinite(options.aliked_min_score) ||
       options.aliked_min_score < 0.0 ||
@@ -424,55 +396,52 @@ void ValidateOptions(const ReconSfmCliOptions& options) {
     throw std::invalid_argument("Invalid learned frontend configuration");
   }
   if (options.learned_gpu_index < 0) {
-    throw std::invalid_argument("--learned_gpu_index must be non-negative");
-  }
-  if (options.focal_length < 0.0) {
-    throw std::invalid_argument("--focal_length must be non-negative");
+    throw std::invalid_argument("--Colite.learned_gpu_index must be non-negative");
   }
   if (!ExistsCameraModel(options.camera_model_id)) {
-    throw std::invalid_argument("--camera_model is unsupported");
+    throw std::invalid_argument("--ImageReader.camera_model is unsupported");
   }
   if (options.aliked_max_image_size < 0) {
     throw std::invalid_argument(
-        "--aliked_max_image_size must be non-negative");
+        "--Colite.aliked_max_image_size must be non-negative");
   }
   if (!std::isfinite(options.default_focal_length_factor) ||
       options.default_focal_length_factor <= 0.0) {
     throw std::invalid_argument(
-        "--default_focal_length_factor must be positive");
+        "--ImageReader.default_focal_length_factor must be positive");
   }
   if (!options.camera_params.empty() &&
       options.camera_params.size() !=
           GetCameraModelSpec(options.camera_model_id).param_names.size()) {
     throw std::invalid_argument(
-        "--camera_params count does not match --camera_model");
+        "--ImageReader.camera_params count does not match --ImageReader.camera_model");
   }
-  if (options.nearby_match_ratio <= 0.0 || options.nearby_match_ratio > 1.0) {
-    throw std::invalid_argument("--nearby_match_ratio must be in (0, 1]");
+  if (!std::isfinite(options.nearby_match_ratio) || options.nearby_match_ratio <= 0.0 || options.nearby_match_ratio > 1.0) {
+    throw std::invalid_argument("--Colite.nearby_match_ratio must be in (0, 1]");
   }
-  if (options.guided_match_ratio <= 0.0 ||
+  if (!std::isfinite(options.guided_match_ratio) || options.guided_match_ratio <= 0.0 ||
       options.guided_match_ratio > 1.0) {
-    throw std::invalid_argument("--guided_match_ratio must be in (0, 1]");
+    throw std::invalid_argument("--Colite.guided_match_ratio must be in (0, 1]");
   }
   if (options.max_registration_trials_per_image == 0) {
     throw std::invalid_argument(
-        "--max_registration_trials_per_image must be positive");
+        "--Mapper.max_reg_trials must be positive");
   }
   if (options.max_initialization_trials == 0) {
-    throw std::invalid_argument("--max_initialization_trials must be positive");
+    throw std::invalid_argument("--Mapper.init_num_trials must be positive");
   }
   if (options.max_num_models == 0 ||
       options.min_num_images_per_model < 2) {
     throw std::invalid_argument(
-        "--max_num_models must be positive and --min_model_size >= 2");
+        "--Mapper.max_num_models must be positive and --Mapper.min_model_size >= 2");
   }
   if (options.registration_retry_reprojection_error_multiplier < 1.0) {
     throw std::invalid_argument(
-        "--registration_retry_error_multiplier must be >= 1");
+        "--Colite.registration_retry_error_multiplier must be >= 1");
   }
   if (options.registration_retry_max_reprojection_error_px <= 0.0) {
     throw std::invalid_argument(
-        "--registration_retry_max_error must be positive");
+        "--Colite.registration_retry_max_error must be positive");
   }
   if (!std::isfinite(options.position_prior_stddev) ||
       options.position_prior_stddev <= 0.0 ||
@@ -494,7 +463,6 @@ controllers::ReconSfmControllerOptions ToControllerOptions(
   controller_options.output_model_format = options.output_model_format;
   controller_options.resume = options.resume;
   controller_options.force = options.force;
-  controller_options.focal_length = options.focal_length;
   controller_options.camera_sharing_mode = options.camera_sharing_mode;
   controller_options.camera_model_id = options.camera_model_id;
   controller_options.camera_params = options.camera_params;
@@ -504,8 +472,16 @@ controllers::ReconSfmControllerOptions ToControllerOptions(
   controller_options.feature_num_threads = options.feature_num_threads;
   controller_options.feature_extractor_type = options.feature_extractor_type;
   controller_options.feature_backend = options.feature_backend;
+  controller_options.feature_execution = options.feature_execution;
+  controller_options.matching_execution = options.matching_execution;
   controller_options.aliked_model_path = options.aliked_model_path;
   controller_options.aliked_min_score = options.aliked_min_score;
+  controller_options.max_ratio = options.max_ratio;
+  controller_options.max_distance = options.max_distance;
+  controller_options.mutual_check = options.mutual_check;
+  controller_options.guided_matching = options.guided_matching;
+  controller_options.two_view_geometry = options.two_view_geometry;
+  controller_options.mapper_options = options.mapper_options;
   controller_options.matcher_backend = options.matcher_backend;
   controller_options.matcher_type = options.matcher_type;
   controller_options.aliked_max_image_size = options.aliked_max_image_size;
@@ -561,7 +537,6 @@ controllers::ReconSfmControllerOptions ToControllerOptions(
         controller_options.ba_refine_camera_params |
         CameraParameterGroup::kDistortion;
   }
-  controller_options.ba_refine_camera_param_names = options.ba_refine_params;
   controller_options.use_position_priors = options.use_position_priors;
   controller_options.position_prior_stddev = options.position_prior_stddev;
   controller_options.position_prior_loss_scale =
@@ -572,6 +547,10 @@ controllers::ReconSfmControllerOptions ToControllerOptions(
 }
 
 }  // namespace
+
+void ValidateReconSfmArguments(const std::vector<std::string>& args) {
+  ValidateOptions(ParseOptions(args));
+}
 
 int RunReconSfm(const std::vector<std::string>& args,
                 std::ostream& out,

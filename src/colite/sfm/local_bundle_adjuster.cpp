@@ -726,7 +726,8 @@ LocalBundleAdjustmentSummary AdjustLocalBundle(
   solver_options.max_num_iterations = options.max_num_iterations;
   solver_options.linear_solver_type = ceres::DENSE_SCHUR;
   solver_options.minimizer_progress_to_stdout = false;
-  solver_options.num_threads = parallel::getNumThreads();
+  solver_options.num_threads = problem.NumResiduals() < 50000
+                                   ? 1 : parallel::getNumThreads();
 
   ceres::Solver::Summary solver_summary;
   ceres::Solve(solver_options, &problem, &solver_summary);

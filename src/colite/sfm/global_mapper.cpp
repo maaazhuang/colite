@@ -75,10 +75,17 @@ GlobalMappingSummary RunGlobalMapping(const MatchGraph& graph,
     summary.message = "Global rotation averaging failed";
     return summary;
   }
+  std::vector<RelativePoseConstraint> positioning_constraints;
+  positioning_constraints.reserve(
+      summary.rotation_averaging.used_constraint_indices.size());
+  for (const std::size_t idx :
+       summary.rotation_averaging.used_constraint_indices) {
+    positioning_constraints.push_back(constraints.at(idx));
+  }
   std::map<ImageId, Eigen::Vector3d> centers;
   summary.positioning = EstimateGlobalCameraCenters(
-      constraints, rotations, summary.anchor_image_id, options.positioning,
-      &centers);
+      positioning_constraints, rotations, summary.anchor_image_id,
+      options.positioning, &centers);
   if (!summary.positioning.success) {
     summary.message = "Global camera positioning failed";
     return summary;

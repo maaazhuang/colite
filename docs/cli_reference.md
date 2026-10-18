@@ -24,6 +24,7 @@ $COLITE <command> --help
 | `transitive_matcher` | 已有 verified workspace | 沿已验证图生成受控新 pair，再执行真实匹配和几何验证 |
 | `mapper` | 已匹配 workspace | 稀疏模型和带 RGB PLY |
 | `compare_colmap` | 两个 COLMAP 模型 | Sim(3) 位姿/结构差异报告 |
+| `model_converter` | COLMAP TXT/BIN 模型 | 保留模型字段，转换为 TXT、BIN 或两种格式 |
 | `model_analyzer` | COLMAP 稀疏模型 | 相机、图像、点、观测、track、误差和边界统计 |
 | `model_transformer` | 稀疏模型、3×4/4×4 矩阵 | 应用 Sim(3) 并写兼容模型 |
 | `model_aligner` | 稀疏模型、按图像名 XYZ | 鲁棒位置对齐 |
@@ -62,199 +63,142 @@ manifest 位于输出根的 `.colite/stages/<stage>.json`。
 滚动文件。INFO 记录阶段开始、缓存命中、核心数量/后端、耗时和结束状态，
 逐图细节只在 `--v 1` 或更高等级输出。
 
-## SfM 单步骤
+## SfM 参数契约（COLMAP 4.0）
+
+SfM 同义旧参数和别名已经移除，不提供兼容层。标准参数直接使用 COLMAP 4.0 名称；只有存储方式、实现后端或其他特有功能使用 `Colite.*`。`--name value` 与 `--name=value` 都可用，重复参数、无效数值、冲突相机分组和不适用的特征/匹配器族参数会在执行前报错。
+
+相同名称应有相同含义、单位、布尔语义和枚举。当前只接受实际接入的选项；下文列出的算法/默认值差距仍需处理，不能把现阶段命令当成完整 COLMAP CLI 的替代品。目标是继续消除差距，而不是为旧设计永久保留差异。
 
 ### 特征提取
 
 ```bash
-OUT=output/sfm_single_building18_YYYYMMDD
-$COLITE feature_extractor \
-  --image_path data/building-18 \
-  --workspace_path "$OUT/workspace" \
-  --feature_extractor auto \
-  --max_num_features 8192 \
-  --feature_num_threads -1
+$COLITE feature_extractor --image_path data/building-18 \
+  --Colite.workspace_path "$OUT/workspace" \
+  --ImageReader.camera_model SIMPLE_RADIAL --ImageReader.single_camera 1 \
+  --FeatureExtraction.type SIFT --FeatureExtraction.num_threads 8 \
+  --SiftExtraction.max_num_features 8192 --Colite.feature_extractor cuda_vlfeat
 ```
 
-主要参数：
+| 参数 | 当前行为 / 默认值 |
+|---|---|
+| `ImageReader.camera_model`、`camera_params` | SIMPLE_RADIAL；显式 CSV 参数按 COLMAP 顺序。初始焦距由完整 camera_params 表达，旧 focal_length 已移除 |
+| `ImageReader.default_focal_length_factor` | 1.2；缺少 EXIF 焦距时使用 |
+| `ImageReader.single_camera`、`single_camera_per_folder`、`single_camera_per_image` | 最多一个 true；全 false 时自动按 EXIF 相机身份分组。旧 camera_mode 已移除 |
+| `FeatureExtraction.type` | SIFT / ALIKED_N16ROT / ALIKED_N32 |
+| `FeatureExtraction.num_threads` | -1；提取 CPU 线程预算 |
+| `SiftExtraction.max_num_features` | 8192；只接受 SIFT。CPU VLFeat 按基础点整层保留；GPU 与 COLMAP 的 -tc2 一样在方向展开后再次按整层限额，边界层可使数量超过预算 |
+| `AlikedExtraction.max_num_features`、`min_score` | 2048 / 0.2；只接受 ALIKED |
+| `AlikedExtraction.n16rot_model_path`、`n32_model_path` | 本地 ONNX 路径，必须对应选定模型；没有自动下载默认 URI 的行为 |
+| `Colite.feature_extractor` | auto / vlsift / cvsift / cuda_opencv / cuda_vlfeat；auto 统一选择 CUDA VLFeat 或 CPU VLFeat |
+| `FeatureExtraction.max_image_size` | 非正数按类型自动选择：SIFT 3200、ALIKED 1600；缩放提取后关键点回映原图，Camera 尺寸保持原始值 |
+| `FeatureExtraction.use_gpu`、`gpu_index` | CPU/GPU 选择；单设备整数，-1 自动选设备 0。多 GPU CSV 暂不支持 |
+| `SiftExtraction.first_octave`、`num_octaves`、`octave_resolution` | -1 / 4 / 3；first_octave 当前支持 -1 或 0 |
+| `SiftExtraction.peak_threshold`、`edge_threshold`、`max_num_orientations`、`normalization` | 0.02/3 / 10 / 2 / L1_ROOT；可选 L2，方向上限 1..4；显式几何控制要求 VLFeat 后端 |
+| `Colite.learned_cuda_memory_limit_mb` | 8192；ONNX CUDA arena 预算 |
 
-| 参数 | 默认 | 说明 |
-|---|---:|---|
-| `--image_path` | 必填 | 图像目录 |
-| `--workspace_path` | 必填 | 文件 workspace |
-| `--focal_length` | EXIF/尺寸先验 | 显式初始焦距像素；是否由 BA 继续优化由 `--ba_refine_focal_length` 控制 |
-| `--camera_model` | SIMPLE_RADIAL | 现有12种 COLMAP 兼容模型之一 |
-| `--camera_params` | 空 | 按模型参数顺序给出完整 CSV；参数数量必须精确匹配 |
-| `--camera_mode` | auto | `auto|single|per_folder|per_image`；兼容别名 `shared=single`、`individual=per_image` |
-| `--default_focal_length_factor` | 1.2 | EXIF 不足时的 `factor × max(width,height)` |
-| `--max_num_features` | 4096 | OpenCV/CUDA 后端为最终输出上限；CPU VLFeat 按基础 keypoint/DoG level 限制，最终多方向点可超过 |
-| `--feature_num_threads` | -1 | CPU 线程数；-1 为逻辑核 |
-| `--feature_extractor` | auto | `auto|vlsift|cvsift|cuda_opencv|cuda_vlfeat` |
+非正 max_image_size 不表示关闭缩放；要保留原分辨率，指定不小于图像最长边的正尺寸。CLI 的 max_num_features 必须为正数，低层提取器测试 API 的 0=不限额不作为公开参数行为。
 
-`auto` 有可用 CUDA 时选择 `cuda_opencv`，否则 `cvsift`。`cudasift`、`cuda_sift`、`cuda` 是兼容别名。CUDA 模式使用单个外层图像 worker，避免同一 GPU 被多任务争用。
-
-### Matcher
+### 匹配与几何验证
 
 ```bash
-$COLITE exhaustive_matcher --workspace_path "$OUT/workspace" --matcher flann
-$COLITE sequential_matcher --workspace_path "$OUT/workspace" \
-  --overlap 5 --matcher flann --max_ratio 0.8
+$COLITE exhaustive_matcher --Colite.workspace_path "$OUT/workspace" \
+  --FeatureMatching.type SIFT_BRUTEFORCE --FeatureMatching.use_gpu 1 \
+  --SiftMatching.max_ratio 0.8 --SiftMatching.max_distance 0.7 \
+  --SiftMatching.cross_check 1 --FeatureMatching.guided_matching 1 \
+  --TwoViewGeometry.max_error 4
+$COLITE sequential_matcher --Colite.workspace_path "$OUT/workspace" \
+  --SequentialMatching.overlap 10 --SequentialMatching.quadratic_overlap 1
 ```
 
-共同参数：
+匹配策略由命令选定；冗余 matching_type 已移除。给 exhaustive_matcher 传 SequentialMatching 参数等无效组合会报错。
 
-| 参数 | 默认 | 说明 |
-|---|---:|---|
-| `--workspace_path` | 必填 | 已提取特征的 workspace |
-| `--matching_type` | 由命令决定 | `exhaustive|sequential|spatial|vocab_tree` |
-| `--matcher` | flann | `bf|flann|cuda|aliked_bf|sift_lightglue|aliked_lightglue`；`cuda` 是与 CPU BF 口径一致的精确 GPU 暴力匹配 |
-| `--max_ratio` | 0.8 | Lowe ratio |
-| `--guided_matching` | 0 | 几何验证后按 F 极线约束重搜描述子 |
-| `--guided_match_ratio` | 0.8 | standalone guided Lowe ratio；COLMAP High 同描述子语义 |
-| `--guided_min_inlier_gain` | 10 | 替换图像对几何所需的最小内点增量 |
-| `--overlap` | 5 | sequential 后向邻居数 |
-| `--spatial_max_num_neighbors` | 10 | 空间邻居数 |
-| `--spatial_max_distance` | ≤0 不限 | 位置先验距离阈值 |
+| 参数 | 当前行为 / 默认值 |
+|---|---|
+| `FeatureMatching.type` | SIFT_BRUTEFORCE / SIFT_LIGHTGLUE / ALIKED_BRUTEFORCE / ALIKED_LIGHTGLUE；旧 matcher 已移除 |
+| `SiftMatching.max_ratio`、`max_distance`、`cross_check` | 0.8 / 0.7 / true，只用于 SIFT BF 族 |
+| `SiftMatching.lightglue_model_path`、`lightglue_min_score` | SIFT LightGlue 模型路径 / 0.1 |
+| `AlikedMatching.brute_force_min_cossim`、`brute_force_max_ratio`、`brute_force_cross_check` | 0.85 / 1.0 / true，ALIKED BF；本地实现不需要 ONNX bruteforce_model_path |
+| `AlikedMatching.lightglue_model_path`、`lightglue_min_score` | ALIKED LightGlue 模型路径 / 0.1 |
+| `FeatureMatching.guided_matching` | matcher 与 recon_sfm 统一默认 false；当前重搜索仅支持 SIFT BF |
+| `TwoViewGeometry.max_error`、`min_num_inliers`、`confidence`、`max_num_trials` | 4 px / 15 / 0.999 / 10000，实际控制几何估计 |
+| `SequentialMatching.overlap`、`quadratic_overlap` | 10 / true；仅 sequential_matcher |
+| `SpatialMatching.max_num_neighbors`、`max_distance` | 50 / 100；距离必须 >0，未实现 min_num_neighbors 补足规则 |
+| `VocabTreeMatching.num_images` | 100；仅 vocab_tree_matcher |
+| `FeatureMatching.use_gpu`、`gpu_index`、`num_threads` | SIFT 默认用可用 GPU；单设备索引 -1 自动选 0；线程预算默认 -1 自动。ALIKED BF 当前仅 CPU，显式 use_gpu=1 会拒绝；LightGlue 接到 ONNX provider |
+| `Colite.guided_match_ratio`、`guided_min_inlier_gain` | 默认继承 SiftMatching.max_ratio，并沿用其 cross_check；显式 ratio 可覆盖。独立 matcher 内点增量门槛 10 |
+| `Colite.vocab_tree_path` | COLITE 格式词树；没有使用 VocabTreeMatching.vocab_tree_path 假装可读取 COLMAP 词树 |
 
-spatial 要求 `images.tsv` 中所有图像都有位置先验，缺失会报错。
+ONNX 设备与匹配并行预算使用标准 FeatureExtraction.* / FeatureMatching.*。特有 arena / I/O binding 仍使用 `Colite.learned_cuda_memory_limit_mb` / `Colite.learned_use_io_binding`。旧 Colite.matcher_backend、Colite.aliked_max_image_size、Colite.learned_device/gpu_index/matcher_num_threads 已移除，没有别名。
 
-Vocabulary tree：
+Colite 自建词树、词树保护顺序边和 transitive matcher 的控制也使用 `Colite.*`，以各命令 help 为准。它们不属于 COLMAP 同名文件/算法兼容承诺。
+
+### Mapper 与组合流程
 
 ```bash
-$COLITE vocab_tree_builder \
-  --workspace_path "$OUT/workspace" \
-  --output_path "$OUT/vocab/tree.txt" \
-  --num_visual_words 1024 --branching 16 \
-  --num_iterations 6 --max_num_features 5000
+$COLITE mapper --Colite.workspace_path "$OUT/workspace" \
+  --Mapper.multiple_models 1 --Mapper.max_num_models 50 \
+  --Mapper.ba_refine_focal_length 1 --Mapper.ba_refine_principal_point 0 \
+  --Mapper.ba_refine_extra_params 1 --Colite.output_format both
 
-$COLITE vocab_tree_matcher \
-  --workspace_path "$OUT/workspace" \
-  --vocab_tree_path "$OUT/vocab/tree.txt" \
-  --vocab_tree_num_images 50 \
-  --vocab_tree_sequential_overlap 2 --matcher flann
+$COLITE recon_sfm --image_path data/building-18 --output_path "$OUT/sfm" \
+  --ImageReader.single_camera 1 --FeatureExtraction.type SIFT \
+  --SiftExtraction.max_num_features 8192 --Colite.feature_extractor cuda_vlfeat \
+  --FeatureMatching.type SIFT_BRUTEFORCE --FeatureMatching.use_gpu 1 \
+  --FeatureMatching.guided_matching 1
 ```
 
-`vocab_tree_num_visual_words=1024`、`branching=16`、`num_iterations=6`、每图检索描述子上限 5000、检索候选图 50、时序保护 overlap 2。纯 matcher A/B 应复用已构建词树并单独记录 builder 时间。
+Mapper / recon_sfm 共用已实现的标准参数：
 
-### Mapper
+- 多模型：`Mapper.multiple_models`、`max_num_models`、`min_model_size`。
+- 初始化：`Mapper.init_min_num_inliers`、`init_max_error`、`init_min_tri_angle`、`init_num_trials`。
+- 注册：`Mapper.max_reg_trials`、`abs_pose_max_error`、`abs_pose_min_num_inliers`、`abs_pose_min_inlier_ratio`、`structure_less_registration_fallback`。
+- 过滤：`Mapper.filter_max_reproj_error`、`filter_min_tri_angle`。
+- BA：`Mapper.ba_refine_focal_length`、`ba_refine_principal_point`、`ba_refine_extra_params`、`ba_local_num_images`、`ba_local_max_num_iterations`、`ba_global_max_num_iterations`。旧 ba_refine_params 逐名称选择入口已删除。
+- 三角化：`Mapper.tri_max_transitivity`、`tri_create_max_angle_error`、`tri_continue_max_angle_error`、`tri_merge_max_reproj_error`、`tri_complete_max_reproj_error`、`tri_complete_max_transitivity`、`tri_min_angle`、`tri_ignore_two_view_tracks`。
+
+`input_path` 用于接续已有模型。`Colite.mapper` 选择 incremental / global / hierarchical；global 当前只接入 Mapper.tri_* 和 Mapper.ba_global_max_num_iterations，其他新增 Mapper 参数明确拒绝。
+
+仍有意义的独立功能包括 `Colite.merge_models`、`Colite.registration_retry_error_multiplier` / `registration_retry_max_error`、`Colite.hierarchical_*`、`Colite.nearby_match_*`、`Colite.use_position_priors` / `position_prior_*`。标准 max_reg_trials、init_num_trials、structure_less_registration_fallback 的旧扁平名称不再接受。
+
+### 默认行为与剩余边界（2026-10-18）
+
+Mapper / recon_sfm 已共用 COLMAP 默认配置：初始化 100 内点 / 16° / 200 次候选预算，abs pose 12 px / 30 内点 / 0.25 比率，过滤 1.5°，最小模型 10 张（受总图像数限制），structure-less 回退默认 true。初始化失败后按两轮“内点减半 → 角度减半”重试；默认 PnP 重试不再隐式放宽用户的误差阈值。
+
+这并不表示完整增量调度等价：init_num_trials 的候选/重建尝试组织、structure-less 求解器、周期全局 BA 和收敛策略仍有实现差异。BA 增长控制、全部 SIFT 仿射/DSP/upright/遮罩选项、统一 random_seed、多 GPU CSV 等未接入项继续明确报错。ALIKED BF 尚无 GPU 实现，不能以接受 use_gpu=1 代替实际加速。
+
+数据库适配按本轮要求暂缓，继续使用文件 workspace。优化与验证记录见 [参数对齐与前端优化](sfm_alignment_20261018.md)。
+
+### TXT / BIN 与模型维护
+
+Colite 文件工作区使用 `Colite.workspace_path`；它不是 COLMAP SQLite database_path，不能通过改名宣称等价。模型文件保持 COLMAP world-to-camera、WXYZ、little-endian 与完整 POINT2D_IDX/track。
+
+特征目前可通过 `scripts/convert_colmap_database_to_colite_workspace.py --database <db> --image_path <images> --workspace <new-workspace> --include_descriptors` 单向导入 SIFT、ALIKED N16Rot/N32；源 SIFT 若采用 L2，额外传 `--SiftExtraction.normalization L2`，默认声明 COLMAP 的 L1_ROOT。随后可用对应 FeatureMatching.type 执行 Colite matcher/mapper。该工具保留关键点 xy/顺序与描述子值，写 feature v2；不保留完整仿射形状、raw matches、F/E/H、rig/frame 与 pose prior，也没有反向数据库导出。直接复用 verified 相对几何要求源数据库已保存有效相对位姿。详见 [当前互通审查与路线](colmap4_interop_audit_20261013.md)。
+
+mapper / recon_sfm 用 `Colite.output_format txt|bin|both`，默认 both。模型维护命令用 `Colite.input_format auto|txt|bin` 选择输入（auto 优先完整 BIN），以及 `Colite.output_format`；model_converter 使用标准 `output_type TXT|BIN`，另支持扩展 BOTH。模型转换不优化，并保留 ID、参数、位姿、观测、RGB、ERROR 和 track。
 
 ```bash
-$COLITE mapper --workspace_path "$OUT/workspace"
+$COLITE model_converter --input_path colmap/sparse/0 --output_path converted --output_type BOTH
+colmap model_converter --input_path converted --output_path colmap_text --output_type TXT
+$COLITE bundle_adjuster --input_path converted --output_path ba \
+  --BundleAdjustment.refine_focal_length 1 --BundleAdjustment.refine_principal_point 0 \
+  --BundleAdjustment.refine_extra_params 1 --BundleAdjustmentCeres.max_num_iterations 50
+$COLITE point_triangulator --Colite.workspace_path workspace --input_path converted --output_path triangulated \
+  --Mapper.tri_min_angle 1.5
+$COLITE image_registrator --Colite.workspace_path workspace --input_path converted --output_path registered \
+  --Mapper.abs_pose_max_error 12 --Mapper.abs_pose_min_num_inliers 30
 ```
 
-默认会重建 verified 匹配图中的多个可初始化分量，并尝试合并可用 verified 3D-3D
-对应对齐的模型：
+旧 BundleAdjustment.max_num_iterations 与 max_reprojection_error 已删除。point_triangulator 只接受实际使用的 Mapper.tri_*，image_registrator 只接受实际使用的 Mapper.abs_pose_*。
 
-```bash
-$COLITE mapper \
-  --workspace_path "$OUT/workspace" \
-  --multiple_models 1 --merge_models 1 \
-  --max_num_models 50 --min_model_size 2
-```
+TXT/BIN 写出仍为三文件模型，不保留 COLMAP 4 rig/frame 元数据；写出时清理另一格式或旧 rig/frame，避免自动读取陈旧数据。SfM 改变几何后重算 ERROR；纯模型转换保留 ERROR。工作区特征/匹配缓存与 SQLite 保持各自格式。
 
-从已有 COLMAP text model 继续注册：
+### 2026-10-08 参数清理验证
 
-```bash
-$COLITE mapper \
-  --workspace_path "$OUT/workspace" \
-  --input_model_path "$OUT/workspace/sparse/models/0"
-```
+最终 CUDA 构建的 CTest：404 项通过、6 项跳过、0 失败。跳过项为五项需要额外 ONNX 模型/运行环境的测试，以及与当前 CUDA 构建条件不适用的一项无 CUDA 失败路径测试。
 
-恢复入口按图像名重映射历史模型 ID，允许当前 workspace 增加新图，但要求相机模型、尺寸和
-共享内参关系兼容；已有图的特征数量、坐标和索引顺序也必须与断点模型一致，改变特征配置后
-会拒绝恢复，以免旧 track 错接到新特征。`--input_model_path` 会绕过 sparse 结果缓存并实际执行续建。输出位于
-workspace 的 `sparse/`：根目录是最大主模型，`models/<index>/` 是全部模型，
-`models.txt` 记录索引；每个模型均含 COLMAP text model 和带 RGB 的 `points3D.ply`。
-算法缓存命中时会直接返回；修改配置或做计时时使用新 workspace。
+`scripts/check_colmap_model_interop.py` 使用官方 COLMAP 4.0 验证 TXT/BIN 双向转换：12 种相机模型的构造样本，以及 House 的 36 张图像、40,034 个点，均保留相机参数、ID、位姿、二维观测、RGB、ERROR 和 track。报告位于 `output/sfm_contract_20261008/interop/report.json`；此验证范围为三文件稀疏模型。
 
-## 完整 SfM
-
-```bash
-$COLITE recon_sfm \
-  --image_path data/building-18 \
-  --output_path output/recon_sfm_building18_YYYYMMDD \
-  --feature_extractor auto --matcher flann \
-  --max_num_features 8192 --feature_num_threads -1
-```
-
-主要参数：
-
-- `--camera_model` 默认 `SIMPLE_RADIAL`；`--camera_params` 可按该模型登记顺序
-  提供完整参数。未提供时由焦距先验、图像中心和零畸变初始化。
-- `--camera_mode auto|single|per_folder|per_image`，默认 `auto`，对齐 COLMAP
-  GUI “Individual images”的 ImageReader AUTO 语义：只有 Make、Model、焦距
-  标识及尺寸完整一致的图像共享 Camera；元数据不完整时每图独立，避免误共享。
-  `single` 要求尺寸一致；`per_folder` 按相对父目录共享；`per_image` 强制每图
-  独立。旧名称 `shared`、`individual` 分别保留为 `single`、`per_image` 别名。
-  各组多个焦距 prior 使用中位数，相对跨度超过 5% 时明确报错。
-- `--focal_length`；省略时每张图依次使用 EXIF 35mm 等效焦距（按 43.27 mm
-  全画幅对角线换算）、EXIF 焦距毫米值与焦平面分辨率，最后回退
-  `default_focal_length_factor × max(width,height)`。EXIF/用户值标记为焦距
-  先验，尺寸回退不标记为先验。
-- `--nearby_match_window` 默认 0，控制首轮匹配中相邻图像对的 ratio 放宽；`--nearby_match_ratio` 默认 0.8。首轮始终遍历全部图像对。几何验证后会对所有具有可用初始 F 的 pair 执行极线约束描述子重搜索，不受 nearby window 限制。`--guided_match_ratio` 独立控制该阶段，`recon_sfm` 默认 0.95；使用同一套 COLMAP 描述子做 High 对照时显式设为 0.8。
-- `--max_registration_trials_per_image`、`--max_initialization_trials` 默认 3。
-- `--registration_retry_error_multiplier` 默认 1.5。
-- `--registration_retry_max_error` 默认 8 px。
-- `--ba_refine_focal_length`、`--ba_refine_extra_params` 默认 1，与 COLMAP
-  增量 Mapper 一致；`--ba_refine_principal_point` 默认 0。
-- `--ba_refine_params <fx,fy,k1,...>` 按名称指定内参优化。
-- `--use_position_priors 1` 从 JPEG EXIF GPS 读取 WGS84 坐标，以全组中位坐标
-  为原点转换为米制 ENU；每个稀疏模型先用至少 3 个已注册相机中心执行 Sim(3)
-  对齐，再在最终全局 BA 中加入鲁棒位置残差。默认关闭以保持无 GPS 数据的旧
-  行为。`--position_prior_stddev` 默认 5 m，
-  `--position_prior_loss_scale` 默认 2 m，
-  `--position_prior_alignment_max_error` 默认 20 m。
-- `--input_model_path <dir>` 从已有 COLMAP text model 继续注册；完整 `recon_sfm`
-  会重新计算前端特征/匹配，若只需复用已有前端结果，优先使用分阶段 `mapper`。
-- `--multiple_models 0|1`、`--merge_models 0|1` 默认均为 1；
-  `--max_num_models` 默认 50，`--min_model_size` 默认 2。`recon_auto` 可用
-  `--sfm.input_model_path`、`--sfm.multiple_models` 等同名转发参数。
-
-`recon_sfm` 输出 cameras/images/points3D text、带 RGB PLY、pair/registration
-diagnostics 和 summary。最大模型位于输出根目录，全部模型位于
-`models/<index>/`。`summary.txt` 记录相机策略、相机数量、具有焦距先验的
-图像数、初始焦距范围、实际 SIFT/matcher 后端、CUDA 可用性、CPU 线程数、
-
-新增前端和 mapper 参数：`--feature_type sift|aliked_n16rot|aliked_n32`、
-`--aliked_model_path`、`--learned_matcher_model_path`、
-`--learned_device auto|cpu|cuda`、`--learned_gpu_index <n>`、
-`--mapper incremental|global|hierarchical`。全局模式从 verified view graph 完成旋转平均、
-相机中心估计、track 三角化和全局 BA；首版不接受 `--input_model_path`。
-层次模式通过 `--hierarchical_target_cluster_size`、
-`--hierarchical_max_cluster_size` 和 `--hierarchical_overlap` 控制重叠分区，
-逐簇执行局部增量重建，重试合并具有公共 verified track 的局部模型，最后执行全局 BA；
-该模式同样不接受 `--input_model_path`。
-增量模式可用 `--structureless_registration 1` 显式启用 PnP 失败后的多邻居
-相对位姿回退。`recon_auto` 中对应写法为 `--sfm.mapper global` 和
-`--sfm.mapper hierarchical`，以及 `--sfm.structureless_registration 1`。
-特征/匹配/内点数量，以及各流程耗时。当前 CUDA 后端加速首轮全局 BF；极线
-走廊 guided 重搜索仍走 CPU。`recon_auto` 通过 `--sfm.<option>` 转发上述
-相机模型、参数和分组策略。
-
-## 稀疏模型维护与独立 SfM 内核
-
-所有模型命令读取 `--input_format auto|txt|bin`，写出
-`--output_format txt|bin|both`（默认 both），保持 COLMAP 模型兼容。
-
-```bash
-$COLITE model_analyzer --input_path sparse/0
-$COLITE model_transformer --input_path sparse/0 --output_path transformed \
-  --transform_path sim3.txt
-$COLITE model_aligner --input_path sparse/0 --output_path aligned \
-  --ref_images_path positions.txt --max_error 20
-$COLITE model_cropper --input_path sparse/0 --output_path cropped \
-  --min "-10,-10,-2" --max "10,10,20"
-$COLITE model_splitter --input_path sparse/0 --output_path split
-$COLITE bundle_adjuster --input_path sparse/0 --output_path ba
-$COLITE point_triangulator --workspace_path workspace \
-  --input_path sparse/0 --output_path triangulated
-$COLITE image_registrator --workspace_path workspace \
-  --input_path sparse/0 --output_path registered
-```
-
-`positions.txt` 每行格式为 `IMAGE_NAME X Y Z`。`point_triangulator` 是显式的
-重三角化/track complete/merge 工具，输出后建议继续执行独立 BA 和稳健过滤；
-`image_registrator` 可用 `--image_id` 只注册一张图，否则按 ID 尝试全部未注册图。
+Building 的新参数 GPU 全流程回归使用显式 `cuda_vlfeat` / `cuda` 与 guided matching，注册 18/18 张图像，输出 15,727 个点。报告位于 `output/sfm_contract_20261008/building_gpu_final/report.json`；COLMAP 对照复用了原有运行，不是重新计时。这是参数迁移与重建覆盖回归，不是公开参考集精度评估。真实参考集与评估要求见 [SfM 真实数据与参考质量评估](sfm_reference_datasets.md)。
 
 ## MVS 单步骤
 
@@ -416,7 +360,7 @@ $COLITE recon_mvs \
 $COLITE recon_auto \
   --image_path data/building-18 \
   --output_path output/recon_auto_building18_YYYYMMDD \
-  --sfm.max_num_features 8192 \
+  --sfm.SiftExtraction.max_num_features 8192 \
   --mvs.patch_match_backend cuda \
   --mvs.patch_match_iterations 3 \
   --mvs.dense_map_format binary \
@@ -426,7 +370,7 @@ $COLITE recon_auto \
 - `start_from/stop_after`：`sfm|undistort|stereo|fusion|mesh|simplify|texture`。
 - `mesher`：`poisson|delaunay|none`，默认 poisson。
 - `simplify`、`texture` 默认 1。
-- `--sfm.<option>` 转发到 `recon_sfm`。
+- `--sfm.<canonical-option>` 转发到 `recon_sfm`，包括 ImageReader.*、FeatureExtraction.*、Mapper.* 和 Colite.*；dry_run 也先校验。旧 --sfm.camera_mode 等名称不再接受。
 - `--mvs.<option>` 转发到去畸变、PatchMatch 和 Fusion。
 - 表面参数保持 `--PoissonMeshing.*`、`--DelaunayMeshing.*`、`--MeshSimplification.*`、`--MeshTextureMapping.*`。
 
@@ -442,6 +386,14 @@ $COLITE recon_auto --image_path data/building-18 --output_path "$OUT" \
 
 ## COLMAP 模型比较
 
+比较器支持 TXT/BIN 和混合格式；默认自动识别。也可以在同一模型目录中直接
+比较两种保存格式：
+
+```bash
+$COLITE compare_colmap --reference_path converted --candidate_path converted \
+  --reference_format txt --candidate_format bin --output_path format_comparison
+```
+
 ```bash
 $COLITE compare_colmap \
   --reference_path output/reference_colmap/sparse/0 \
@@ -450,3 +402,16 @@ $COLITE compare_colmap \
 ```
 
 输出 `summary.txt`、`image_diff.tsv`、`pose_diff.tsv`、`point_diff.tsv` 和 `pair_diff.tsv`。位姿先按共同相机中心估计 Sim(3)；独立模型点 ID 不可视为对应关系。
+
+可用标准库 Python 脚本执行真实双向互操作验证，覆盖全部 12 种相机模型，并可
+额外传入已有重建结果：
+
+```bash
+python3 scripts/check_colmap_model_interop.py \
+  --colite "$COLITE" --colmap /path/to/colmap \
+  --output_path output/model_interop --input_path sparse/0
+```
+
+脚本独立解码 TXT/BIN，逐字段检查 `COLITE → COLMAP → COLITE`，保存模型、
+进程日志和 `report.json`。本地 COLMAP 4.0 的 TXT 读取器会截断含空格的图像名，
+并将点 ID 按有符号 64 位解析；这些特殊数据跨工具交换时应选择 BIN。

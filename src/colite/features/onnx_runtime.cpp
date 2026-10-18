@@ -118,6 +118,14 @@ OnnxModel::OnnxModel(const std::filesystem::path& model_path,
                                  .GetTensorTypeAndShapeInfo()
                                  .GetShape());
   }
+  input_name_ptrs_.reserve(input_names_.size());
+  output_name_ptrs_.reserve(output_names_.size());
+  for (const std::string& name : input_names_) {
+    input_name_ptrs_.push_back(name.c_str());
+  }
+  for (const std::string& name : output_names_) {
+    output_name_ptrs_.push_back(name.c_str());
+  }
 }
 
 std::vector<Ort::Value> OnnxModel::Run(
@@ -125,29 +133,24 @@ std::vector<Ort::Value> OnnxModel::Run(
   if (input_tensors.size() != input_names_.size()) {
     throw std::invalid_argument("ONNX input tensor count does not match model");
   }
-  std::vector<const char*> input_names;
-  std::vector<const char*> output_names;
-  input_names.reserve(input_names_.size());
-  output_names.reserve(output_names_.size());
-  for (const std::string& name : input_names_) input_names.push_back(name.c_str());
-  for (const std::string& name : output_names_) output_names.push_back(name.c_str());
+
   if (execution_provider_ == OnnxExecutionProvider::kCuda && use_io_binding_) {
     Ort::IoBinding binding(*session_);
     for (std::size_t idx = 0; idx < input_tensors.size(); ++idx) {
-      binding.BindInput(input_names[idx], input_tensors[idx]);
+      binding.BindInput(input_name_ptrs_[idx], input_tensors[idx]);
     }
     const Ort::MemoryInfo cpu_memory = Ort::MemoryInfo::CreateCpu(
         OrtAllocatorType::OrtDeviceAllocator, OrtMemType::OrtMemTypeCPU);
-    for (const char* output_name : output_names) {
+    for (const char* output_name : output_name_ptrs_) {
       binding.BindOutput(output_name, cpu_memory);
     }
     session_->Run(Ort::RunOptions{nullptr}, binding);
     binding.SynchronizeOutputs();
     return binding.GetOutputValues();
   }
-  return session_->Run(Ort::RunOptions{nullptr}, input_names.data(),
+  return session_->Run(Ort::RunOptions{nullptr}, input_name_ptrs_.data(),
                        input_tensors.data(), input_tensors.size(),
-                       output_names.data(), output_names.size());
+                       output_name_ptrs_.data(), output_name_ptrs_.size());
 }
 
 }  // namespace colite::features

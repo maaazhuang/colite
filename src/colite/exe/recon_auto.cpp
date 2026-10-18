@@ -75,9 +75,9 @@ int RunReconAuto(const std::vector<std::string>& args,
              "[--stop_after sfm|undistort|stereo|fusion|mesh|simplify|texture] "
              "[--mesher poisson|delaunay|none] [--simplify 0|1] "
              "[--texture 0|1] "
-             "[--sfm.camera_model SIMPLE_RADIAL] "
-             "[--sfm.camera_params CSV] "
-             "[--sfm.camera_mode auto|single|per_folder|per_image] "
+             "[--sfm.ImageReader.camera_model SIMPLE_RADIAL] "
+             "[--sfm.ImageReader.camera_params CSV] "
+             "[--sfm.ImageReader.single_camera 0|1] "
              "[--sfm.<option> value] [--mvs.<option> value] "
              "[--resume|--force] [--dry_run]\n";
       return 0;
@@ -125,9 +125,10 @@ int RunReconAuto(const std::vector<std::string>& args,
       AppendOptionsWithPrefix(values, "--sfm.", &sfm_args, true);
       if (stage.resume) sfm_args.push_back("--resume");
       if (stage.force) sfm_args.push_back("--force");
+      ValidateReconSfmArguments(sfm_args);
       const ColmapModelFormat sfm_format = ColmapModelFormatFromString(
-          values.count("--sfm.output_format")
-              ? values.at("--sfm.output_format")
+          values.count("--sfm.Colite.output_format")
+              ? values.at("--sfm.Colite.output_format")
               : "both");
       std::vector<std::filesystem::path> sfm_outputs{sfm / "points3D.ply"};
       if (sfm_format == ColmapModelFormat::kText ||

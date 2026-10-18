@@ -5,11 +5,14 @@
 
 #include <climits>
 #include <mutex>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 
 namespace colite::cuda_matcher {
 namespace {
+
+int& SelectedDevice() { static int device = 0; return device; }
 
 void CheckCuda(cudaError_t status, const char* operation) {
   if (status == cudaSuccess) return;
@@ -33,6 +36,7 @@ class CudaDescriptorBuffer final : public DescriptorBuffer {
                        int columns,
                        const float* keypoints_xy)
       : rows_(rows), columns_(columns) {
+    CheckCuda(cudaGetDevice(&device_), "cudaGetDevice buffer");
     if (rows < 0 || columns < 0) {
       throw std::invalid_argument("Descriptor dimensions must be non-negative.");
     }
@@ -57,8 +61,10 @@ class CudaDescriptorBuffer final : public DescriptorBuffer {
             descriptor_sums[static_cast<std::size_t>(row)] += value;
           }
         }
-        CheckCuda(cudaMalloc(&signed_data_, descriptor_bytes),
+        const std::size_t signed_bytes = static_cast<std::size_t>(PaddedRows()) * columns;
+        CheckCuda(cudaMalloc(&signed_data_, signed_bytes),
                   "cudaMalloc signed descriptors");
+        CheckCuda(cudaMemset(signed_data_, 0, signed_bytes), "cudaMemset descriptor padding");
         CheckCuda(cudaMalloc(&descriptor_sums_,
                              descriptor_sums.size() * sizeof(int)),
                   "cudaMalloc descriptor sums");
@@ -93,12 +99,14 @@ class CudaDescriptorBuffer final : public DescriptorBuffer {
   }
 
   ~CudaDescriptorBuffer() override {
+    cudaSetDevice(device_);
     if (data_ != nullptr) cudaFree(data_);
     if (signed_data_ != nullptr) cudaFree(signed_data_);
     if (descriptor_sums_ != nullptr) cudaFree(descriptor_sums_);
     if (keypoints_xy_ != nullptr) cudaFree(keypoints_xy_);
   }
   int Rows() const override { return rows_; }
+  int PaddedRows() const { return (rows_ + 3) / 4 * 4; }
   int Columns() const override { return columns_; }
   const std::uint8_t* Data() const { return data_; }
   const std::int8_t* SignedData() const { return signed_data_; }
@@ -107,6 +115,7 @@ class CudaDescriptorBuffer final : public DescriptorBuffer {
   bool HasKeypoints() const { return keypoints_xy_ != nullptr; }
 
  private:
+  int device_ = 0;
   int rows_ = 0;
   int columns_ = 0;
   std::uint8_t* data_ = nullptr;
@@ -142,12 +151,15 @@ class CudaMatcherWorkspace {
     cudaFree(backward_output_);
     cudaFree(candidate_offsets_);
     cudaFree(candidate_indices_);
+    cudaFree(column_partials_);
     cublasDestroy(cublas_handle_);
   }
 
   void EnsureMutual(const std::size_t matrix_values,
                     const std::size_t forward_values,
                     const std::size_t backward_values) {
+    EnsureDeviceCapacity(&column_partials_, &column_partials_capacity_,
+        ((forward_values + 255) / 256) * backward_values, "cudaMalloc column partials");
     EnsureDeviceCapacity(&dot_matrix_, &dot_matrix_capacity_, matrix_values,
                          "cudaMalloc matcher dot matrix workspace");
     EnsureDeviceCapacity(&forward_output_, &forward_output_capacity_,
@@ -176,6 +188,7 @@ class CudaMatcherWorkspace {
   int* DotMatrix() const { return dot_matrix_; }
   BestMatch* ForwardOutput() const { return forward_output_; }
   BestMatch* BackwardOutput() const { return backward_output_; }
+  BestMatch* ColumnPartials() const { return column_partials_; }
   int* CandidateOffsets() const { return candidate_offsets_; }
   int* CandidateIndices() const { return candidate_indices_; }
 
@@ -184,6 +197,8 @@ class CudaMatcherWorkspace {
   int* dot_matrix_ = nullptr;
   BestMatch* forward_output_ = nullptr;
   BestMatch* backward_output_ = nullptr;
+  BestMatch* column_partials_ = nullptr;
+  std::size_t column_partials_capacity_ = 0;
   int* candidate_offsets_ = nullptr;
   int* candidate_indices_ = nullptr;
   std::size_t dot_matrix_capacity_ = 0;
@@ -237,73 +252,127 @@ __global__ void FindBestKernel(const std::uint8_t* query,
   if (lane == 0) output[query_idx] = {best_idx, best_dot, second_best_dot};
 }
 
+__device__ void InsertBestTwo(const int score, const int index,
+                             int* best, int* best_index,
+                             int* second, int* second_index) {
+  if (index < 0 || index == *best_index || index == *second_index) return;
+  if (score > *best || (score == *best && index < *best_index)) {
+    *second = *best;
+    *second_index = *best_index;
+    *best = score;
+    *best_index = index;
+  } else if (score > *second || (score == *second && index < *second_index)) {
+    *second = score;
+    *second_index = index;
+  }
+}
+
+// One warp scans one row with contiguous loads. One thread per row caused
+// strided global-memory transactions across the warp and long serial scans.
+template <bool Guided>
 __global__ void ReduceDotMatrixRowsKernel(const int* dot_matrix,
                                           int num_rows,
                                           int num_columns,
+                                          int matrix_stride,
                                           int dimensions,
                                           const int* row_sums,
                                           const int* column_sums,
                                           BestMatch* output) {
-  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  const int row = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  const int lane = threadIdx.x % 32;
   if (row >= num_rows) return;
   int best_idx = -1;
   int second_best_idx = -1;
   int best_dot = INT_MIN;
   int second_best_dot = INT_MIN;
   const int* values =
-      dot_matrix + static_cast<std::size_t>(row) * num_columns;
-  for (int column = 0; column < num_columns; ++column) {
-    const int dot = values[column] + 128 * column_sums[column];
-    if (dot > best_dot) {
-      second_best_idx = best_idx;
-      best_idx = column;
-      second_best_dot = best_dot;
-      best_dot = dot;
-    } else if (dot > second_best_dot) {
-      second_best_idx = column;
-      second_best_dot = dot;
+      dot_matrix + static_cast<std::size_t>(row) * matrix_stride;
+  for (int column = lane; column < num_columns; column += 32) {
+    int dot = values[column];
+    if constexpr (Guided) {
+      if (dot < 0) continue;
+    } else {
+      dot += 128 * column_sums[column];
+    }
+    InsertBestTwo(dot, column, &best_dot, &best_idx,
+                  &second_best_dot, &second_best_idx);
+  }
+  for (int offset = 16; offset > 0; offset /= 2) {
+    const int other_best = __shfl_down_sync(0xFFFFFFFF, best_dot, offset);
+    const int other_index = __shfl_down_sync(0xFFFFFFFF, best_idx, offset);
+    const int other_second = __shfl_down_sync(0xFFFFFFFF, second_best_dot, offset);
+    const int other_second_index = __shfl_down_sync(0xFFFFFFFF, second_best_idx, offset);
+    if (lane + offset < 32) {
+      InsertBestTwo(other_best, other_index, &best_dot, &best_idx,
+                    &second_best_dot, &second_best_idx);
+      InsertBestTwo(other_second, other_second_index, &best_dot, &best_idx,
+                    &second_best_dot, &second_best_idx);
     }
   }
-  const int row_correction = 128 * row_sums[row] - dimensions * 128 * 128;
-  best_dot += row_correction;
-  second_best_dot =
-      second_best_idx >= 0 ? second_best_dot + row_correction : -1;
-  output[row] = {best_idx, best_dot, second_best_dot};
+  if (lane == 0) {
+    int correction = 0;
+    if constexpr (!Guided) correction = 128 * row_sums[row] - dimensions * 128 * 128;
+    output[row] = {best_idx, best_idx >= 0 ? best_dot + correction : -1,
+                   second_best_idx >= 0 ? second_best_dot + correction : -1};
+  }
 }
 
-__global__ void ReduceDotMatrixColumnsKernel(const int* dot_matrix,
-                                             int num_rows,
-                                             int num_columns,
-                                             int dimensions,
-                                             const int* row_sums,
-                                             const int* column_sums,
-                                             BestMatch* output) {
-  const int column = blockIdx.x * blockDim.x + threadIdx.x;
-  if (column >= num_columns) return;
-  int best_idx = -1;
-  int second_best_idx = -1;
-  int best_dot = INT_MIN;
-  int second_best_dot = INT_MIN;
-  for (int row = 0; row < num_rows; ++row) {
-    const int dot =
-        dot_matrix[static_cast<std::size_t>(row) * num_columns + column] +
-        128 * row_sums[row];
-    if (dot > best_dot) {
-      second_best_idx = best_idx;
-      best_idx = row;
-      second_best_dot = best_dot;
-      best_dot = dot;
-    } else if (dot > second_best_dot) {
-      second_best_idx = row;
-      second_best_dot = dot;
+// Split long columns into independent tiles. A single thread scanning an
+// entire 8K-16K column leaves too few blocks to hide memory latency.
+template <bool Guided>
+__global__ void ReduceColumnTilesKernel(const int* dots, int rows, int columns, int matrix_stride,
+    const int* row_sums, BestMatch* partials) {
+  const int column = blockIdx.x * 32 + threadIdx.x;
+  const int lane_row = threadIdx.y;
+  int best = INT_MIN, second = INT_MIN, best_index = -1, second_index = -1;
+  for (int row = blockIdx.y * 256 + lane_row;
+       row < rows && row < (blockIdx.y + 1) * 256; row += 8) {
+    if (column < columns) {
+      int dot = dots[static_cast<std::size_t>(row) * matrix_stride + column];
+      if constexpr (Guided) { if (dot < 0) continue; }
+      else dot += 128 * row_sums[row];
+      InsertBestTwo(dot, row, &best, &best_index, &second, &second_index);
     }
   }
-  const int column_correction =
-      128 * column_sums[column] - dimensions * 128 * 128;
-  best_dot += column_correction;
-  second_best_dot =
-      second_best_idx >= 0 ? second_best_dot + column_correction : -1;
-  output[column] = {best_idx, best_dot, second_best_dot};
+  __shared__ int scores[8][32], indices[8][32], seconds[8][32], second_indices[8][32];
+  scores[lane_row][threadIdx.x] = best;
+  indices[lane_row][threadIdx.x] = best_index;
+  seconds[lane_row][threadIdx.x] = second;
+  second_indices[lane_row][threadIdx.x] = second_index;
+  __syncthreads();
+  if (lane_row == 0 && column < columns) {
+    for (int i = 1; i < 8; ++i) {
+      InsertBestTwo(scores[i][threadIdx.x], indices[i][threadIdx.x],
+          &best, &best_index, &second, &second_index);
+      InsertBestTwo(seconds[i][threadIdx.x], second_indices[i][threadIdx.x],
+          &best, &best_index, &second, &second_index);
+    }
+    partials[static_cast<std::size_t>(blockIdx.y) * columns + column] =
+        {best_index, best, second};
+  }
+}
+
+template <bool Guided>
+__global__ void FinishColumnTilesKernel(const BestMatch* partials, int tiles,
+    int columns, int dimensions, const int* column_sums, BestMatch* output) {
+  const int column = blockIdx.x * blockDim.x + threadIdx.x;
+  if (column >= columns) return;
+  int best = INT_MIN, second = INT_MIN, index = -1;
+  for (int tile = 0; tile < tiles; ++tile) {
+    const auto candidate = partials[static_cast<std::size_t>(tile) * columns + column];
+    if (candidate.index < 0) continue;
+    if (candidate.best_dot > best ||
+        (candidate.best_dot == best && (index < 0 || candidate.index < index))) {
+      second = max(second, best);
+      best = candidate.best_dot;
+      index = candidate.index;
+    } else second = max(second, candidate.best_dot);
+    second = max(second, candidate.second_best_dot);
+  }
+  int correction = 0;
+  if constexpr (!Guided) correction = 128 * column_sums[column] - dimensions * 128 * 128;
+  output[column] = {index, index >= 0 ? best + correction : -1,
+                   second != INT_MIN ? second + correction : -1};
 }
 
 __global__ void FindBestGuidedKernel(const std::uint8_t* query,
@@ -357,147 +426,30 @@ struct FundamentalMatrixF {
   float data[9];
 };
 
-__global__ void ComputeGuidedDotMatrixKernel(
-    const std::uint8_t* features1,
-    int num_features1,
-    const float* keypoints1,
-    const std::uint8_t* features2,
-    int num_features2,
-    const float* keypoints2,
-    int dimensions,
-    FundamentalMatrixF fundamental,
-    float max_squared_error,
-    int* dot_matrix) {
-  constexpr int kQueriesPerBlock = 8;
-  constexpr int kTrainPerBlock = 128;
-  constexpr int kDescriptorWords = 32;
-  __shared__ unsigned int query_descriptors[kQueriesPerBlock]
-                                                   [kDescriptorWords];
-  __shared__ float query_locations[kQueriesPerBlock][2];
-
-  const int query_start = blockIdx.y * kQueriesPerBlock;
-  for (int idx = threadIdx.x;
-       idx < kQueriesPerBlock * kDescriptorWords;
-       idx += blockDim.x) {
-    const int local_query = idx / kDescriptorWords;
-    const int word = idx % kDescriptorWords;
-    const int query_idx = query_start + local_query;
-    query_descriptors[local_query][word] =
-        query_idx < num_features1
-            ? reinterpret_cast<const unsigned int*>(
-                  features1 + query_idx * dimensions)[word]
-            : 0U;
-  }
-  if (threadIdx.x < kQueriesPerBlock * 2) {
-    const int local_query = threadIdx.x / 2;
-    const int coordinate = threadIdx.x % 2;
-    const int query_idx = query_start + local_query;
-    query_locations[local_query][coordinate] =
-        query_idx < num_features1
-            ? keypoints1[query_idx * 2 + coordinate]
-            : 0.0F;
-  }
-  __syncthreads();
-
-  const int train_idx = blockIdx.x * kTrainPerBlock + threadIdx.x;
-  if (train_idx >= num_features2) return;
-  const float train_x = keypoints2[train_idx * 2];
-  const float train_y = keypoints2[train_idx * 2 + 1];
-  const float* f = fundamental.data;
-  const float ftx2_x = f[0] * train_x + f[3] * train_y + f[6];
-  const float ftx2_y = f[1] * train_x + f[4] * train_y + f[7];
-
-  bool accepted[kQueriesPerBlock];
-  unsigned int dots[kQueriesPerBlock] = {};
-#pragma unroll
-  for (int local_query = 0; local_query < kQueriesPerBlock; ++local_query) {
-    const int query_idx = query_start + local_query;
-    const float query_x = query_locations[local_query][0];
-    const float query_y = query_locations[local_query][1];
-    const float fx1_x = f[0] * query_x + f[1] * query_y + f[2];
-    const float fx1_y = f[3] * query_x + f[4] * query_y + f[5];
-    const float fx1_z = f[6] * query_x + f[7] * query_y + f[8];
-    const float residual = train_x * fx1_x + train_y * fx1_y + fx1_z;
-    const float denominator = fx1_x * fx1_x + fx1_y * fx1_y +
-                              ftx2_x * ftx2_x + ftx2_y * ftx2_y;
-    accepted[local_query] =
-        query_idx < num_features1 && denominator > 0.0F &&
-        isfinite(denominator) &&
-        residual * residual <= max_squared_error * denominator;
-  }
-
-  const unsigned int* train_descriptor =
-      reinterpret_cast<const unsigned int*>(
-          features2 + train_idx * dimensions);
-#pragma unroll
-  for (int word = 0; word < kDescriptorWords; ++word) {
-    const unsigned int rhs = train_descriptor[word];
-#pragma unroll
-    for (int local_query = 0; local_query < kQueriesPerBlock;
-         ++local_query) {
-      if (accepted[local_query]) {
-        dots[local_query] = __dp4a(
-            query_descriptors[local_query][word], rhs, dots[local_query]);
-      }
-    }
-  }
-
-#pragma unroll
-  for (int local_query = 0; local_query < kQueriesPerBlock; ++local_query) {
-    const int query_idx = query_start + local_query;
-    if (query_idx < num_features1) {
-      dot_matrix[static_cast<std::size_t>(query_idx) * num_features2 +
-                 train_idx] =
-          accepted[local_query] ? static_cast<int>(dots[local_query]) : -1;
-    }
-  }
-}
-
-__global__ void ReduceGuidedDotMatrixRowsKernel(const int* dot_matrix,
-                                                int num_rows,
-                                                int num_columns,
-                                                BestMatch* output) {
-  const int row = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= num_rows) return;
-  int best_idx = -1;
-  int best_dot = -1;
-  int second_best_dot = -1;
-  const int* values =
-      dot_matrix + static_cast<std::size_t>(row) * num_columns;
-  for (int column = 0; column < num_columns; ++column) {
-    const int dot = values[column];
-    if (dot > best_dot) {
-      best_idx = column;
-      second_best_dot = best_dot;
-      best_dot = dot;
-    } else if (dot > second_best_dot) {
-      second_best_dot = dot;
-    }
-  }
-  output[row] = {best_idx, best_dot, second_best_dot};
-}
-
-__global__ void ReduceGuidedDotMatrixColumnsKernel(const int* dot_matrix,
-                                                   int num_rows,
-                                                   int num_columns,
-                                                   BestMatch* output) {
+// Tensor-core GEMM supplies the exact integer dots. Geometry is a bandwidth
+// pass; do not recompute 128 descriptor components with scalar DP4A here.
+__global__ void MaskGuidedDotMatrixKernel(int* dots, int rows, int columns, int matrix_stride,
+    const float* keypoints1, const float* keypoints2, const int* sums1,
+    const int* sums2, int dimensions, FundamentalMatrixF fundamental,
+    float max_squared_error) {
   const int column = blockIdx.x * blockDim.x + threadIdx.x;
-  if (column >= num_columns) return;
-  int best_idx = -1;
-  int best_dot = -1;
-  int second_best_dot = -1;
-  for (int row = 0; row < num_rows; ++row) {
-    const int dot =
-        dot_matrix[static_cast<std::size_t>(row) * num_columns + column];
-    if (dot > best_dot) {
-      best_idx = row;
-      second_best_dot = best_dot;
-      best_dot = dot;
-    } else if (dot > second_best_dot) {
-      second_best_dot = dot;
-    }
-  }
-  output[column] = {best_idx, best_dot, second_best_dot};
+  const int row = blockIdx.y;
+  if (column >= columns || row >= rows) return;
+  const float x = keypoints1[2 * row], y = keypoints1[2 * row + 1];
+  const float u = keypoints2[2 * column], v = keypoints2[2 * column + 1];
+  const float* f = fundamental.data;
+  const float fx = f[0] * x + f[1] * y + f[2];
+  const float fy = f[3] * x + f[4] * y + f[5];
+  const float fz = f[6] * x + f[7] * y + f[8];
+  const float ftx = f[0] * u + f[3] * v + f[6];
+  const float fty = f[1] * u + f[4] * v + f[7];
+  const float residual = u * fx + v * fy + fz;
+  const float denominator = fx * fx + fy * fy + ftx * ftx + fty * fty;
+  const auto index = static_cast<std::size_t>(row) * matrix_stride + column;
+  if (denominator > 0 && isfinite(denominator) &&
+      residual * residual <= max_squared_error * denominator) {
+    dots[index] += 128 * (sums1[row] + sums2[column]) - dimensions * 128 * 128;
+  } else dots[index] = -1;
 }
 
 std::mutex& RuntimeMutex() {
@@ -506,11 +458,19 @@ std::mutex& RuntimeMutex() {
 }
 
 CudaMatcherWorkspace& RuntimeWorkspace() {
-  static CudaMatcherWorkspace* workspace = new CudaMatcherWorkspace();
+  static auto* workspaces = new std::map<int, std::unique_ptr<CudaMatcherWorkspace>>();
+  auto& workspace = (*workspaces)[SelectedDevice()];
+  if (!workspace) workspace = std::make_unique<CudaMatcherWorkspace>();
   return *workspace;
 }
 
 }  // namespace
+
+void SetDevice(int device) {
+  const std::lock_guard<std::mutex> lock(RuntimeMutex());
+  CheckCuda(cudaSetDevice(device), "FeatureMatching.gpu_index");
+  SelectedDevice() = device;
+}
 
 bool IsAvailable() {
   int count = 0;
@@ -529,6 +489,7 @@ std::unique_ptr<DescriptorBuffer> CreateBuffer(const std::uint8_t* descriptors,
         "CUDA descriptor matcher requires dimensions divisible by four.");
   }
   const std::lock_guard<std::mutex> lock(RuntimeMutex());
+  CheckCuda(cudaSetDevice(SelectedDevice()), "cudaSetDevice matcher");
   return std::make_unique<CudaDescriptorBuffer>(descriptors, rows, columns,
                                                 keypoints_xy);
 }
@@ -545,6 +506,7 @@ std::vector<BestMatch> FindBestMatches(const DescriptorBuffer& query_base,
   if (query->Rows() == 0 || train->Rows() == 0) return result;
 
   const std::lock_guard<std::mutex> lock(RuntimeMutex());
+  CheckCuda(cudaSetDevice(SelectedDevice()), "cudaSetDevice matcher");
   CudaMatcherWorkspace& workspace = RuntimeWorkspace();
   workspace.EnsureGuided(/*offset_values=*/0, /*index_values=*/0,
                          result.size());
@@ -581,13 +543,14 @@ MutualBestMatches FindBestMatchesMutual(
   if (features1->Rows() == 0 || features2->Rows() == 0) return result;
 
   const std::size_t matrix_values =
-      static_cast<std::size_t>(features1->Rows()) * features2->Rows();
+      static_cast<std::size_t>(features1->PaddedRows()) * features2->PaddedRows();
   const std::size_t forward_bytes =
       result.forward.size() * sizeof(BestMatch);
   const std::size_t backward_bytes =
       result.backward.size() * sizeof(BestMatch);
 
   const std::lock_guard<std::mutex> lock(RuntimeMutex());
+  CheckCuda(cudaSetDevice(SelectedDevice()), "cudaSetDevice matcher");
   CudaMatcherWorkspace& workspace = RuntimeWorkspace();
   workspace.EnsureMutual(matrix_values, result.forward.size(),
                          result.backward.size());
@@ -600,26 +563,26 @@ MutualBestMatches FindBestMatchesMutual(
   CheckCublas(
       cublasGemmEx(
           workspace.CublasHandle(), CUBLAS_OP_T, CUBLAS_OP_N,
-          features2->Rows(), features1->Rows(), features1->Columns(), &alpha,
+          features2->PaddedRows(), features1->PaddedRows(), features1->Columns(), &alpha,
           features2->SignedData(), CUDA_R_8I, features2->Columns(),
           features1->SignedData(), CUDA_R_8I, features1->Columns(), &beta,
-          device_matrix, CUDA_R_32I, features2->Rows(), CUBLAS_COMPUTE_32I,
+          device_matrix, CUDA_R_32I, features2->PaddedRows(), CUBLAS_COMPUTE_32I,
           CUBLAS_GEMM_DEFAULT_TENSOR_OP),
       "cublasGemmEx mutual descriptor dots");
 
   constexpr int kReductionThreads = 256;
-  ReduceDotMatrixRowsKernel<<<
-      (features1->Rows() + kReductionThreads - 1) / kReductionThreads,
+  ReduceDotMatrixRowsKernel<false><<<
+      (features1->Rows() + kReductionThreads / 32 - 1) / (kReductionThreads / 32),
       kReductionThreads>>>(
-      device_matrix, features1->Rows(), features2->Rows(),
+      device_matrix, features1->Rows(), features2->Rows(), features2->PaddedRows(),
       features1->Columns(), features1->DescriptorSums(),
       features2->DescriptorSums(), device_forward);
   CheckCuda(cudaGetLastError(), "CUDA mutual row reduction kernel launch");
-  ReduceDotMatrixColumnsKernel<<<
-      (features2->Rows() + kReductionThreads - 1) / kReductionThreads,
-      kReductionThreads>>>(
-      device_matrix, features1->Rows(), features2->Rows(),
-      features1->Columns(), features1->DescriptorSums(),
+  const int tiles = (features1->Rows() + 255) / 256;
+  ReduceColumnTilesKernel<false><<<dim3((features2->Rows() + 31) / 32, tiles), dim3(32, 8)>>>(
+      device_matrix, features1->Rows(), features2->Rows(), features2->PaddedRows(), features1->DescriptorSums(), workspace.ColumnPartials());
+  FinishColumnTilesKernel<false><<<(features2->Rows() + 255) / 256, 256>>>(
+      workspace.ColumnPartials(), tiles, features2->Rows(), features1->Columns(),
       features2->DescriptorSums(), device_backward);
   CheckCuda(cudaGetLastError(), "CUDA mutual column reduction kernel launch");
 
@@ -668,6 +631,7 @@ std::vector<BestMatch> FindBestMatchesGuided(
   }
 
   const std::lock_guard<std::mutex> lock(RuntimeMutex());
+  CheckCuda(cudaSetDevice(SelectedDevice()), "cudaSetDevice matcher");
   CudaMatcherWorkspace& workspace = RuntimeWorkspace();
   workspace.EnsureGuided(candidate_offsets.size(), candidate_indices.size(),
                          result.size());
@@ -733,41 +697,46 @@ MutualBestMatches FindBestMatchesGuidedFundamental(
   }
 
   const std::size_t matrix_values =
-      static_cast<std::size_t>(features1->Rows()) * features2->Rows();
+      static_cast<std::size_t>(features1->PaddedRows()) * features2->PaddedRows();
   const std::size_t forward_bytes =
       result.forward.size() * sizeof(BestMatch);
   const std::size_t backward_bytes =
       result.backward.size() * sizeof(BestMatch);
   const std::lock_guard<std::mutex> lock(RuntimeMutex());
+  CheckCuda(cudaSetDevice(SelectedDevice()), "cudaSetDevice matcher");
   CudaMatcherWorkspace& workspace = RuntimeWorkspace();
   workspace.EnsureMutual(matrix_values, result.forward.size(),
                          result.backward.size());
 
-  constexpr int kTrainPerBlock = 128;
-  constexpr int kQueriesPerBlock = 8;
-  const dim3 blocks(
-      (features2->Rows() + kTrainPerBlock - 1) / kTrainPerBlock,
-      (features1->Rows() + kQueriesPerBlock - 1) / kQueriesPerBlock);
-  ComputeGuidedDotMatrixKernel<<<blocks, kTrainPerBlock>>>(
-      features1->Data(), features1->Rows(), features1->Keypoints(),
-      features2->Data(), features2->Rows(), features2->Keypoints(),
-      features1->Columns(), fundamental,
-      static_cast<float>(max_sampson_error_px * max_sampson_error_px),
-      workspace.DotMatrix());
+  const int alpha = 1, beta = 0;
+  CheckCublas(cublasGemmEx(workspace.CublasHandle(), CUBLAS_OP_T, CUBLAS_OP_N,
+      features2->PaddedRows(), features1->PaddedRows(), features1->Columns(), &alpha,
+      features2->SignedData(), CUDA_R_8I, features2->Columns(),
+      features1->SignedData(), CUDA_R_8I, features1->Columns(), &beta,
+      workspace.DotMatrix(), CUDA_R_32I, features2->PaddedRows(), CUBLAS_COMPUTE_32I,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP), "cublasGemmEx guided descriptor dots");
+  constexpr int kMaskThreads = 256;
+  const dim3 blocks((features2->Rows() + kMaskThreads - 1) / kMaskThreads, features1->Rows());
+  MaskGuidedDotMatrixKernel<<<blocks, kMaskThreads>>>(workspace.DotMatrix(),
+      features1->Rows(), features2->Rows(), features2->PaddedRows(), features1->Keypoints(), features2->Keypoints(),
+      features1->DescriptorSums(), features2->DescriptorSums(), features1->Columns(),
+      fundamental, static_cast<float>(max_sampson_error_px * max_sampson_error_px));
   CheckCuda(cudaGetLastError(),
             "CUDA fused guided dot matrix kernel launch");
 
   constexpr int kReductionThreads = 256;
-  ReduceGuidedDotMatrixRowsKernel<<<
-      (features1->Rows() + kReductionThreads - 1) / kReductionThreads,
+  ReduceDotMatrixRowsKernel<true><<<
+      (features1->Rows() + kReductionThreads / 32 - 1) / (kReductionThreads / 32),
       kReductionThreads>>>(workspace.DotMatrix(), features1->Rows(),
-                           features2->Rows(), workspace.ForwardOutput());
+                           features2->Rows(), features2->PaddedRows(), 0, nullptr, nullptr,
+                           workspace.ForwardOutput());
   CheckCuda(cudaGetLastError(),
             "CUDA fused guided row reduction kernel launch");
-  ReduceGuidedDotMatrixColumnsKernel<<<
-      (features2->Rows() + kReductionThreads - 1) / kReductionThreads,
-      kReductionThreads>>>(workspace.DotMatrix(), features1->Rows(),
-                           features2->Rows(), workspace.BackwardOutput());
+  const int tiles = (features1->Rows() + 255) / 256;
+  ReduceColumnTilesKernel<true><<<dim3((features2->Rows() + 31) / 32, tiles), dim3(32, 8)>>>(
+      workspace.DotMatrix(), features1->Rows(), features2->Rows(), features2->PaddedRows(), nullptr, workspace.ColumnPartials());
+  FinishColumnTilesKernel<true><<<(features2->Rows() + 255) / 256, 256>>>(
+      workspace.ColumnPartials(), tiles, features2->Rows(), 0, nullptr, workspace.BackwardOutput());
   CheckCuda(cudaGetLastError(),
             "CUDA fused guided column reduction kernel launch");
 

@@ -75,6 +75,7 @@ std::vector<float> GrayToFloatVector(const cv::Mat& gray,
 }
 
 double EffectiveVlSiftPeakThreshold(const SiftExtractionOptions& options) {
+  if (options.peak_threshold > 0.0) return options.peak_threshold;
   // COLMAP CPU SIFT 的 peak_threshold 默认是 0.02 / octave_resolution。
   if (std::abs(options.contrast_threshold -
                kDefaultOpenCvContrastThreshold) < 1e-12) {
@@ -140,7 +141,7 @@ FeatureSet ExtractCvSiftFeatures(const cv::Mat& gray,
       descriptors.data(), keypoints.size(), options.use_root_sift);
   result.descriptor_normalization =
       options.use_root_sift ? DescriptorNormalization::kRootL1
-                            : DescriptorNormalization::kNone;
+                            : DescriptorNormalization::kL2;
   return result;
 }
 
@@ -278,7 +279,7 @@ FeatureSet ExtractVlSiftFeatures(const cv::Mat& gray,
       descriptors.data(), result.keypoints.size(), options.use_root_sift);
   result.descriptor_normalization =
       options.use_root_sift ? DescriptorNormalization::kRootL1
-                            : DescriptorNormalization::kNone;
+                            : DescriptorNormalization::kL2;
   return result;
 }
 
@@ -332,12 +333,30 @@ SiftBackend ResolveSiftBackend(const SiftBackend requested) {
   if (requested != SiftBackend::kAuto) {
     return requested;
   }
-  return IsCudaSiftAvailable() ? SiftBackend::kCudaSift
-                               : SiftBackend::kCvSift;
+  return IsCudaSiftAvailable() ? SiftBackend::kCudaVlSift
+                               : SiftBackend::kVlSift;
 }
 
 FeatureSet ExtractSiftFeatures(const cv::Mat& image,
                                const SiftExtractionOptions& options) {
+  if (options.max_image_size > 0 &&
+      std::max(image.cols, image.rows) > options.max_image_size) {
+    const double ratio = static_cast<double>(options.max_image_size) / std::max(image.cols, image.rows);
+    cv::Mat resized;
+    cv::resize(image, resized, cv::Size(std::max(1, static_cast<int>(std::round(image.cols * ratio))),
+                                     std::max(1, static_cast<int>(std::round(image.rows * ratio)))), 0, 0, cv::INTER_AREA);
+    auto nested = options;
+    nested.max_image_size = 0;
+    FeatureSet features = ExtractSiftFeatures(resized, nested);
+    const float sx = static_cast<float>(image.cols) / resized.cols;
+    const float sy = static_cast<float>(image.rows) / resized.rows;
+    for (auto& keypoint : features.keypoints) {
+      keypoint.x *= sx;
+      keypoint.y *= sy;
+      keypoint.scale *= (sx + sy) * 0.5F;
+    }
+    return features;
+  }
   const cv::Mat gray = ToGrayImage(image);
   const SiftBackend backend = ResolveSiftBackend(options.backend);
   switch (backend) {

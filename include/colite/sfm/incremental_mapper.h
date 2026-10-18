@@ -69,6 +69,7 @@ struct IncrementalMapperSummary {
 
 // 完整增量建图参数。initialization 负责初始图像对，mapper 负责后续每张图像。
 struct IncrementalMappingOptions {
+  bool relax_initialization_constraints = false;
   IncrementalInitializerOptions initialization;
   IncrementalMapperOptions mapper;
   GlobalBundleAdjustmentOptions global_bundle_adjustment;

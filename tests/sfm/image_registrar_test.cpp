@@ -136,6 +136,25 @@ TEST(ImageRegistrarTest, RegistersImageFromExistingPointsUsingPnPRansac) {
   register_options.min_num_inliers = 20;
   register_options.max_reprojection_error_px = 2.0;
 
+  // Enough absolute inliers can still be a poor explanation of a large set of
+  // correspondences. Enforce the COLMAP ratio before publishing the pose.
+  MatchGraph outlier_graph = graph;
+  FeatureSet noisy_features = features3;
+  noisy_features.keypoints.back().x += 10000.0F;
+  noisy_features.keypoints.back().y += 10000.0F;
+  SetFeatures(&outlier_graph, 3, noisy_features);
+  Reconstruction ratio_reconstruction = reconstruction;
+  ImageRegistrarOptions ratio_options = register_options;
+  ratio_options.min_num_inliers = 12;
+  ratio_options.min_inlier_ratio = 1.0;
+  const auto rejected = RegisterImageWithExistingPoints(
+      outlier_graph, 3, ratio_options, &ratio_reconstruction);
+  EXPECT_GE(rejected.num_inliers, 12U);
+  EXPECT_LT(rejected.num_inliers, rejected.num_correspondences);
+  EXPECT_FALSE(rejected.success);
+  EXPECT_FALSE(ratio_reconstruction.IsImageRegistered(3));
+  EXPECT_FALSE(ratio_reconstruction.GetImage(3).HasPose());
+
   const ImageRegistrationSummary summary =
       RegisterImageWithExistingPoints(graph, 3, register_options,
                                       &reconstruction);

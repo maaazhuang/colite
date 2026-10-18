@@ -65,7 +65,7 @@ std::optional<double> ReprojectionError(
 std::optional<double> Point3DTrackReprojectionError(
     const Reconstruction& reconstruction,
     const Point3D& point3d) {
-  double squared_error_sum = 0.0;
+  double error_sum = 0.0;
   std::size_t num_observations = 0;
   for (const TrackElement& element : point3d.track.elements) {
     if (!reconstruction.ExistsImage(element.image_id)) {
@@ -82,14 +82,20 @@ std::optional<double> Point3DTrackReprojectionError(
     if (!error || !std::isfinite(*error)) {
       continue;
     }
-    squared_error_sum += *error * *error;
+    error_sum += *error;
     ++num_observations;
   }
   if (num_observations == 0) {
     return std::nullopt;
   }
-  return std::sqrt(squared_error_sum /
-                   static_cast<double>(num_observations));
+  return error_sum / static_cast<double>(num_observations);
+}
+
+void UpdatePoint3DReprojectionErrors(Reconstruction* reconstruction) {
+  for (const auto& [id, point] : reconstruction->Points3D()) {
+    reconstruction->GetPoint3D(id).reprojection_error =
+        Point3DTrackReprojectionError(*reconstruction, point).value_or(-1.0);
+  }
 }
 
 std::optional<Eigen::Vector3d> TriangulatePoint(

@@ -1,9 +1,12 @@
 #include "colite/io/image_reader.h"
 
 #include <cstdint>
+#include <fstream>
+#include <vector>
 #include <stdexcept>
 
 #include <gtest/gtest.h>
+#include "colite/io/camera_prior.h"
 
 namespace colite {
 namespace {
@@ -41,6 +44,38 @@ TEST(ImageReaderTest, AppliesAllExifOrientations) {
 TEST(ImageReaderTest, RejectsInvalidOrientation) {
   EXPECT_THROW(ApplyExifOrientation(LabeledImage(), 0), std::invalid_argument);
   EXPECT_THROW(ApplyExifOrientation(LabeledImage(), 9), std::invalid_argument);
+}
+
+TEST(ImageReaderTest, HeaderDimensionsMatchDecodedExifOrientations) {
+  const auto root = std::filesystem::temp_directory_path() / "colite_header_dimensions_test";
+  std::filesystem::create_directories(root);
+  std::vector<unsigned char> encoded;
+  ASSERT_TRUE(cv::imencode(".jpg", cv::Mat(9, 17, CV_8UC3, cv::Scalar(20, 40, 80)),
+                          encoded, {cv::IMWRITE_JPEG_PROGRESSIVE, 1}));
+  for (int orientation = 1; orientation <= 8; ++orientation) {
+    // A non-EXIF APP1 followed by an orientation-only little-endian TIFF IFD.
+    std::vector<unsigned char> header = {
+        0xFF, 0xE1, 0, 8, 'x', 'm', 'p', '0', '0', '0',
+        0xFF, 0xFF, 0xE1, 0, 34, 'E', 'x', 'i', 'f', 0, 0,
+        'I', 'I', 42, 0, 8, 0, 0, 0, 1, 0,
+        0x12, 1, 3, 0, 1, 0, 0, 0,
+        static_cast<unsigned char>(orientation), 0, 0, 0, 0, 0, 0, 0};
+    const auto path = root / (std::to_string(orientation) + ".jpg");
+    {
+      std::ofstream file(path, std::ios::binary);
+      file.write(reinterpret_cast<const char*>(encoded.data()), 2);
+      file.write(reinterpret_cast<const char*>(header.data()), header.size());
+      file.write(reinterpret_cast<const char*>(encoded.data() + 2), encoded.size() - 2);
+    }
+    EXPECT_EQ(ReadExifOrientation(path), orientation);
+    const auto expected_size = orientation < 5 ? cv::Size(17, 9) : cv::Size(9, 17);
+    EXPECT_EQ(ReadImageSizeWithExifOrientation(path), expected_size);
+    EXPECT_EQ(ReadImageWithExifOrientation(path).size(), expected_size);
+  }
+  const auto png = root / "fallback.png";
+  ASSERT_TRUE(cv::imwrite(png.string(), LabeledImage()));
+  EXPECT_EQ(ReadImageSizeWithExifOrientation(png), cv::Size(3, 2));
+  std::filesystem::remove_all(root);
 }
 
 }  // namespace

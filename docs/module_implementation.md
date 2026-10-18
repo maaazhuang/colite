@@ -35,7 +35,7 @@ OpenCV-like 高斯边界使用周期折叠的 reflect/`REFLECT_101` 映射，支
 ## 匹配与两视图几何
 
 - BF：在 COLMAP 风格 uint8/512 描述子空间执行 dot-product、max distance、ratio 和 cross-check。
-- CUDA BF：每张图量化后只上传一次。特征数满足 INT8 GEMM 对齐时，将 uint8 描述子无损偏置到 int8，使用 cuBLAS 一次矩阵乘同时生成双向点积，并用描述子和补偿恢复原始精确整数点积；不满足对齐要求时回退 warp 级 `__dp4a`。点积矩阵、双向输出和 cuBLAS handle 由进程级 matcher workspace 按容量增长并持续复用，避免每个 image pair 重复 `cudaMalloc/cudaFree`。两条路径均复用相同的角距离、ratio 和 cross-check 判定；`COLITE_ENABLE_CUDA_MATCHER` 控制编译，CLI 为 `--matcher cuda`。
+- CUDA BF：每张图量化后只上传一次。特征数满足 INT8 GEMM 对齐时，将 uint8 描述子无损偏置到 int8，使用 cuBLAS 一次矩阵乘同时生成双向点积，并用描述子和补偿恢复原始精确整数点积；不满足对齐要求时回退 warp 级 `__dp4a`。点积矩阵、双向输出和 cuBLAS handle 由进程级 matcher workspace 按容量增长并持续复用，避免每个 image pair 重复 `cudaMalloc/cudaFree`。两条路径均复用相同的角距离、ratio 和 cross-check 判定；`COLITE_ENABLE_CUDA_MATCHER` 控制编译，CLI 为 `--FeatureMatching.type SIFT_BRUTEFORCE --FeatureMatching.use_gpu 1`。
 - FLANN：`flann::L2<uint8_t>`，KDTree 和 search 参数向 COLMAP CPU 路径靠齐。
 - pair 模式：exhaustive、sequential、spatial、vocabulary tree。
 - spatial 必须有所有图像的位置先验，缺失时直接报错，不静默退化。
@@ -43,7 +43,7 @@ OpenCV-like 高斯边界使用周期折叠的 reflect/`REFLECT_101` 映射，支
 - 两视图验证内部估计 E/F/H，PoseLib 可用时使用 five-point；支持平面、全景、多模型和退化分类。批量验证按 image pair 使用持久线程池并行计算，最后按 pair 顺序写回，避免 630 对全串行。
 - `recon_sfm` 的 guided matching 先用初始 F 建立极线走廊，再在走廊内重新搜索描述子，而不是只过滤首轮匹配；这可以恢复被极线外假近邻压掉的真实对应。CPU 后端预计算查询极线项并遍历 16 px 网格；CUDA 后端在同一 kernel 中融合 Fundamental/Sampson 门控、精确 uint8 描述子点积和双向前两名归约，不生成或上传 CPU 候选 CSR。
 - E/F/H 使用自适应 LO-RANSAC；局部优化只对支持度已经优于当前最优值的假设执行，避免为每个随机假设重复求解和评分大内点集。
-- exhaustive/weak-pair 批处理会为每张图预量化一次描述子；guided 重搜索同时复用每图 16 px 空间网格。CPU BF 的 uint8/512 点积使用局部 AVX2 target，不改变跨库 Eigen ABI；CUDA BF 复用每图显存缓冲。`recon_sfm --matcher cuda` 按 image pair 流水执行初始 GPU 匹配、指定数量的 CPU 几何 worker 和 guided GPU 匹配，并在末尾按 pair 顺序发布结果；这样保留确定性写回，同时消除三个全局阶段之间的 barrier。summary 中 `frontend_pipeline_seconds` 是端到端墙钟；三个阶段字段在 CUDA 流水线下是累计工作量，不能直接相加。CUDA SIFT 提取期间线程池临时为 1，结束后恢复调用方指定线程数，避免后续匹配意外单线程。
+- exhaustive/weak-pair 批处理会为每张图预量化一次描述子；guided 重搜索同时复用每图 16 px 空间网格。CPU BF 的 uint8/512 点积使用局部 AVX2 target，不改变跨库 Eigen ABI；CUDA BF 复用每图显存缓冲。`recon_sfm --FeatureMatching.type SIFT_BRUTEFORCE --FeatureMatching.use_gpu 1` 按 image pair 流水执行初始 GPU 匹配、指定数量的 CPU 几何 worker 和 guided GPU 匹配，并在末尾按 pair 顺序发布结果；这样保留确定性写回，同时消除三个全局阶段之间的 barrier。summary 中 `frontend_pipeline_seconds` 是端到端墙钟；三个阶段字段在 CUDA 流水线下是累计工作量，不能直接相加。CUDA SIFT 提取期间线程池临时为 1，结束后恢复调用方指定线程数，避免后续匹配意外单线程。
 
 主要入口位于 `src/colite/matching` 和 `src/colite/controllers/*matcher*`。
 
@@ -53,21 +53,27 @@ OpenCV-like 高斯边界使用周期折叠的 reflect/`REFLECT_101` 映射，支
 
 全局 SfM 首版位于 `src/colite/sfm/global_mapper.cpp`：verified view graph
 依次经过约束筛选、旋转平均、带边尺度的相机中心求解、track 三角化/合并和
-全局 BA，并由 `recon_sfm --mapper global` 调用。该实现已经形成可运行垂直链路，
-但 view-graph calibration 和固定旋转的位置/结构优化仍需继续增强，不能视为
+全局 BA，并由 `recon_sfm --Colite.mapper global` 调用。该实现已经形成可运行垂直链路，
+旋转异常边剔除后会重新求解，定位只消费最终有效边，并通过稀疏 QR 检查秩；
+定位过滤每轮重新检查锚点连通分量，不输出无约束相机。固定旋转 BA、重三角化
+和观测过滤已接通，但焦距 calibration 与 track 驱动定位仍需增强，不能视为
 与完整 GLOMAP 数值行为等价。
 
 层次 SfM 位于 `src/colite/sfm/hierarchical_mapper.cpp`：verified view graph 先按
 目标规模、最大规模和重叠图像数分区，每个 cluster 在显式 image-ID 约束下执行
 局部增量重建；局部模型按注册规模排序，通过 verified 3D-3D 对应估计鲁棒 Sim(3)
 并合并。暂时无法合并的模型会在其他模型并入后重试，以覆盖链式重叠；合并结果最终
-执行一次全局 BA。`recon_sfm --mapper hierarchical` 与
-`recon_auto --sfm.mapper hierarchical` 已接入同一输出协议。当前局部任务顺序执行，
-大规模数据集的并行调度、模型图联合优化和系统 A/B 仍是后续增强项。
+执行一次全局 BA。`recon_sfm --Colite.mapper hierarchical` 与
+`recon_auto --sfm.Colite.mapper hierarchical` 已接入同一输出协议。局部任务已经支持有界并行，
+通过 `--Colite.hierarchical_num_workers` 配置；大规模调度、模型图联合优化和系统 A/B
+仍是后续增强项。
 
 structure-less 注册是增量 mapper 的显式回退：PnP 失败后，从至少两个已注册
-邻居的 verified relative pose 生成一致位姿假设，再继续 track 创建和局部优化。
-默认关闭。`transitive_matcher` 只生成新候选 pair，匹配证据仍来自真实描述子匹配
+邻居的 verified relative pose 估计旋转并交会世界坐标平移射线。双视图平移仅作为
+方向，距离由已注册邻居的基线决定；中心误差阈值按该基线归一化。共线射线不唯一，
+因此明确失败。候选需通过至少两个邻居的正深度、重投影及视差验证，才允许注册
+并创建 track。默认关闭。该回退仍不是完整 generalized relative pose 求解器。
+`transitive_matcher` 只生成新候选 pair，匹配证据仍来自真实描述子匹配
 和 two-view geometry verification。
 
 ## Incremental SfM

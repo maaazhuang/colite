@@ -39,6 +39,9 @@ inline DescriptorMatrix ConvertSiftDescriptors(const float* descriptors,
             std::sqrt(result(static_cast<Eigen::Index>(row), col) *
                       inv_l1_norm));
       }
+    } else if (!use_root_sift) {
+      const double norm = result.row(static_cast<Eigen::Index>(row)).cast<double>().norm();
+      if (norm > 0.0) result.row(static_cast<Eigen::Index>(row)) /= static_cast<float>(norm);
     }
   }
   return result;

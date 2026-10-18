@@ -9,6 +9,7 @@
 
 #include "colite/controllers/sequential_matcher.h"
 #include "colite/core/version.h"
+#include "colite/exe/sfm_options.h"
 #include "colite/io/sfm_workspace.h"
 #include "colite/matching/vocabulary_tree.h"
 
@@ -31,25 +32,6 @@ std::string_view StrategyName(const MatchingStrategy strategy) {
   return "unknown";
 }
 
-MatchingStrategy ParseMatchingStrategy(const std::string& name) {
-  if (name == "exhaustive") {
-    return MatchingStrategy::kExhaustive;
-  }
-  if (name == "sequential") {
-    return MatchingStrategy::kSequential;
-  }
-  if (name == "spatial") {
-    return MatchingStrategy::kSpatial;
-  }
-  if (name == "vocab_tree" || name == "vocab-tree" || name == "vocabtree") {
-    return MatchingStrategy::kVocabTree;
-  }
-  if (name == "transitive") {
-    return MatchingStrategy::kTransitive;
-  }
-  throw std::invalid_argument("Unsupported matching type: " + name);
-}
-
 void PrintHelp(std::string_view executable,
                MatchingStrategy default_strategy,
                std::ostream& out) {
@@ -62,45 +44,39 @@ void PrintHelp(std::string_view executable,
           : "colite " + command_name;
   out << display_name << " " << colite::Version() << "\n\n"
       << "Usage:\n"
-      << "  " << executable << " --workspace_path <dir> [options]\n\n"
+      << "  " << executable << " --Colite.workspace_path <dir> [options]\n\n"
       << "Options:\n"
-      << "  --matching_type <exhaustive|sequential|spatial|vocab_tree|transitive>\n"
       << "                            Pair generation strategy, default "
       << StrategyName(default_strategy) << ".\n"
-      << "  --overlap <n>             Match each image with next n images, "
-         "default 5.\n"
-      << "  --spatial_max_num_neighbors <n>\n"
-      << "                            Spatial neighbors per image, default 10.\n"
-      << "  --spatial_max_distance <d>\n"
-      << "                            Spatial distance limit; <=0 disables it.\n"
-      << "  --vocab_tree_num_images <n>\n"
-      << "                            Retrieved candidate images per image, "
-         "default 50.\n"
-      << "  --vocab_tree_num_visual_words <n>\n"
-      << "                            Hierarchical visual words, "
-         "default 1024.\n"
-      << "  --vocab_tree_branching <n> Tree branching factor, default 16.\n"
-      << "  --vocab_tree_num_iterations <n> K-means iterations per node, "
-         "default 6.\n"
-      << "  --vocab_tree_max_num_features <n>\n"
-      << "                            Max descriptors per image used to build "
-         "retrieval histograms, default 5000.\n"
-      << "  --vocab_tree_path <file>  Load a COLITE text vocab tree file instead "
-         "of building one in memory.\n"
-      << "  --vocab_tree_sequential_overlap <n> Merge next-n temporal pairs; "
-         "0 disables, default 2.\n"
-      << "  --transitive_max_path_length <n> Verified-graph path limit, default 2.\n"
-      << "  --transitive_max_num_neighbors <n> New candidates per image, default 20.\n"
-      << "  --matcher <bf|flann|cuda|aliked_bf|sift_lightglue|aliked_lightglue>\n"
-      << "                            Descriptor matcher, default flann.\n"
-      << "  --learned_matcher_model_path <file> LightGlue ONNX model path.\n"
-      << "  --min_cosine_similarity <s> ALIKED BF threshold, default 0.85.\n"
-      << "  --lightglue_min_score <s> LightGlue score threshold, default 0.1.\n"
-      << "  --learned_matcher_num_threads <n> ONNX intra-op threads, default 1.\n"
-      << "  --max_ratio <r>          Lowe ratio, default 0.8.\n"
-      << "  --guided_matching <0|1> Re-search descriptors under verified geometry, default 0.\n"
-      << "  --guided_match_ratio <r> Lowe ratio used by guided matching, default 0.8.\n"
-      << "  --guided_min_inlier_gain <n> Minimum guided inlier gain, default 10.\n";
+      << "                            Descriptor matcher, default bf.\n"
+      << "  --SiftMatching.lightglue_model_path <file> LightGlue ONNX model path.\n"
+      << "  --AlikedMatching.brute_force_min_cossim <s> ALIKED BF threshold, default 0.85.\n"
+      << "  --SiftMatching.lightglue_min_score <s> LightGlue score threshold, default 0.1.\n"
+      << "  --Colite.learned_cuda_memory_limit_mb <n> CUDA arena limit, default 8192.\n"
+      << "  --Colite.learned_use_io_binding <0|1> Bind ONNX CUDA I/O, default 1.\n"
+      << "  --SiftMatching.max_ratio <r>          Lowe ratio, default 0.8.\n"
+      << "  --FeatureMatching.guided_matching <0|1> Re-search descriptors under verified geometry, default 0.\n"
+      << "  --Colite.guided_match_ratio <r> Candidate ratio under verified geometry, default 0.8.\n"
+      << "  --Colite.guided_min_inlier_gain <n> Minimum guided inlier gain, default 10.\n";
+  if (default_strategy == MatchingStrategy::kSequential) {
+    out << "  --SequentialMatching.overlap <n> Default 10.\n"
+        << "  --SequentialMatching.quadratic_overlap <0|1> Default 1.\n";
+  } else if (default_strategy == MatchingStrategy::kSpatial) {
+    out << "  --SpatialMatching.max_num_neighbors <n> Default 50.\n"
+        << "  --SpatialMatching.max_distance <d> Positive, default 100.\n";
+  } else if (default_strategy == MatchingStrategy::kVocabTree) {
+    out << "  --VocabTreeMatching.num_images <n> Default 100.\n"
+        << "  --Colite.vocab_tree_num_visual_words <n> Default 1024.\n"
+        << "  --Colite.vocab_tree_branching <n> Default 16.\n"
+        << "  --Colite.vocab_tree_num_iterations <n> Default 6.\n"
+        << "  --Colite.vocab_tree_max_num_features <n> Default 5000.\n"
+        << "  --Colite.vocab_tree_path <file> COLITE vocabulary file.\n"
+        << "  --Colite.vocab_tree_sequential_overlap <n> Default 2.\n";
+  } else if (default_strategy == MatchingStrategy::kTransitive) {
+    out << "  --Colite.transitive_max_path_length <n> Default 2.\n"
+        << "  --Colite.transitive_max_num_neighbors <n> Default 20.\n";
+  }
+  PrintSfmOptionsHelp(out, SfmOptionScope::kMatching);
 }
 
 std::string RequireValue(const std::vector<std::string>& args,
@@ -113,14 +89,15 @@ std::string RequireValue(const std::vector<std::string>& args,
   return args[*index];
 }
 
-int RunMatcherCommand(const std::vector<std::string>& args,
+int RunMatcherCommand(const std::vector<std::string>& raw_args,
                       const MatchingStrategy default_strategy,
                       std::ostream& out,
                       std::ostream& err) {
-  const std::string executable = args.empty()
+  const std::string executable = raw_args.empty()
                                      ? std::string("matcher")
-                                     : args.front();
+                                     : raw_args.front();
   try {
+    const auto args = NormalizeSfmArguments(raw_args, SfmOptionScope::kMatching);
     controllers::SequentialMatcherControllerOptions options;
     options.matching_strategy = default_strategy;
     if (args.size() <= 1) {
@@ -133,104 +110,123 @@ int RunMatcherCommand(const std::vector<std::string>& args,
         PrintHelp(executable, default_strategy, out);
         return EXIT_SUCCESS;
       }
-      if (arg == "--workspace_path") {
+      if (i + 1 < args.size() && ApplySfmMatchingExecutionOption(arg, args[i + 1], &options.execution)) {
+        ++i;
+        continue;
+      }
+      const bool sequential_option = arg.rfind("--SequentialMatching.", 0) == 0;
+      const bool spatial_option = arg.rfind("--SpatialMatching.", 0) == 0;
+      const bool vocabulary_option = arg.rfind("--VocabTreeMatching.", 0) == 0 ||
+                                     arg.rfind("--Colite.vocab_tree_", 0) == 0;
+      const bool transitive_option = arg.rfind("--Colite.transitive_", 0) == 0;
+      if ((sequential_option && default_strategy != MatchingStrategy::kSequential) ||
+          (spatial_option && default_strategy != MatchingStrategy::kSpatial) ||
+          (vocabulary_option && default_strategy != MatchingStrategy::kVocabTree) ||
+          (transitive_option && default_strategy != MatchingStrategy::kTransitive)) {
+        throw std::invalid_argument(arg + " does not apply to " + std::string(StrategyName(default_strategy)));
+      }
+      if (arg == "--Colite.workspace_path") {
         options.workspace_path = RequireValue(args, &i, arg);
-      } else if (arg == "--matching_type") {
-        options.matching_strategy =
-            ParseMatchingStrategy(RequireValue(args, &i, arg));
-      } else if (arg == "--overlap") {
+      } else if (arg == "--SequentialMatching.overlap") {
         options.overlap =
-            static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
-      } else if (arg == "--spatial_max_num_neighbors") {
+            static_cast<std::size_t>(controllers::SfmCount(RequireValue(args, &i, arg)));
+      } else if (arg == "--SpatialMatching.max_num_neighbors") {
         options.spatial_max_num_neighbors =
-            static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
-      } else if (arg == "--spatial_max_distance") {
-        options.spatial_max_distance = std::stod(RequireValue(args, &i, arg));
-      } else if (arg == "--vocab_tree_num_images") {
+            static_cast<std::size_t>(controllers::SfmCount(RequireValue(args, &i, arg)));
+      } else if (arg == "--SpatialMatching.max_distance") {
+        options.spatial_max_distance = controllers::SfmDouble(RequireValue(args, &i, arg));
+      } else if (arg == "--VocabTreeMatching.num_images") {
         options.vocab_tree_num_images =
-            static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
-      } else if (arg == "--vocab_tree_num_visual_words") {
+            static_cast<std::size_t>(controllers::SfmCount(RequireValue(args, &i, arg)));
+      } else if (arg == "--Colite.vocab_tree_num_visual_words") {
         options.vocab_tree_num_visual_words =
-            static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
-      } else if (arg == "--vocab_tree_branching") {
+            static_cast<std::size_t>(controllers::SfmCount(RequireValue(args, &i, arg)));
+      } else if (arg == "--Colite.vocab_tree_branching") {
         options.vocab_tree_branching =
-            static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
-      } else if (arg == "--vocab_tree_num_iterations") {
+            static_cast<std::size_t>(controllers::SfmCount(RequireValue(args, &i, arg)));
+      } else if (arg == "--Colite.vocab_tree_num_iterations") {
         options.vocab_tree_num_iterations =
-            std::stoi(RequireValue(args, &i, arg));
-      } else if (arg == "--vocab_tree_max_num_features") {
+            controllers::SfmInt(RequireValue(args, &i, arg));
+      } else if (arg == "--Colite.vocab_tree_max_num_features") {
         options.vocab_tree_max_num_features =
-            static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
-      } else if (arg == "--vocab_tree_path") {
+            static_cast<std::size_t>(controllers::SfmCount(RequireValue(args, &i, arg)));
+      } else if (arg == "--Colite.vocab_tree_path") {
         options.vocab_tree_path = RequireValue(args, &i, arg);
-      } else if (arg == "--vocab_tree_sequential_overlap") {
+      } else if (arg == "--Colite.vocab_tree_sequential_overlap") {
         options.vocab_tree_sequential_overlap =
-            static_cast<std::size_t>(std::stoull(RequireValue(args, &i, arg)));
-      } else if (arg == "--transitive_max_path_length") {
+            static_cast<std::size_t>(controllers::SfmCount(RequireValue(args, &i, arg)));
+      } else if (arg == "--Colite.transitive_max_path_length") {
         options.transitive_max_path_length = static_cast<std::size_t>(
-            std::stoull(RequireValue(args, &i, arg)));
-      } else if (arg == "--transitive_max_num_neighbors") {
+            controllers::SfmCount(RequireValue(args, &i, arg)));
+      } else if (arg == "--Colite.transitive_max_num_neighbors") {
         options.transitive_max_num_neighbors = static_cast<std::size_t>(
-            std::stoull(RequireValue(args, &i, arg)));
-      } else if (arg == "--max_ratio") {
-        options.max_ratio = std::stod(RequireValue(args, &i, arg));
-      } else if (arg == "--guided_matching") {
+            controllers::SfmCount(RequireValue(args, &i, arg)));
+      } else if (arg == "--SiftMatching.max_ratio" || arg == "--AlikedMatching.brute_force_max_ratio") {
+        options.max_ratio = controllers::SfmDouble(RequireValue(args, &i, arg));
+      } else if (arg == "--FeatureMatching.guided_matching") {
         options.guided_matching =
-            std::stoi(RequireValue(args, &i, arg)) != 0;
-      } else if (arg == "--guided_match_ratio") {
-        options.guided_match_ratio = std::stod(RequireValue(args, &i, arg));
-      } else if (arg == "--guided_min_inlier_gain") {
+            controllers::SfmBool(RequireValue(args, &i, arg));
+      } else if (arg == "--Colite.guided_match_ratio") {
+        options.guided_match_ratio = controllers::SfmDouble(RequireValue(args, &i, arg));
+      } else if (arg == "--Colite.guided_min_inlier_gain") {
         options.guided_min_inlier_gain = static_cast<std::size_t>(
-            std::stoull(RequireValue(args, &i, arg)));
-      } else if (arg == "--matcher") {
-        const std::string matcher = RequireValue(args, &i, arg);
-        if (matcher == "bf") {
-          options.matcher_backend = DescriptorMatcherBackend::kBruteForce;
-          options.matcher_type = FeatureMatcherType::kSiftBruteForce;
-        } else if (matcher == "flann") {
-          options.matcher_backend = DescriptorMatcherBackend::kFlann;
-          options.matcher_type = FeatureMatcherType::kSiftBruteForce;
-        } else if (matcher == "cuda") {
-          options.matcher_backend = DescriptorMatcherBackend::kCudaBruteForce;
-          options.matcher_type = FeatureMatcherType::kSiftBruteForce;
-        } else if (matcher == "aliked_bf" || matcher == "aliked-bf") {
-          options.matcher_type = FeatureMatcherType::kAlikedBruteForce;
-        } else if (matcher == "sift_lightglue" ||
-                   matcher == "sift-lightglue") {
-          options.matcher_type = FeatureMatcherType::kSiftLightGlue;
-        } else if (matcher == "aliked_lightglue" ||
-                   matcher == "aliked-lightglue") {
-          options.matcher_type = FeatureMatcherType::kAlikedLightGlue;
-        } else {
-          throw std::invalid_argument("Unsupported matcher: " + matcher);
-        }
-      } else if (arg == "--learned_matcher_model_path") {
+            controllers::SfmCount(RequireValue(args, &i, arg)));
+      } else if (arg == "--SiftMatching.lightglue_model_path" || arg == "--AlikedMatching.lightglue_model_path") {
         options.learned_matcher_model_path = RequireValue(args, &i, arg);
-      } else if (arg == "--min_cosine_similarity") {
+      } else if (arg == "--AlikedMatching.brute_force_min_cossim") {
         options.min_cosine_similarity =
-            std::stod(RequireValue(args, &i, arg));
-      } else if (arg == "--lightglue_min_score") {
+            controllers::SfmDouble(RequireValue(args, &i, arg));
+      } else if (arg == "--SiftMatching.lightglue_min_score" || arg == "--AlikedMatching.lightglue_min_score") {
         options.lightglue_min_score =
-            std::stod(RequireValue(args, &i, arg));
-      } else if (arg == "--learned_matcher_num_threads") {
-        options.learned_matcher_num_threads =
-            std::stoi(RequireValue(args, &i, arg));
+            controllers::SfmDouble(RequireValue(args, &i, arg));
+      } else if (arg == "--Colite.learned_cuda_memory_limit_mb") {
+        options.learned_cuda_memory_limit_mb = static_cast<std::size_t>(
+            controllers::SfmCount(RequireValue(args, &i, arg)));
+      } else if (arg == "--Colite.learned_use_io_binding") {
+        options.learned_use_io_binding =
+            controllers::SfmBool(RequireValue(args, &i, arg));
+      } else if (arg == "--FeatureMatching.type") {
+        options.matcher_type = ParseSfmMatcherType(RequireValue(args, &i, arg));
+      } else if (arg == "--SequentialMatching.quadratic_overlap") {
+        options.quadratic_overlap = controllers::SfmBool(RequireValue(args, &i, arg));
+      } else if (arg == "--SiftMatching.max_distance") {
+        options.max_distance = controllers::SfmDouble(RequireValue(args, &i, arg));
+      } else if (arg == "--SiftMatching.cross_check" || arg == "--AlikedMatching.brute_force_cross_check") {
+        options.mutual_check = controllers::SfmBool(RequireValue(args, &i, arg));
       } else {
+        const std::string value = RequireValue(args, &i, arg);
+        if (controllers::ApplySfmGeometryOption(arg, value, &options.two_view_geometry)) continue;
         throw std::invalid_argument("Unknown argument: " + arg);
       }
     }
+    if (options.matcher_type == FeatureMatcherType::kAlikedBruteForce &&
+        std::find(args.begin(), args.end(), "--AlikedMatching.brute_force_max_ratio") == args.end()) {
+      options.max_ratio = 1.0;
+    }
+    if (std::find(args.begin(), args.end(), "--Colite.guided_match_ratio") == args.end())
+      options.guided_match_ratio = options.max_ratio;
+    if (!std::isfinite(options.max_ratio) || options.max_ratio <= 0 || options.max_ratio > 1 ||
+        !std::isfinite(options.max_distance) || options.max_distance <= 0) {
+      throw std::invalid_argument("Invalid SIFT matching thresholds");
+    }
+    if (options.matcher_type == FeatureMatcherType::kSiftBruteForce && !options.execution.use_gpu.has_value())
+      options.execution.use_gpu = IsCudaDescriptorMatcherAvailable();
     if (options.workspace_path.empty()) {
-      throw std::invalid_argument("--workspace_path is required");
+      throw std::invalid_argument("--Colite.workspace_path is required");
+    }
+    if (options.learned_matcher_num_threads <= 0 ||
+        options.learned_gpu_index < 0) {
+      throw std::invalid_argument("Invalid learned matcher runtime configuration");
     }
     if (options.guided_match_ratio <= 0.0 ||
         options.guided_match_ratio > 1.0) {
-      throw std::invalid_argument("--guided_match_ratio must be in (0, 1]");
+      throw std::invalid_argument("--Colite.guided_match_ratio must be in (0, 1]");
     }
     if ((options.matcher_type == FeatureMatcherType::kSiftLightGlue ||
          options.matcher_type == FeatureMatcherType::kAlikedLightGlue) &&
         options.learned_matcher_model_path.empty()) {
       throw std::invalid_argument(
-          "--learned_matcher_model_path is required for LightGlue");
+          "--SiftMatching.lightglue_model_path is required for LightGlue");
     }
     const auto summary =
         controllers::SequentialMatcherController(options).Run();
@@ -308,12 +304,12 @@ int RunVocabTreeBuilder(const std::vector<std::string>& args,
     VocabularyTreeBuildOptions options;
     if (args.size() <= 1) {
       out << "Usage:\n  " << executable
-          << " --workspace_path <dir> --output_path <file> [options]\n\n"
+          << " --Colite.workspace_path <dir> --output_path <file> [options]\n\n"
           << "Options:\n"
-          << "  --num_visual_words <n>  Leaf visual words, default 1024.\n"
-          << "  --branching <n>         Branching factor, default 16.\n"
-          << "  --num_iterations <n>    K-means iterations per node, default 6.\n"
-          << "  --max_num_features <n>  Descriptors sampled per image, default 5000.\n";
+          << "  --Colite.num_visual_words <n>  Leaf visual words, default 1024.\n"
+          << "  --Colite.branching <n>         Branching factor, default 16.\n"
+          << "  --Colite.num_iterations <n>    K-means iterations per node, default 6.\n"
+          << "  --Colite.vocab_tree_max_num_features <n>  Descriptors sampled per image, default 5000.\n";
       return EXIT_SUCCESS;
     }
     for (std::size_t i = 1; i < args.size(); ++i) {
@@ -322,28 +318,28 @@ int RunVocabTreeBuilder(const std::vector<std::string>& args,
         std::vector<std::string> help_args{executable};
         return RunVocabTreeBuilder(help_args, out, err);
       }
-      if (arg == "--workspace_path") {
+      if (arg == "--Colite.workspace_path") {
         workspace_path = RequireValue(args, &i, arg);
       } else if (arg == "--output_path") {
         output_path = RequireValue(args, &i, arg);
-      } else if (arg == "--num_visual_words") {
+      } else if (arg == "--Colite.num_visual_words") {
         options.num_visual_words = static_cast<std::size_t>(
-            std::stoull(RequireValue(args, &i, arg)));
-      } else if (arg == "--branching") {
+            controllers::SfmCount(RequireValue(args, &i, arg)));
+      } else if (arg == "--Colite.branching") {
         options.branching = static_cast<std::size_t>(
-            std::stoull(RequireValue(args, &i, arg)));
-      } else if (arg == "--num_iterations") {
-        options.num_iterations = std::stoi(RequireValue(args, &i, arg));
-      } else if (arg == "--max_num_features") {
+            controllers::SfmCount(RequireValue(args, &i, arg)));
+      } else if (arg == "--Colite.num_iterations") {
+        options.num_iterations = controllers::SfmInt(RequireValue(args, &i, arg));
+      } else if (arg == "--Colite.vocab_tree_max_num_features") {
         options.max_num_features_per_image = static_cast<std::size_t>(
-            std::stoull(RequireValue(args, &i, arg)));
+            controllers::SfmCount(RequireValue(args, &i, arg)));
       } else {
         throw std::invalid_argument("Unknown argument: " + arg);
       }
     }
     if (workspace_path.empty() || output_path.empty()) {
       throw std::invalid_argument(
-          "--workspace_path and --output_path are required");
+          "--Colite.workspace_path and --output_path are required");
     }
     const std::vector<Image> images = ReadWorkspaceImages(workspace_path);
     MatchGraph graph;

@@ -17,7 +17,7 @@ namespace colite {
 struct LocalBundleAdjustmentOptions {
   int max_num_iterations = 25;
   double loss_scale = 4.0;
-  std::size_t max_num_images = 8;
+  std::size_t max_num_images = 6;
   // 不参与位姿优化、但对局部 3D 点提供约束的 fixed images 数量上限。
   std::size_t max_num_fixed_images = 8;
   bool refine_poses = true;

@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <numeric>
+#include <map>
 #include <stdexcept>
 #include <vector>
 
@@ -28,7 +29,7 @@ float EffectiveCudaVlFeatPeakThreshold(
           : options.contrast_threshold;
   // The CUDA pyramid preserves the input's [0, 255] intensity range while
   // CPU VLFeat receives the same range as floats.
-  return static_cast<float>(normalized * 255.0);
+  return static_cast<float>((options.peak_threshold > 0.0 ? options.peak_threshold : normalized) * 255.0);
 }
 
 cv::Mat ToContinuousGray(const cv::Mat& image) {
@@ -93,6 +94,36 @@ void RetainBestCudaFeatures(const std::size_t maximum,
   result->descriptors = std::move(descriptors);
 }
 
+void RetainCudaVlFeatLevels(const std::size_t maximum,
+                           features::cuda::CudaSiftResult* result) {
+  if (maximum == 0) return;
+  using Level = std::pair<int, int>;
+  std::map<Level, std::size_t> levels;
+  for (const auto& point : result->keypoints) ++levels[{point.octave, point.layer}];
+  if (levels.empty()) return;
+  auto first = levels.begin()->first;
+  std::size_t count = 0;
+  // COLMAP SiftGPU (-tc2) repeats complete-level culling after expanding
+  // multiple orientations. Count oriented rows here, not base detections.
+  // Keeping the boundary level intact never splits a base's orientations.
+  for (auto it = levels.rbegin(); it != levels.rend(); ++it) {
+    count += it->second;
+    first = it->first;
+    if (count > maximum) break;
+  }
+  std::vector<features::cuda::CudaSiftKeypoint> keypoints;
+  std::vector<float> descriptors;
+  for (std::size_t i = 0; i < result->keypoints.size(); ++i) {
+    const auto& point = result->keypoints[i];
+    if (Level{point.octave, point.layer} < first) continue;
+    keypoints.push_back(point);
+    descriptors.insert(descriptors.end(), result->descriptors.begin() + i * 128,
+                        result->descriptors.begin() + (i + 1) * 128);
+  }
+  result->keypoints = std::move(keypoints);
+  result->descriptors = std::move(descriptors);
+}
+
 }  // namespace
 
 bool IsCudaSiftAvailable() {
@@ -121,14 +152,16 @@ FeatureSet ExtractCudaSiftFeatures(const cv::Mat& image,
                              ? EffectiveCudaVlFeatPeakThreshold(options)
                              : options.cuda_threshold;
   config.edgeThreshold = static_cast<float>(options.edge_threshold);
-  config.maxFeatures = options.max_num_features;
+  // Budget base features by scale and keep all selected orientations.
+  config.maxFeatures = vlfeat_mode ? 0 : options.max_num_features;
+  config.maxOrientations = vlfeat_mode ? options.max_num_orientations : 4;
 
   const cv::Mat gray = ToContinuousGray(image);
   features::cuda::CudaSiftResult cuda_result =
       features::cuda::CudaSift(config, options.cuda_device)
           .detectAndCompute(gray.ptr<std::uint8_t>(), gray.cols, gray.rows);
-  RetainBestCudaFeatures(static_cast<std::size_t>(options.max_num_features),
-                         &cuda_result);
+  if (vlfeat_mode) RetainCudaVlFeatLevels(static_cast<std::size_t>(std::max(0, options.max_num_features)), &cuda_result);
+  else RetainBestCudaFeatures(static_cast<std::size_t>(options.max_num_features), &cuda_result);
 
   FeatureSet result;
   result.keypoints.reserve(cuda_result.keypoints.size());
@@ -158,6 +191,7 @@ FeatureSet ExtractCudaSiftFeatures(const cv::Mat& image,
   }
   result.descriptors = features::ConvertSiftDescriptors(
       descriptors.data(), result.keypoints.size(), options.use_root_sift);
+  result.descriptor_normalization = options.use_root_sift ? DescriptorNormalization::kRootL1 : DescriptorNormalization::kL2;
   return result;
 }
 

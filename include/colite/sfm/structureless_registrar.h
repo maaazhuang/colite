@@ -12,6 +12,7 @@ struct StructurelessRegistrationOptions {
   std::size_t min_num_registered_neighbors = 2;
   std::size_t min_num_inliers_per_edge = 15;
   double max_rotation_disagreement_deg = 5.0;
+  // Perpendicular ray error divided by the registered-neighbor baseline.
   double max_center_disagreement = 0.25;
 };
 
@@ -33,5 +34,13 @@ StructurelessRegistrationSummary EstimateStructurelessPose(
     ImageId image_id,
     const Reconstruction& reconstruction,
     const StructurelessRegistrationOptions& options = {});
+
+// Unique target observations passing positive-depth, reprojection and parallax
+// checks, with support from the required number of registered neighbors.
+std::size_t ValidateStructurelessPose(
+    const MatchGraph& graph, ImageId image_id,
+    const Reconstruction& reconstruction, const Pose3& pose,
+    const StructurelessRegistrationOptions& options,
+    double max_reprojection_error_px);
 
 }  // namespace colite

@@ -452,12 +452,21 @@ IncrementalMapperSummary RegisterNextImage(
       return summary;
     }
     Image& image = reconstruction->GetImage(image_id);
+    const std::size_t validated_inliers = ValidateStructurelessPose(
+        graph, image_id, *reconstruction,
+        summary.structureless_registration.pose,
+        options.structureless_registration,
+        options.registration.max_reprojection_error_px);
+    if (validated_inliers < options.registration.min_num_inliers) {
+      summary.message = "Structure-less pose failed multi-view geometric validation";
+      return summary;
+    }
     image.cam_from_world = summary.structureless_registration.pose;
     reconstruction->RegisterImage(image_id);
     summary.used_structureless_registration = true;
     summary.registration.success = true;
     summary.registration.num_inliers =
-        summary.structureless_registration.num_consistent_hypotheses;
+        validated_inliers;
     summary.registration.message =
         "Registered from consistent relative-pose hypotheses";
   }
@@ -645,6 +654,20 @@ IncrementalMappingSummary RunIncrementalMapping(
     const auto initialization_start = MappingClock::now();
     summary.initialization = InitializeReconstructionFromBestPair(
         graph, initialization_options, reconstruction);
+    // COLMAP retries twice, halving inliers and then angle in each round.
+    // Only the working copy is relaxed; the user's configured thresholds and
+    // cache identity remain unchanged.
+    for (int relaxation = 0; options.relax_initialization_constraints &&
+         !summary.initialization.success && relaxation < 4; ++relaxation) {
+      if (relaxation % 2 == 0) initialization_options.min_num_inliers =
+          std::max<std::size_t>(8, initialization_options.min_num_inliers / 2);
+      else initialization_options.min_triangulation_angle_deg *= 0.5;
+      auto attempt = InitializeReconstructionFromBestPair(graph, initialization_options, reconstruction);
+      attempt.num_initialization_attempts += summary.initialization.num_initialization_attempts;
+      attempt.attempted_initial_pairs.insert(attempt.attempted_initial_pairs.begin(),
+          summary.initialization.attempted_initial_pairs.begin(), summary.initialization.attempted_initial_pairs.end());
+      summary.initialization = std::move(attempt);
+    }
     summary.initialization_seconds = ElapsedSeconds(initialization_start);
     if (!summary.initialization.success) {
       summary.num_registered_images =
@@ -826,6 +849,24 @@ IncrementalMappingSummary RunIncrementalMapping(
     }
   }
 
+  // Final BA and subsequent track merges move points/intrinsics after the
+  // earlier filter. Enforce the configured error/angle gates on saved output.
+  if (options.run_global_observation_filter &&
+      !reconstruction->Points3D().empty()) {
+    const auto stage_start = MappingClock::now();
+    const auto final_filter = FilterObservationsAndPoints(
+        options.global_observation_filter, reconstruction);
+    summary.global_observation_filter_seconds += ElapsedSeconds(stage_start);
+    summary.global_observation_filter.num_removed_observations +=
+        final_filter.num_removed_observations;
+    summary.global_observation_filter.num_removed_points +=
+        final_filter.num_removed_points;
+    summary.global_observation_filter.success = final_filter.success;
+    if (!final_filter.success) {
+      summary.message = final_filter.message;
+      return summary;
+    }
+  }
   summary.num_registered_images = reconstruction->RegisteredImageIds().size();
   summary.num_points3d = reconstruction->Points3D().size();
   summary.success = summary.num_registered_images >= 2;

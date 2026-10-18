@@ -43,15 +43,27 @@ std::vector<ImagePair> GenerateExhaustivePairs(
 
 std::vector<ImagePair> GenerateSequentialPairs(
     const std::vector<Image>& images,
-    const std::size_t overlap) {
+    const std::size_t overlap,
+    const bool quadratic = false) {
   if (overlap == 0) {
     throw std::invalid_argument("sequential overlap must be positive");
   }
   std::set<ImagePair> pairs;
   for (std::size_t i = 0; i < images.size(); ++i) {
-    const std::size_t end = std::min(images.size(), i + overlap + 1);
-    for (std::size_t j = i + 1; j < end; ++j) {
-      AddPair(images[i].id, images[j].id, &pairs);
+    const std::size_t remaining = images.size() - i - 1;
+    if (quadratic) {
+      const std::size_t levels = std::min<std::size_t>(
+          overlap, std::numeric_limits<std::size_t>::digits);
+      for (std::size_t level = 0; level < levels; ++level) {
+        const std::size_t offset = std::size_t{1} << level;
+        if (offset > remaining) break;
+        AddPair(images[i].id, images[i + offset].id, &pairs);
+      }
+    } else {
+      const std::size_t end = i + std::min(overlap, remaining) + 1;
+      for (std::size_t j = i + 1; j < end; ++j) {
+        AddPair(images[i].id, images[j].id, &pairs);
+      }
     }
   }
   return ToVector(pairs);
@@ -513,7 +525,8 @@ std::vector<ImagePair> GenerateMatchingPairs(
     case MatchingStrategy::kExhaustive:
       return GenerateExhaustivePairs(images);
     case MatchingStrategy::kSequential:
-      return GenerateSequentialPairs(images, options.sequential_overlap);
+      return GenerateSequentialPairs(images, options.sequential_overlap,
+                                     options.sequential_quadratic_overlap);
     case MatchingStrategy::kSpatial:
       return GenerateSpatialPairs(images, options.spatial_max_num_neighbors,
                                   options.spatial_max_distance);

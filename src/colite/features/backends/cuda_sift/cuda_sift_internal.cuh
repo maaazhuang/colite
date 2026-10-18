@@ -173,12 +173,12 @@ PipelineOrientedKeypoint* AssignOrientationsDevice(
     int keypointCount,
     int octave,
     int& outputCount,
-    size_t& temporaryBytes);
+    size_t& temporaryBytes, int maxOrientations);
 
 extern template PipelineOrientedKeypoint* AssignOrientationsDevice<OpenCvModeTraits>(
-    const float*, int, int, int, const PipelineRefinedKeypoint*, int, int, int&, size_t&);
+    const float*, int, int, int, const PipelineRefinedKeypoint*, int, int, int&, size_t&, int);
 extern template PipelineOrientedKeypoint* AssignOrientationsDevice<VlFeatModeTraits>(
-    const float*, int, int, int, const PipelineRefinedKeypoint*, int, int, int&, size_t&);
+    const float*, int, int, int, const PipelineRefinedKeypoint*, int, int, int&, size_t&, int);
 
 PipelineOrientedKeypoint* RetainBestOrientedDevice(
     const PipelineOrientedKeypoint* input,
